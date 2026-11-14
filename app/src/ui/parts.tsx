@@ -89,11 +89,11 @@ export function StatusHero({ state, now }: { state: State | null; now: number })
       <p className="relative mt-3 text-[15px] leading-snug text-slate-600 dark:text-slate-300">{state.message}</p>
     </Card>;
   }
-  // Only say "Ready" when voice commands will actually work.
+  // Only say "Listening" when voice commands will actually work.
   const glasses = state.connected && state.camera;
   const listening = glasses && state.voice === "Voice commands ready";
   const [title, detail, HeroIcon] = !glasses ? ["Glasses off", "Connect Mentra Live in the Mentra app.", Glasses]
-    : listening ? ["Ready", "Say “start” to begin", Mic] : ["Voice loading", state.voice, MicOff];
+    : listening ? ["Listening", "Say “start” to begin", Mic] : ["Voice loading", state.voice, MicOff];
   return <Card className="py-6">
     <div className="flex items-center gap-4">
       <div className={clsx("relative grid size-16 shrink-0 place-items-center rounded-full", listening ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" : "bg-amber-500/15 text-amber-600 dark:text-amber-400")}>
