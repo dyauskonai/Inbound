@@ -16,7 +16,7 @@ VITAL_FIELDS = {"bp": "blood_pressure", "hr": "heart_rate", "spo2": "spo2", "rr"
 
 
 def shown(kind: str, value: str) -> str:
-    return f"{value}%" if kind == "spo2" else value
+    return f"{value}%" if kind == "spo2" and value.isdigit() else value
 
 
 def vital_evidence(vital: dict) -> dict:

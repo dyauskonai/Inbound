@@ -76,6 +76,7 @@ export interface Channels {
   video: { enabled: boolean };
   wifi: Record<string, never>;
   checkUpload: Record<string, never>;
+  checkSpeaker: Record<string, never>;
   report: Record<string, never>;
   copyDiagnostics: Rpc<Record<string, never>, void>;
 }

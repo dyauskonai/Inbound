@@ -1,6 +1,11 @@
 // Critical vitals as the medic says them: "BP one ninety over sixty", "sats 98 percent".
 export type VitalKind = "bp" | "hr" | "spo2" | "rr";
-export interface VitalReading { kind: VitalKind; value: string }
+/**
+ * `unclear`: a number was said for the vital but doesn't make sense ("BP one nine over sixty",
+ * when the recognizer dropped "-ty"). The glasses ask about it rather than guess.
+ */
+export interface VitalReading { kind: VitalKind; value: string; unclear?: boolean }
+export const UNCLEAR = "unclear";
 
 export const vitalNames: Record<VitalKind, string> = {
   bp: "blood pressure", hr: "heart rate", spo2: "oxygen saturation", rr: "respiratory rate",
@@ -29,6 +34,9 @@ const PHRASES: [string[], VitalKind][] = ([
   [["respiratory"], "rr"], [["resp"], "rr"], [["r", "r"], "rr"], [["rr"], "rr"],
 ] as [string[], VitalKind][]).sort((a, b) => b[0].length - a[0].length);
 
+// A number followed by one of these is a dose, duration, or flow, not a vital: "oxygen two liters".
+const OTHER_UNITS = new Set(["liter", "liters", "litre", "litres", "l", "lpm", "minute", "minutes", "mins", "hour", "hours", "day", "days",
+  "year", "years", "old", "mg", "milligrams", "mcg", "micrograms", "ml", "cc", "units", "kg", "kilos", "pounds", "lbs", "feet", "foot", "inches"]);
 const FILLERS = new Set(["is", "was", "of", "at", "about", "around", "approximately", "roughly", "now", "currently", "the", "a", "an",
   "reading", "measured", "its", "it's", "it", "are", "like", "um", "uh", "ah", "rate", "s"]);
 // "sats 92, no, 98": after one of these, a bare number is the vital just mentioned.
@@ -83,6 +91,13 @@ export function readNumber(t: string[], i: number): Read {
       return { value: base + rest.value, next: rest.next };
     }
   }
+  // Digit by digit: "one nine zero" is 190, "nine eight" is 98.
+  if (word in UNITS && t[i + 1] in UNITS) {
+    let digits = "";
+    let j = i;
+    while (t[j] in UNITS && digits.length < 3) digits += UNITS[t[j++]];
+    return { value: Number(digits), next: j };
+  }
   return belowHundred(t, i);
 }
 
@@ -94,16 +109,18 @@ function plausible(kind: VitalKind, first: number, second = 0): boolean {
   return first >= 4 && first <= 70;
 }
 
+// A number right after a vital's name that doesn't make sense is unclear rather than ignored.
 function readVital(t: string[], i: number, kind: VitalKind): { vital: VitalReading; next: number } | null {
   const first = readNumber(t, i);
-  if (!first) return null;
+  if (!first || OTHER_UNITS.has(t[first.next])) return null;
+  const unclear = (next: number) => ({ vital: { kind, value: "", unclear: true }, next });
   if (kind === "bp") {
-    if (!["over", "by", "slash"].includes(t[first.next])) return null;
+    if (!["over", "by", "slash"].includes(t[first.next])) return unclear(first.next);
     const second = readNumber(t, first.next + 1);
-    if (!second || !plausible(kind, first.value, second.value)) return null;
+    if (!second || !plausible(kind, first.value, second.value)) return unclear(second ? second.next : first.next + 1);
     return { vital: { kind, value: `${first.value}/${second.value}` }, next: second.next };
   }
-  if (!plausible(kind, first.value)) return null;
+  if (!plausible(kind, first.value)) return unclear(first.next);
   return { vital: { kind, value: String(first.value) }, next: t[first.next] === "percent" ? first.next + 1 : first.next };
 }
 
@@ -135,16 +152,19 @@ export function findVitals(text: string, expect?: VitalKind): VitalReading[] {
     if (previous && previous !== "bp" && CORRECTIONS.has(t[i])) {
       let j = i + 1;
       while (CORRECTION_FILLERS.has(t[j])) j++;
+      // Only a believable value counts here: "no twelve lead" is not a heart rate.
       const reading = readVital(t, j, previous);
-      if (reading) {
+      if (reading && !reading.vital.unclear) {
         found.push(reading.vital);
         i = reading.next;
         continue;
       }
     }
+    // Without a vital's name, only a clear "X over Y" counts: "pain two over ten" is not a blood pressure.
     const bare = readVital(t, i, "bp");
-    if (bare) found.push(bare.vital);
-    i = bare ? bare.next : i + 1;
+    const clear = bare && !bare.vital.unclear ? bare : null;
+    if (clear) found.push(clear.vital);
+    i = clear ? clear.next : i + 1;
   }
   if (expect && !found.some(vital => vital.kind === expect)) {
     for (let i = 0; i < t.length; i++) {

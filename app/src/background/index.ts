@@ -1,7 +1,7 @@
 import { MiniappRequestType, registerMiniapp } from "@mentra/miniapp/background";
 import type { Capture, CaptureVideo, Channels, Command, Photo, State, Vital } from "../shared/channels";
 import { findCommands, isPhoneRelay, serverOrigin, speechWords } from "../shared/commands";
-import { findVitals, spokenValue, vitalNames, type VitalKind } from "../shared/vitals";
+import { findVitals, spokenValue, UNCLEAR, vitalNames, type VitalKind, type VitalReading } from "../shared/vitals";
 
 declare const INBOUND_SERVER: string;
 declare const INBOUND_LOCAL_SERVER: string;
@@ -585,12 +585,15 @@ registerMiniapp<Channels>(async (session) => {
   }
 
   // Speak through the glasses (the phone's audio route). Listening for vitals pauses meanwhile.
-  async function say(text: string) {
+  async function say(text: string): Promise<boolean> {
     speakingUntil = Number.POSITIVE_INFINITY;
     try {
       await session.speaker.speak(text, { processing: "preferLocal" });
+      diagnostic("speech.said", { words: text.split(" ").length });
+      return true;
     } catch (error) {
       diagnostic("speech.say_failed", { code: (error as { code?: string })?.code });
+      return false;
     } finally {
       speakingUntil = Date.now() + ECHO_TAIL_MS;
     }
@@ -610,24 +613,52 @@ registerMiniapp<Channels>(async (session) => {
     }
   }
 
+  // Ask whenever a vital is unclear or was given two different values close together;
+  // otherwise log it as heard.
   function heardVitals(capture: Capture, text: string) {
     if (Date.now() < speakingUntil) return;
     const live = capture === state.capture;
-    for (const reading of findVitals(text, repeat?.capture === capture ? repeat.kind : undefined)) {
-      if (repeat?.capture === capture && reading.kind === repeat.kind) {
-        confirmRepeat(reading.value);
-        continue;
-      }
-      const last = lastVitals.get(reading.kind);
-      lastVitals.set(reading.kind, { value: reading.value, at: Date.now() });
-      if (live && last && last.value !== reading.value && Date.now() - last.at < CORRECTION_WINDOW_MS) {
-        askToRepeat(capture, reading.kind, [last.value, reading.value]);
-      } else logVital(capture, reading.kind, reading.value, "heard");
+    const open = repeat?.capture === capture ? repeat : null;
+    const readings = findVitals(text, open?.kind);
+    if (open) {
+      const answer = readings.filter(reading => reading.kind === open.kind);
+      if (answer.length) answerRepeat(open, answer);
+    }
+    for (const kind of new Set(readings.map(reading => reading.kind))) {
+      if (kind === open?.kind) continue;
+      const said = readings.filter(reading => reading.kind === kind);
+      const clear = [...new Set(said.filter(reading => !reading.unclear).map(reading => reading.value))];
+      const last = lastVitals.get(kind);
+      const recent = last && Date.now() - last.at < CORRECTION_WINDOW_MS ? [last.value] : [];
+      const values = [...new Set([...recent, ...clear])];
+      const unclear = said.some(reading => reading.unclear);
+      if (clear.length) lastVitals.set(kind, { value: clear.at(-1)!, at: Date.now() });
+      if (live && (unclear || values.length > 1)) askToRepeat(capture, kind, unclear ? [...values, UNCLEAR] : values);
+      else for (const value of clear) logVital(capture, kind, value, "heard");
     }
   }
 
+  // One clear value answers the question. Another unclear or conflicting answer is asked again.
+  function answerRepeat(request: Repeat, answer: VitalReading[]) {
+    const clear = [...new Set(answer.filter(reading => !reading.unclear).map(reading => reading.value))];
+    if (clear.length === 1 && !answer.some(reading => reading.unclear)) {
+      confirmRepeat(clear[0]);
+      return;
+    }
+    clearTimeout(request.timer);
+    request.candidates = [...new Set([...request.candidates, ...clear, ...(answer.some(reading => reading.unclear) ? [UNCLEAR] : [])])];
+    diagnostic("vital.answer_unclear", { session: request.capture.id, kind: request.kind, asks: request.asks });
+    if (request.asks < 3) void prompt(request);
+    else {
+      settleRepeat("answer still unclear");
+      nextRepeat();
+    }
+  }
+
+  const lastClear = (candidates: string[]) => candidates.filter(value => value !== UNCLEAR).at(-1) ?? "";
+
   function askToRepeat(capture: Capture, kind: VitalKind, candidates: string[]) {
-    logVital(capture, kind, candidates.at(-1)!, "conflict", candidates);
+    logVital(capture, kind, lastClear(candidates), "conflict", candidates);
     const request: Repeat = { capture, kind, candidates, asks: 0 };
     if (repeat) repeatQueue.push(request);
     else {
@@ -640,7 +671,7 @@ registerMiniapp<Channels>(async (session) => {
     request.asks++;
     state.voiceCommand = `Asking the medic to repeat the ${vitalNames[request.kind]}. Heard ${request.candidates.join(", then ")}.`;
     publish();
-    await say(`Can you repeat the ${vitalNames[request.kind]}?`);
+    await say(`${request.asks > 1 ? "Sorry, " : ""}${request.asks > 1 ? "can" : "Can"} you repeat the ${vitalNames[request.kind]}?`);
     if (repeat !== request) return;
     request.timer = setTimeout(() => {
       if (repeat !== request) return;
@@ -670,7 +701,7 @@ registerMiniapp<Channels>(async (session) => {
     if (!request) return;
     clearTimeout(request.timer);
     repeat = null;
-    logVital(request.capture, request.kind, request.candidates.at(-1)!, "unconfirmed", request.candidates);
+    logVital(request.capture, request.kind, lastClear(request.candidates), "unconfirmed", request.candidates);
     diagnostic("vital.unconfirmed", { session: request.capture.id, kind: request.kind, reason });
   }
 
@@ -863,6 +894,13 @@ registerMiniapp<Channels>(async (session) => {
     publish();
   });
   session.ui.on("checkUpload", () => { void run(checkVideoUpload); });
+  session.ui.on("checkSpeaker", () => { void run(async () => {
+    state.message = "Speaking through the glasses…";
+    publish();
+    const spoke = await say("This is Inbound. If you can hear me on the glasses, read-backs will work.");
+    state.message = spoke ? "Played. If it came from the phone instead of the glasses, make the glasses your phone's audio output."
+      : "The phone could not play speech. Check Mentra's voice settings and the phone's volume.";
+  }); });
   session.ui.on("wifi", () => { void run(() => session.glasses.requestWifiSetup("Inbound's glasses upload their video to the server over Wi-Fi.")); });
   session.ui.on("report", () => {
     const target = state.capture ?? state.delivered;

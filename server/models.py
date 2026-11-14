@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -53,10 +53,11 @@ class VitalInput(BaseModel):
     """A critical vital the phone heard, and whether the medic confirmed it by repeating it."""
     seq: int = Field(ge=1, le=100_000)
     kind: Literal["bp", "hr", "spo2", "rr"]
-    value: str = Field(pattern=r"^\d{1,3}(/\d{1,3})?$")
+    # Empty when every value the medic gave was unclear.
+    value: str = Field(pattern=r"^(\d{1,3}(/\d{1,3})?)?$")
     status: Literal["heard", "conflict", "confirmed", "unconfirmed"]
     seconds: float = Field(ge=0, le=7200, allow_inf_nan=False)
-    candidates: list[str] = Field(default_factory=list, max_length=6)
+    candidates: list[Annotated[str, Field(pattern=r"^(\d{1,3}(/\d{1,3})?|unclear)$")]] = Field(default_factory=list, max_length=6)
 
 
 class PhotoLink(BaseModel):

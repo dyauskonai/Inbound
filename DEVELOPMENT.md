@@ -68,7 +68,11 @@ Say **start**, **snap** (also "snapshot" or "screenshot"), or **stop** anywhere 
 
 ## Vitals read-back
 
-During a capture, Inbound listens for blood pressure, heart rate, SpO₂, and respiratory rate, in digits or words ("BP one ninety over sixty", "sats ninety eight percent"). If the medic gives a vital two different values within 45 seconds ("BP 190 over 60… no, 90 over 60", or "sats 92, no, 98"), the glasses ask aloud, "Can you repeat the blood pressure?" The next value said for that vital is logged as confirmed, and the glasses read it back ("Blood pressure 90 over 60, logged."). With no answer, they ask once more after 20 seconds, then leave it unconfirmed. Stopping the capture also leaves an open question unconfirmed.
+During a capture, Inbound listens for blood pressure, heart rate, SpO₂, and respiratory rate, in digits or words ("BP one ninety over sixty", "sats ninety eight percent"). The glasses ask aloud, "Can you repeat the blood pressure?", in two cases:
+- The medic gives a vital two different values within 45 seconds ("BP 190 over 60… no, 90 over 60", or "sats 92, no, 98").
+- A number said right after a vital's name makes no sense. For example, the recognizer heard "one ninety" as "one nine" ("b p one nine over sixty"). That counts as unclear, and Inbound doesn't guess.
+
+The next clear value said for that vital is logged as confirmed, and the glasses read it back ("Blood pressure 90 over 60, logged."). An answer that is unclear again, or holds two values, gets "Sorry, can you repeat the blood pressure?" With no answer, they ask once more after 20 seconds, then leave the vital unconfirmed. Stopping the capture also leaves an open question unconfirmed. Digit-by-digit numbers ("one nine zero over six zero") are understood. Use **Test glasses speaker** in Inbound's connection settings to check that speech plays on the glasses.
 
 While the glasses speak, and for 2 seconds after, Inbound ignores what the microphone hears, so it doesn't log its own read-back. Confirmed vitals set the handoff card's values and show "✓ confirmed". Unconfirmed vitals show both values and are flagged in the report's uncertainties. The dashboard shows vitals live during a capture, with both values on screen until the medic repeats one. Speech goes to the phone's audio output, which is the glasses' speaker when they are connected.
 

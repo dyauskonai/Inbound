@@ -188,6 +188,7 @@ async function connect({ journal = null as string | null, video = false, failVid
     serverHasVideo: (video: object) => { serverVideo = video; },
     glassesAt: (ip: string) => event("glasses_wifi", { connected: true, ssid: "Test Wi-Fi", localIp: ip }),
     checkUpload: () => event("_ui", { type: "UI_MESSAGE", channel: "checkUpload", payload: {} }),
+    checkSpeaker: () => event("_ui", { type: "UI_MESSAGE", channel: "checkSpeaker", payload: {} }),
     toggleVideo: (enabled: boolean) => event("_ui", { type: "UI_MESSAGE", channel: "video", payload: { enabled } }),
     reject: (endpoint: string, status: number) => rejected.set(endpoint, status),
     photoReply: (value: object | null) => { photoReply = value; },
@@ -618,13 +619,13 @@ test("a vital changed right after it was said makes the glasses ask for it again
   app.voice("blood pressure ninety over sixty", true);
   await app.settle();
   expect(app.spoken()).toEqual(["Can you repeat the blood pressure?", "Blood pressure 90 over 60, logged."]);
-  expect(app.vitalPosts().map(vital => `${vital.status} ${vital.value}`)).toEqual(["heard 190/60", "conflict 90/60", "confirmed 90/60"]);
-  expect(app.vitalPosts()[2].candidates).toEqual(["190/60", "90/60"]);
+  expect(app.vitalPosts().map(vital => `${vital.status} ${vital.value}`)).toEqual(["conflict 90/60", "confirmed 90/60"]);
+  expect(app.vitalPosts()[1].candidates).toEqual(["190/60", "90/60"]);
   expect(app.state.vitals[0]).toMatchObject({ value: "90/60", status: "confirmed" });
   // Its own read-back is not a new reading.
   app.voice("blood pressure ninety over sixty logged", true);
   await app.settle();
-  expect(app.vitalPosts()).toHaveLength(3);
+  expect(app.vitalPosts()).toHaveLength(2);
 });
 
 test("what the glasses hear while they speak is ignored, and a heart rate answer can be just the number", async () => {
@@ -636,7 +637,7 @@ test("what the glasses hear while they speak is ignored, and a heart rate answer
   // The question is still playing: the microphone hears it, not an answer.
   app.voice("can you repeat the heart rate one ten", true);
   await app.settle();
-  expect(app.vitalPosts().map(vital => vital.status)).toEqual(["heard", "conflict"]);
+  expect(app.vitalPosts().map(vital => vital.status)).toEqual(["conflict"]);
   app.finishSpeech();
   await app.settle(AFTER_SPEECH);
   app.voice("one twenty", true);
@@ -661,7 +662,43 @@ test("stopping before the medic repeats it leaves the vital unconfirmed for the 
   await app.settle();
   app.button("stop");
   await app.settle();
-  expect(app.vitalPosts().map(vital => vital.status)).toEqual(["heard", "conflict", "unconfirmed"]);
+  expect(app.vitalPosts().map(vital => vital.status)).toEqual(["conflict", "unconfirmed"]);
   expect(app.vitalPosts().at(-1)!.candidates).toEqual(["92", "98"]);
   expect(app.posts().at(-1)).toBe("/finish");
+});
+
+test("a value the recognizer garbles next to a clear one is conflicting: the glasses ask", async () => {
+  const app = await connect();
+  app.button("start");
+  // Exactly what the phone heard on the glasses for "BP one ninety over sixty, or actually ninety over sixty".
+  app.voice("b p one nine over sixty are actually ninety over sixty", true);
+  await app.settle();
+  expect(app.spoken()).toEqual(["Can you repeat the blood pressure?"]);
+  expect(app.vitalPosts()[0]).toMatchObject({ status: "conflict", value: "90/60", candidates: ["90/60", "unclear"] });
+  await app.settle(AFTER_SPEECH);
+  // The answer is garbled too, so the glasses ask again.
+  app.voice("b p one nine", true);
+  await app.settle();
+  expect(app.spoken().at(-1)).toBe("Sorry, can you repeat the blood pressure?");
+  await app.settle(AFTER_SPEECH);
+  app.voice("one ninety over sixty", true);
+  await app.settle();
+  expect(app.vitalPosts().at(-1)).toMatchObject({ status: "confirmed", value: "190/60" });
+  expect(app.spoken().at(-1)).toBe("Blood pressure 190 over 60, logged.");
+});
+
+test("a vital said once but unclear is asked about too", async () => {
+  const app = await connect();
+  app.button("start");
+  app.voice("heart rate one", true);
+  await app.settle();
+  expect(app.spoken()).toEqual(["Can you repeat the heart rate?"]);
+});
+
+test("the speaker test talks through the glasses", async () => {
+  const app = await connect();
+  app.checkSpeaker();
+  await app.settle();
+  expect(app.spoken()).toEqual(["This is Inbound. If you can hear me on the glasses, read-backs will work."]);
+  expect(app.state.message).toContain("Played.");
 });

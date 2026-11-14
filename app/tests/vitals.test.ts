@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { findVitals, spokenValue } from "../src/shared/vitals";
 
 const read = (text: string, expect?: Parameters<typeof findVitals>[1]) =>
-  findVitals(text, expect).map(vital => `${vital.kind} ${vital.value}`);
+  findVitals(text, expect).map(vital => `${vital.kind} ${vital.unclear ? "unclear" : vital.value}`);
 
 test("vitals said with keywords, in digits or words", () => {
   expect(read("BP 190/60, heart rate 110, sats 98%")).toEqual(["bp 190/60", "hr 110", "spo2 98"]);
@@ -23,11 +23,22 @@ test("a correction gives both values in the order they were said", () => {
   expect(read("heart rate one ten, no allergies, no twelve lead")).toEqual(["hr 110"]);
 });
 
-test("ordinary speech and implausible numbers are not vitals", () => {
+test("ordinary speech is not a vital", () => {
   expect(read("age thirty two, fell over the curb, pain two over ten")).toEqual([]);
-  expect(read("heart rate one")).toEqual([]);
   expect(read("put pressure on the wound")).toEqual([]);
-  expect(read("we sat him down")).toEqual([]);
+  expect(read("we sat him down, heart rate is regular")).toEqual([]);
+  expect(read("on oxygen two liters, pulse ox reading in five minutes")).toEqual([]);
+});
+
+test("a number said for a vital that makes no sense is unclear, so the glasses can ask", () => {
+  // From the glasses: the recognizer dropped "-ty" from "one ninety".
+  expect(read("b p one nine over sixty are actually ninety over sixty")).toEqual(["bp unclear", "bp 90/60"]);
+  expect(read("heart rate one")).toEqual(["hr unclear"]);
+  expect(read("BP one twenty")).toEqual(["bp unclear"]);
+});
+
+test("digit-by-digit numbers", () => {
+  expect(read("BP one nine zero over six zero, sats nine eight")).toEqual(["bp 190/60", "spo2 98"]);
 });
 
 test("an answer to a repeat request can be just the number", () => {

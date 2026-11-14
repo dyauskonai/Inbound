@@ -433,3 +433,19 @@ def test_a_later_new_reading_is_left_to_the_report(client, monkeypatch):
         {"seq": 2, "kind": "bp", "value": "100/70", "status": "heard", "seconds": 600, "candidates": []},
     ])
     assert report["handoff"]["blood_pressure"] == "100/70" and report["handoff"]["confirmed_fields"] == []
+
+
+def test_an_unclear_vital_stays_unclear_on_the_card(client):
+    import uuid
+    from server.processing import apply_vitals
+    sid = str(uuid.uuid4())
+    client.post("/api/sessions", json={"id": sid, "source": "glasses"})
+    unclear = {"seq": 1, "kind": "bp", "value": "90/60", "status": "unconfirmed", "seconds": 5, "candidates": ["90/60", "unclear"]}
+    assert client.post(f"/api/sessions/{sid}/vitals", json=unclear).status_code == 200
+    only_unclear = {"seq": 2, "kind": "hr", "value": "", "status": "conflict", "seconds": 6, "candidates": ["unclear"]}
+    assert client.post(f"/api/sessions/{sid}/vitals", json=only_unclear).status_code == 200
+    assert client.post(f"/api/sessions/{sid}/vitals", json={**only_unclear, "seq": 3, "candidates": ["garbage"]}).status_code == 422
+    report = {"uncertainties": [], "handoff": {"blood_pressure": "190/60", "heart_rate": None, "missing_fields": [], "evidence_ids": []}}
+    apply_vitals(report, client.get(f"/api/sessions/{sid}").json()["vitals"])
+    assert report["handoff"]["blood_pressure"] == "90/60 or unclear (unconfirmed)"
+    assert report["handoff"]["heart_rate"] == "unclear (unconfirmed)"
