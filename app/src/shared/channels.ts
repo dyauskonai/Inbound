@@ -1,34 +1,57 @@
 import type { Rpc } from "@mentra/miniapp/background";
+import type { VitalKind } from "./vitals";
 
 export type Command = "start" | "snap" | "stop";
-export type Phase = "ready" | "starting" | "start_unconfirmed" | "recording" | "stopping" | "waiting_upload" | "processing" | "awaiting_key" | "complete";
-export interface Bookmark { id: string; seconds: number; label: string }
+export type Phase = "ready" | "recording";
+/** `from_video`: the camera refused the photo while recording; the server takes the still from the video. */
+export interface Photo { seq: number; seconds: number; status: "taking" | "uploading" | "saved" | "failed" | "from_video" }
+export interface CaptureVideo {
+  state: "starting" | "recording" | "stopping" | "uploading" | "failed";
+  recordingId?: string;
+  /** Seconds from Start until the glasses confirmed recording. */
+  offset?: number;
+  detail?: string;
+}
 export interface Capture {
   id: string;
-  recordingId?: string;
-  cameraReleased?: boolean;
-  live?: boolean;
-  streamId?: string;
-  startedAt: number;
-  bookmarks: Bookmark[];
-  phase: Phase;
   server: string;
+  startedAt: number;
+  audioSeq: number;
+  noteSeq: number;
+  photos: Photo[];
+  vitalSeq: number;
+  video?: CaptureVideo;
+  /** Secret the glasses present to upload this capture's video through the server's tunnel. */
+  uploadToken: string;
 }
+/**
+ * A critical vital as Inbound last logged it. `conflict`: two different values close together,
+ * so the glasses asked the medic to repeat it. `confirmed`: the medic's answer.
+ * `updated`: the medic later changed a logged value. `unconfirmed`: no answer came.
+ */
+export interface Vital { kind: VitalKind; value: string; status: "heard" | "conflict" | "confirmed" | "updated" | "unconfirmed"; candidates?: string[] }
+/** The most recent finished capture, followed until the Mac's report is ready. */
+export interface Delivered { id: string; server: string; status: string; progress: string; video?: string }
 export interface State {
   phase: Phase;
   server: string;
   defaultServer: string;
-  localServer: string;
-  liveOnly: boolean;
-  captureMode: "live" | "device";
-  autoUpload: boolean;
-  streamUpdateRequired: boolean;
   online: boolean;
   aiConfigured: boolean;
   camera: boolean;
   connected: boolean;
+  /** Glasses on Wi-Fi: needed only to upload their video. */
   wifi: boolean;
+  /** The glasses' Wi-Fi name and address, to compare with the server's network. */
+  glassesNetwork: string;
+  glassesIp: string;
+  /** Result of the last "Test video upload". */
+  uploadCheck: string;
+  /** Internet address the glasses upload video to, when the server runs a tunnel. */
+  videoUploadBase: string;
+  videoEnabled: boolean;
   battery: number | null;
+  audio: boolean;
   voice: string;
   voiceCommand: string;
   heard: string;
@@ -36,8 +59,13 @@ export interface State {
   message: string;
   error: string;
   capture: Capture | null;
+  /** The current capture's vitals, latest per kind. */
+  vitals: Vital[];
+  delivered: Delivered | null;
+  /** Requests waiting to reach the Mac, oldest first. */
+  pending: number;
+  pendingBytes: number;
   busy: boolean;
-  stopPending: boolean;
   diagnostics: string[];
 }
 export interface Channels {
@@ -45,16 +73,10 @@ export interface Channels {
   getState: Rpc<Record<string, never>, State>;
   command: { command: Command };
   connect: { server: string };
-  captureMode: { mode: State["captureMode"] };
-  autoUpload: { enabled: boolean };
-  retry: Record<string, never>;
+  video: { enabled: boolean };
   wifi: Record<string, never>;
-  resetUnconfirmedStart: Record<string, never>;
-  confirmStoppedOnGlasses: Record<string, never>;
-  newCapture: Record<string, never>;
-  recoverCamera: Record<string, never>;
-  resetAfterRestart: Record<string, never>;
-  stopPublisher: Record<string, never>;
+  checkUpload: Record<string, never>;
+  checkSpeaker: Record<string, never>;
   report: Record<string, never>;
   copyDiagnostics: Rpc<Record<string, never>, void>;
 }

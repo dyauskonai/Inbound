@@ -21,9 +21,9 @@ class Store:
     def connect(self):
         return sqlite3.connect(self.database, timeout=10)
 
-    def create(self, title: str, source: str) -> dict:
+    def create(self, title: str, source: str, session_id: str | None = None) -> dict:
         session = {
-            "id": str(uuid4()), "title": title, "source": source,
+            "id": session_id or str(uuid4()), "title": title, "source": source,
             "created_at": now(), "updated_at": now(), "status": "created",
             "progress": "Waiting for a recording", "error": None,
             "bookmarks": [], "evidence": [], "transcript": [], "report": None,

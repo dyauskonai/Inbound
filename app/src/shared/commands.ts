@@ -1,20 +1,41 @@
-import type { Command, Phase } from "./channels";
+import type { Command } from "./channels";
 
 export function normalizeSpeech(text: string): string {
   return text.toLowerCase().trim().replace(/^\p{P}+|\p{P}+$/gu, "").trim().replace(/\s+/g, " ");
 }
 
-// Narrative containing these words must not interrupt a recording.
-export function commandFrom(text: string): Command | null {
-  const phrase = normalizeSpeech(text).replace(/^in\s?bound(?:\s*[,.:!-]\s*|\s+)/, "");
-  if (/^start(?: (?:the )?record(?:ings?)?)?$/.test(phrase)) return "start";
-  if (/^stop(?: (?:the )?record(?:ings?)?)?$/.test(phrase)) return "stop";
-  if (/^(?:take a )?(?:snap|snapshot|screen\s?shot)$/.test(phrase)) return "snap";
-  return null;
+export function speechWords(text: string): string[] {
+  return text.toLowerCase().replace(/[’‘]/g, "'").split(/[^a-z0-9']+/).map(word => word.replace(/^'+|'+$/g, "")).filter(Boolean);
 }
 
-export function canStartCapture(phase: Phase): boolean {
-  return phase === "ready" || phase === "complete" || phase === "awaiting_key";
+const keywords: Record<string, Command> = { start: "start", stop: "stop", snap: "snap", snapshot: "snap", screenshot: "snap" };
+// "Don't stop" must not end a recording.
+const negations = new Set(["don't", "dont", "not", "never", "cannot", "can't", "cant", "won't", "wont", "shouldn't"]);
+
+export interface CommandHit {
+  command: Command;
+  /** Position of the command word in the hypothesis. */
+  index: number;
+  /** 1 for the first "snap" in the utterance, 2 for the second, and so on. */
+  occurrence: number;
+}
+
+// Commands can appear anywhere in a sentence: "okay start recording now".
+export function findCommands(words: string[]): CommandHit[] {
+  const hits: CommandHit[] = [];
+  const seen = new Map<Command, number>();
+  words.forEach((word, index) => {
+    const command = keywords[word] ?? (word === "screen" && words[index + 1] === "shot" ? "snap" : undefined);
+    if (!command || negations.has(words[index - 1] ?? "")) return;
+    const occurrence = (seen.get(command) ?? 0) + 1;
+    seen.set(command, occurrence);
+    hits.push({ command, index: word === "screen" ? index + 1 : index, occurrence });
+  });
+  return hits;
+}
+
+export function commandFrom(text: string): Command | null {
+  return findCommands(speechWords(text))[0]?.command ?? null;
 }
 
 export function isPhoneRelay(address: string): boolean {

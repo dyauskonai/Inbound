@@ -401,6 +401,113 @@ video {
   display: block;
   max-height: 380px;
 }
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 40px 24px;
+  border-bottom: 1px solid var(--line);
+}
+button.tab {
+  background: none;
+  color: var(--muted);
+  border-radius: 0;
+  padding: 10px 14px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+button.tab[aria-selected="true"] {
+  color: var(--green);
+  border-bottom-color: var(--green);
+}
+.tab-badge {
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.video-view {
+  padding: 0 40px 50px;
+  max-width: 1100px;
+}
+#full-video {
+  max-height: 70vh;
+  margin-bottom: 12px;
+}
+button.moment-link {
+  margin: 0 8px 8px 0;
+  background: #edf3ee;
+  color: #2e4c3f;
+}
+button.moment-link small {
+  margin-left: 6px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 1100px) {
+  .tabs {
+    margin: 0 25px 20px;
+  }
+  .video-view {
+    padding: 0 25px 35px;
+  }
+}
+#recording-audio {
+  width: 100%;
+  display: block;
+}
+.handoff dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  gap: 10px;
+  margin: 0 0 16px;
+}
+.handoff dl div {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 10px 12px;
+}
+.handoff dt {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.handoff dd {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: #1f3a2f;
+  font-variant-numeric: tabular-nums;
+}
+.handoff dl div.confirmed {
+  border-color: #9fcdb6;
+  background: #f1f8f4;
+}
+.handoff dl div.confirmed dt span {
+  color: var(--green);
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.handoff dl div.unconfirmed {
+  border-color: #e6d29b;
+  background: #fbf7ea;
+}
+.handoff dl div.unconfirmed dd {
+  font-size: 14px;
+  color: #7a5b12;
+}
+.handoff .not-reported {
+  font-size: 12px;
+  font-weight: 400;
+  color: #a08a52;
+}
+.handoff .missing-fields {
+  color: #776646;
+  background: #faf8f0;
+  border: 1px solid #eee7ce;
+  border-radius: 7px;
+  padding: 8px 12px;
+}
 .evidence-panel .panel-heading:not(:first-child) {
   margin-top: 27px;
 }

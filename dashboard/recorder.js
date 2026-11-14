@@ -163,17 +163,16 @@ export function setupRecorder({ api, selectSession }) {
       const data = JSON.parse(event.data);
       if (data.heard)
         $("capture-message").textContent = `Heard “${data.heard}”`;
-      if (data.command === "start" && state === "armed") void startRecording();
-      if (data.command === "snap" && state === "recording")
-        snap(
-          data.end == null
-            ? undefined
-            : Math.max(
-                0,
-                (audioStart + data.end * 1000 - recordingStart) / 1000,
-              ),
-        );
-      if (data.command === "stop" && state === "recording") stopRecording();
+      for (const { command, end } of data.commands || []) {
+        if (command === "start" && state === "armed") void startRecording();
+        if (command === "snap" && state === "recording")
+          snap(
+            end == null
+              ? undefined
+              : Math.max(0, (audioStart + end * 1000 - recordingStart) / 1000),
+          );
+        if (command === "stop" && state === "recording") stopRecording();
+      }
     };
     socket.onclose = () =>
       error(

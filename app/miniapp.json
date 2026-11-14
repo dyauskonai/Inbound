@@ -1,9 +1,9 @@
 {
   "$schema": "./node_modules/@mentra/miniapp-cli/schema/miniapp.schema.json",
   "packageName": "com.inbound.capture",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "name": "Inbound",
-  "description": "Voice-controlled recording and evidence-linked handoff reports.",
+  "description": "Voice-controlled audio, photo capture, and AI handoff reports.",
   "icon": "icon.png",
   "type": "standard",
   "sdkVersion": "3.4.0",
@@ -15,11 +15,11 @@
   "permissions": [
     {
       "type": "MICROPHONE",
-      "description": "Recognize start, snap, and stop voice commands."
+      "description": "Record the handoff and recognize start, snap, and stop anywhere in a sentence."
     },
     {
       "type": "CAMERA",
-      "description": "Record first-person video for your handoff report."
+      "description": "Take photos for your handoff report."
     }
   ],
   "hardwareRequirements": [
@@ -30,11 +30,6 @@
     {
       "type": "MICROPHONE",
       "level": "REQUIRED"
-    },
-    {
-      "type": "WIFI",
-      "level": "REQUIRED",
-      "description": "Upload recordings to the local Mac server."
     }
   ]
 }

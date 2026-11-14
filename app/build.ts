@@ -43,11 +43,15 @@ const interfaces = networkInterfaces()
 const lan = (interfaces.en0 ?? []).find(item => item.family === "IPv4" && !item.internal && !item.address.startsWith("169.254."))?.address
   ?? Object.values(interfaces).flat().find(item => item?.family === "IPv4" && !item.internal && !item.address.startsWith("169.254."))?.address
 const localServer = lan ? `http://${lan}:8000` : ""
+// INBOUND_SERVER=https://… targets an internet server; the phone then never
+// falls back to a laptop on the local network. INBOUND_TOKEN is that server's
+// device token. It is inlined into the background bundle only.
+const internetServer = process.env.INBOUND_SERVER?.replace(/\/+$/, "")
 const define: Record<string, string> = {
-  INBOUND_SERVER: JSON.stringify(process.env.INBOUND_SERVER || localServer),
-  INBOUND_LOCAL_SERVER: JSON.stringify(localServer),
-  INBOUND_LIVE_ONLY: JSON.stringify(process.env.INBOUND_LIVE_ONLY === "1"),
+  INBOUND_SERVER: JSON.stringify(internetServer || localServer),
+  INBOUND_LOCAL_SERVER: JSON.stringify(internetServer ? "" : localServer),
 }
+const backgroundDefine = { ...define, INBOUND_TOKEN: JSON.stringify(process.env.INBOUND_TOKEN || "") }
 for (const [k, v] of Object.entries(process.env)) {
   if (k.startsWith("MENTRA_PUBLIC_") && typeof v === "string") {
     define[`process.env.${k}`] = JSON.stringify(v)
@@ -60,7 +64,7 @@ const backgroundResult = await Bun.build({
   target: "browser",
   format: "iife",
   minify: false,
-  define,
+  define: backgroundDefine,
 })
 
 if (!backgroundResult.success) {

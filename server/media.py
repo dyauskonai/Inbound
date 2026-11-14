@@ -2,6 +2,7 @@ import math
 import re
 import shutil
 import subprocess
+import wave
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -58,18 +59,8 @@ def prepare(directory: Path, bookmarks: list[dict], *, glasses=False) -> tuple[d
     samples = [item for item in samples if all(abs(item["seconds"] - snap["seconds"]) > 1 for snap in selected)]
     evidence = []
     for item in selected + samples:
-        seconds = min(item["seconds"], max(0, duration - 0.1))
         name = item["id"]
-        still = directory / f"{name}.jpg"
-        still.unlink(missing_ok=True)
-        ffmpeg("-ss", seconds, "-i", directory / "recording.mp4", "-frames:v", "1", "-q:v", "3", still)
-        if not still.is_file():
-            # FFmpeg can return success with no image when a seek lands after
-            # the last decodable frame, particularly with low frame rates.
-            seconds = min(seconds, max(0, duration - 0.5))
-            ffmpeg("-ss", seconds, "-i", directory / "recording.mp4", "-frames:v", "1", "-q:v", "3", still)
-            if not still.is_file():
-                raise ValueError(f"Could not extract the still for {item['label']}.")
+        seconds = extract_frame(directory / "recording.mp4", min(item["seconds"], duration), duration, directory / f"{name}.jpg", item["label"])
         entry = {"id": name, "kind": "image", "start": seconds, "end": seconds,
                  "label": item["label"], "file": f"{name}.jpg"}
         if name.startswith("snap_"):
@@ -82,11 +73,70 @@ def prepare(directory: Path, bookmarks: list[dict], *, glasses=False) -> tuple[d
     return info, sorted(evidence, key=lambda item: item["start"])
 
 
-def audio_chunks(directory: Path, duration: float):
+def extract_frame(video: Path, seconds: float, duration: float, still: Path, label: str = "the photo") -> float:
+    """Save the frame nearest `seconds` as a JPEG and return the time actually used."""
+    seconds = min(max(0, seconds), max(0, duration - 0.1))
+    still.unlink(missing_ok=True)
+    ffmpeg("-ss", seconds, "-i", video, "-frames:v", "1", "-q:v", "3", still)
+    if not still.is_file():
+        # FFmpeg can return success with no image when a seek lands after
+        # the last decodable frame, particularly with low frame rates.
+        seconds = min(seconds, max(0, duration - 0.5))
+        ffmpeg("-ss", seconds, "-i", video, "-frames:v", "1", "-q:v", "3", still)
+        if not still.is_file():
+            raise ValueError(f"Could not extract the still for {label}.")
+    return seconds
+
+
+def web_video(source: Path, target: Path):
+    """Make an uploaded clip seekable in browsers, re-encoding only when a copy won't do."""
+    try:
+        ffmpeg("-i", source, "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", target)
+    except ValueError:
+        ffmpeg("-i", source, "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+               "-c:a", "aac", "-movflags", "+faststart", target)
+
+
+def prepare_phone(directory: Path, session: dict) -> tuple[dict, list[dict]]:
+    """Join the phone's audio parts into one WAV and index its photos as evidence."""
+    parts = sorted(session.get("audio_parts", {}).items(), key=lambda item: int(item[0]))
+    rate = parts[0][1]["rate"] if parts else 16000
+    written = 0
+    if parts:
+        with wave.open(str(directory / "recording.wav"), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(rate)
+            for seq, part in parts:
+                if part["rate"] != rate:
+                    continue
+                # Keep audio aligned with photo times when the mic stream paused.
+                offset = int(part["at"] * rate) * 2
+                if offset - written > rate * 2:
+                    output.writeframes(bytes(offset - written))
+                    written = offset
+                data = (directory / f"audio-{int(seq):06d}.pcm").read_bytes()
+                output.writeframes(data)
+                written += len(data)
+    duration = written / (rate * 2)
+    photos = session.get("photos", [])
+    if not duration:
+        duration = max([session.get("capture_seconds") or 0, *(photo["seconds"] for photo in photos)])
+    evidence = [{"id": photo["id"], "kind": "image", "start": photo["seconds"], "end": photo["seconds"],
+                 "label": f"Photo {photo['seq']}", "file": photo["file"],
+                 # For the report model: these timings tie a misheard command back to "snap".
+                 "note": "Taken the moment the phone heard the medic say snap"
+                         + (", as a still from the glasses video because the camera was recording." if photo.get("from_video") else ".")}
+                for photo in photos]
+    info = {"duration": round(duration, 2) or None, "has_audio": written > 0, "media": "audio" if written else None}
+    return info, sorted(evidence, key=lambda item: item["start"])
+
+
+def audio_chunks(directory: Path, duration: float, source: str = "original"):
     # Accurate chunk boundaries are retained even when the STT provider returns text only.
     for index, start in enumerate(range(0, math.ceil(duration), 30)):
         path = directory / f"audio_{index}.wav"
         end = min(duration, start + 30)
-        ffmpeg("-ss", start, "-i", directory / "original", "-t", end - start,
+        ffmpeg("-ss", start, "-i", directory / source, "-t", end - start,
                "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", path)
         yield path, start, end

@@ -83,7 +83,27 @@
             Attach recording</button
           ><button id="retry" class="primary" hidden>Generate report</button>
         </div>
-        <div class="report-layout">
+        <div class="tabs" role="tablist" aria-label="Session views">
+          <button class="tab" role="tab" data-tab="report" aria-selected="true">Report</button
+          ><button class="tab" role="tab" data-tab="video" aria-selected="false">
+            Full video <span id="video-badge" class="tab-badge"></span>
+          </button>
+        </div>
+        <section id="video-view" class="video-view" role="tabpanel" hidden>
+          <video id="full-video" controls playsinline preload="metadata" hidden></video>
+          <p id="video-status" class="muted small"></p>
+          <div id="attach-glasses-video" hidden>
+            <label class="file-label"
+              >If the glasses couldn’t upload it, export the video from the Mentra gallery
+              (for example, AirDrop it to this Mac) and attach it here. Each snap’s still is
+              then taken from it.<input type="file" id="glasses-video-file" accept="video/*"
+            /></label>
+            <p id="attach-glasses-status" class="muted small" role="status"></p>
+          </div>
+          <div class="panel-heading"><h2>Photo moments</h2></div>
+          <div id="video-moments"></div>
+        </section>
+        <div id="report-layout" class="report-layout" role="tabpanel">
           <article id="report" class="report-card">
             <div class="empty-report">
               The report will appear here after processing.
@@ -100,6 +120,7 @@
               preload="metadata"
               playsinline
             ></video>
+            <audio id="recording-audio" controls preload="metadata" hidden></audio>
             <p class="muted small">
               Select a source reference to jump to that moment.
             </p>

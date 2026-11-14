@@ -1,0 +1,7 @@
+{$INBOUND_DOMAIN} {
+	encode gzip
+	reverse_proxy 127.0.0.1:8000 {
+		# The dashboard's live updates are a long-lived event stream.
+		flush_interval -1
+	}
+}
