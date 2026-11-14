@@ -32,8 +32,10 @@ const PHOTO_TIMEOUT_MS = 30000;
 const WARM_MS = 60000;
 const VIDEO_START_TIMEOUT_MS = 30000;
 // `save` keeps a copy in the glasses' gallery in case the Wi-Fi upload fails.
-// 15 fps keeps files about half the size, so longer captures fit the tunnel's ~100 MB upload limit.
-const videoOptions = { width: 1280, height: 720, fps: 15, save: true, sound: false };
+// 720p at 30 fps: enough detail for the ER. `save` keeps a copy in the glasses' gallery.
+const videoOptions = { width: 1280, height: 720, fps: 30, save: true, sound: false };
+// Stop resolves only after the glasses finish uploading, so allow for a long video on slow Wi-Fi.
+const VIDEO_UPLOAD_TIMEOUT_MS = 15 * 60 * 1000;
 // A command word at the end of a partial transcript can still grow ("stop" → "stopped").
 const SETTLE_MS = 350;
 const REPEAT_MS = 1500;
@@ -42,7 +44,7 @@ const finished = new Set(["complete", "awaiting_key", "failed", "interrupted"]);
 registerMiniapp<Channels>(async (session) => {
   const state: State = {
     phase: "ready", server: INBOUND_SERVER, defaultServer: INBOUND_SERVER,
-    online: false, aiConfigured: false, camera: false, connected: false, wifi: false, glassesNetwork: "", videoUploadBase: "", videoEnabled: true, battery: null, audio: false,
+    online: false, aiConfigured: false, camera: false, connected: false, wifi: false, glassesNetwork: "", glassesIp: "", videoUploadBase: "", uploadCheck: "", videoEnabled: true, battery: null, audio: false,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
     message: "Say “start” to begin. Nothing is recorded or sent until then.", error: "",
     capture: null, delivered: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
@@ -54,6 +56,7 @@ registerMiniapp<Channels>(async (session) => {
   let lastPhoto: Promise<void> = Promise.resolve();
   let videoStarting: Promise<void> | null = null;
   let warmTimer: ReturnType<typeof setTimeout> | undefined;
+  let checking = false;
   let journalWrite = Promise.resolve();
   let audioChunks: string[] = [];
   let audioChars = 0;
@@ -377,25 +380,68 @@ registerMiniapp<Channels>(async (session) => {
     publish();
   }
 
+  // Start a glasses recording. A recording Mentra never released (say, after a failed
+  // upload) blocks every new one, so release the last one Inbound started and retry.
+  async function startRecording(): Promise<string> {
+    const request = () => session.sendRequest<{ recordingId?: string }>({ type: MiniappRequestType.VIDEO_RECORDING_START, ...videoOptions }, { timeoutMs: VIDEO_START_TIMEOUT_MS });
+    let result: { recordingId?: string };
+    try {
+      result = await request();
+    } catch (error) {
+      const stale = await session.storage.get("videoRecording").catch(() => null);
+      if ((error as { code?: string })?.code !== "ALREADY_RECORDING" || !stale) throw error;
+      diagnostic("video.releasing_previous");
+      await releaseVideo(stale);
+      result = await request();
+    }
+    if (!result?.recordingId) throw new Error("The glasses did not return a recording ID.");
+    void session.storage.set("videoRecording", result.recordingId).catch(() => {});
+    return result.recordingId;
+  }
+
+  // The glasses upload the video themselves, over their own Wi-Fi. When they share the
+  // server's subnet they use its local address; otherwise the server's internet tunnel,
+  // so their Wi-Fi then only needs internet.
+  function uploadRoute(server: string): { base: string; route: "local" | "internet" } {
+    const subnet = (address: string) => /(?:^|\/\/)(\d+\.\d+\.\d+)\.\d+/.exec(address)?.[1];
+    const glasses = subnet(state.glassesIp);
+    return state.videoUploadBase && !(glasses && glasses === subnet(server))
+      ? { base: state.videoUploadBase, route: "internet" }
+      : { base: server, route: "local" };
+  }
+
+  // Stop resolves only after the glasses finish uploading. A failed upload can leave Mentra
+  // holding the recording, so release it to save the clip to the gallery and free the camera.
+  async function stopAndUpload(recordingId: string, url: string, token: string) {
+    try {
+      await session.sendRequest<void>({ type: MiniappRequestType.VIDEO_RECORDING_STOP, recordingId, uploadUrl: url, uploadAuthToken: token }, { timeoutMs: VIDEO_UPLOAD_TIMEOUT_MS });
+    } catch (error) {
+      const { code, message } = (error as { code?: string; message?: string }) ?? {};
+      if (code === "media_error" || /upload/i.test(message ?? "")) await releaseVideo(recordingId);
+      throw error;
+    }
+    void session.storage.delete("videoRecording").catch(() => {});
+  }
+
+  function uploadProblem(error: unknown): string {
+    const { code, message } = (error as { code?: string; message?: string }) ?? {};
+    // "failed to connect to /10.16.99.52 (port 8001) from /10.16.95.18": no route from the glasses' network.
+    const route = /failed to connect to \/([\d.]+).*? from \/([\d.]+)/.exec(message ?? "");
+    const network = state.glassesNetwork ? ` (${state.glassesNetwork})` : "";
+    if (route) return `The glasses (${route[2]}) could not reach ${state.videoUploadBase ? "the upload address" : `the server (${route[1]})`}. Their Wi-Fi${network} blocks it.`;
+    if (code === "ACTION_TIMEOUT") return `The glasses did not finish uploading. Their Wi-Fi${network} may need a sign-in page, as Stanford Visitor does, which glasses can't open.`;
+    if (code === "media_error" || /upload/i.test(message ?? "")) return `The glasses could not upload over their Wi-Fi${network}. ${(message ?? "").replace(/https?:\/\/\S+/g, "the server")}`.trim();
+    return message || "The glasses did not confirm the video stopped.";
+  }
+
   // Video is extra: the report comes from the phone's audio and photos even if the glasses never record or upload it.
   function startVideo(capture: Capture) {
     const video: CaptureVideo = { state: "starting" };
     capture.video = video;
     diagnostic("video.start_requested", { session: capture.id, wifi: state.wifi });
-    const request = () => session.sendRequest<{ recordingId?: string }>({ type: MiniappRequestType.VIDEO_RECORDING_START, ...videoOptions }, { timeoutMs: VIDEO_START_TIMEOUT_MS });
-    const started = request()
-      .catch(async (error: { code?: string }) => {
-        // A recording Mentra never released (say, after a failed upload) blocks every new one.
-        const stale = await session.storage.get("videoRecording").catch(() => null);
-        if (error?.code !== "ALREADY_RECORDING" || !stale) throw error;
-        diagnostic("video.releasing_previous", { session: capture.id });
-        await releaseVideo(stale);
-        return request();
-      })
-      .then((result) => {
-        if (!result?.recordingId) throw new Error("The glasses did not return a recording ID.");
-        void session.storage.set("videoRecording", result.recordingId).catch(() => {});
-        video.recordingId = result.recordingId;
+    const started = startRecording()
+      .then((recordingId) => {
+        video.recordingId = recordingId;
         video.state = "recording";
         video.offset = elapsed(capture);
         diagnostic("video.started", { session: capture.id, offset: video.offset });
@@ -430,33 +476,61 @@ registerMiniapp<Channels>(async (session) => {
   async function stopVideo(capture: Capture) {
     const video = capture.video;
     if (!video?.recordingId || video.state !== "recording") return;
-    video.state = "stopping";
-    publish();
+    const { base, route } = uploadRoute(capture.server);
+    // The dashboard shows the upload in progress; the server marks the video ready when it lands.
+    video.state = "uploading";
+    videoState(capture, video);
+    const requestedAt = Date.now();
+    diagnostic("video.upload_started", { session: capture.id, route, glasses: state.glassesNetwork });
     try {
-      // The glasses upload the finished video themselves, over their own Wi-Fi.
-      await session.camera.stopVideoRecording(video.recordingId, {
-        // Through the server's internet tunnel when it has one, so the glasses' Wi-Fi only needs internet.
-        uploadUrl: `${state.videoUploadBase || capture.server}/api/sessions/${capture.id}/video`,
-        uploadAuthToken: INBOUND_TOKEN || capture.uploadToken,
-      });
-      video.state = "uploading";
-      void session.storage.delete("videoRecording").catch(() => {});
-      diagnostic("video.stopped", { session: capture.id, wifi: state.wifi, route: state.videoUploadBase ? "internet" : "local" });
+      await stopAndUpload(video.recordingId, `${base}/api/sessions/${capture.id}/video`, INBOUND_TOKEN || capture.uploadToken);
+      diagnostic("video.uploaded", { session: capture.id, route, elapsedMs: Date.now() - requestedAt });
     } catch (error) {
       const { code, message } = (error as { code?: string; message?: string }) ?? {};
-      const uploadFailed = code === "media_error" || /upload/i.test(message ?? "");
-      // Mentra can keep the recording after a failed upload. Stop it without a URL so it
-      // saves to the gallery and frees the camera.
-      if (uploadFailed) await releaseVideo(video.recordingId);
       video.state = "failed";
-      // "failed to connect to /10.16.99.52 (port 8001) from /10.16.95.18": the glasses' network can't reach the server.
-      const route = /failed to connect to \/([\d.]+).*? from \/([\d.]+)/.exec(message ?? "");
-      video.detail = !uploadFailed ? message || "The glasses did not confirm the video stopped."
-        : route ? `The glasses (${route[2]}) could not reach the server (${route[1]}) over Wi-Fi, so they are on a different network from it. Put the glasses on the server's Wi-Fi, or use one phone hotspot for the glasses, phone, and laptop. The video is saved in the Mentra gallery; you can attach it on the dashboard.`
-        : "The glasses could not upload the video to the server over their Wi-Fi. It is saved in the Mentra gallery; you can attach it on the dashboard.";
-      diagnostic("video.stop_failed", { session: capture.id, code, uploadFailed, error: (message ?? "").replace(/https?:\/\/\S+/g, "[address]").slice(0, 160) });
+      video.detail = `${uploadProblem(error)} The video is saved in the Mentra gallery; you can attach it on the dashboard.`;
+      diagnostic("video.upload_failed", { session: capture.id, route, code, elapsedMs: Date.now() - requestedAt, error: (message ?? "").replace(/https?:\/\/\S+/g, "[address]").slice(0, 160) });
+      videoState(capture, video);
     }
-    videoState(capture, video);
+  }
+
+  // Record a 3-second clip and send it the way a capture's video goes, to prove the
+  // glasses can deliver video before it matters.
+  async function checkVideoUpload() {
+    if (state.capture) throw new Error("Finish the current capture before testing the video upload.");
+    if (!state.camera) throw new Error("Connect Mentra Live glasses in the Mentra app first.");
+    const id = crypto.randomUUID();
+    const token = (crypto.randomUUID() + crypto.randomUUID()).replace(/-/g, "");
+    const report = (message: string) => { state.uploadCheck = message; publish(); };
+    checking = true;
+    try {
+      const server = await selectServer(state.server, true);
+      await request(server, "/api/sessions", "POST", JSON.stringify({ id, source: "glasses", title: "Video upload check", check: true, upload_token: token }));
+      report("Recording a 3-second test clip on the glasses…");
+      const recordingId = await startRecording();
+      await sleep(3000);
+      const { base, route } = uploadRoute(server);
+      report(route === "internet" ? "Uploading the test clip over the internet…" : "Uploading the test clip over local Wi-Fi…");
+      const startedAt = Date.now();
+      try {
+        await stopAndUpload(recordingId, `${base}/api/sessions/${id}/video`, INBOUND_TOKEN || token);
+      } catch (error) {
+        diagnostic("video.check_failed", { route, code: (error as { code?: string })?.code });
+        report(`✗ ${uploadProblem(error)} Put the glasses on a phone hotspot with internet, then test again.`);
+        return;
+      }
+      const result = await request<{ video?: { state?: string; bytes?: number; duration?: number } }>(server, `/api/sessions/${id}`);
+      const seconds = Math.round((Date.now() - startedAt) / 100) / 10;
+      if (result.video?.state !== "ready") {
+        report("✗ The glasses reported success, but the server has no video. Check the server log.");
+        return;
+      }
+      const perMinute = result.video.bytes && result.video.duration ? result.video.bytes / result.video.duration * 60 / 1e6 : 0;
+      diagnostic("video.check_passed", { route, seconds, mbPerMinute: Math.round(perMinute) });
+      report(`✓ The glasses uploaded a test clip over ${route === "internet" ? "the internet" : "local Wi-Fi"} in ${seconds} s.${perMinute ? ` Video is about ${Math.round(perMinute)} MB per minute.` : ""}`);
+    } finally {
+      checking = false;
+    }
   }
 
   function stop() {
@@ -546,6 +620,7 @@ registerMiniapp<Channels>(async (session) => {
     if (!hydrated) return feedback(`Heard “${command}”. Inbound is still loading.`);
     if (command === "start") {
       if (state.capture) return feedback("Heard “start”. Already recording.");
+      if (checking) return feedback("Heard “start”. Wait for the video upload test to finish.");
       start();
     } else if (command === "snap") {
       if (!state.capture) return feedback("Heard “snap”. Say “start” first.");
@@ -662,6 +737,7 @@ registerMiniapp<Channels>(async (session) => {
     void session.storage.set("video", enabled ? "on" : "off").catch(problem);
     publish();
   });
+  session.ui.on("checkUpload", () => { void run(checkVideoUpload); });
   session.ui.on("wifi", () => { void run(() => session.glasses.requestWifiSetup("Inbound's glasses upload their video to the server over Wi-Fi.")); });
   session.ui.on("report", () => {
     const target = state.capture ?? state.delivered;
@@ -680,6 +756,7 @@ registerMiniapp<Channels>(async (session) => {
     if (state.wifi !== data.connected || state.glassesNetwork !== network) diagnostic("glasses.wifi", { connected: data.connected, ssid: data.ssid, ip: data.localIp });
     state.wifi = data.connected;
     state.glassesNetwork = network;
+    state.glassesIp = data.connected ? data.localIp ?? "" : "";
     publish();
   });
   session.on("ready", () => {

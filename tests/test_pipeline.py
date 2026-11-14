@@ -365,3 +365,14 @@ def test_tunnel_lets_through_only_the_glasses_video_upload(tmp_path, video, monk
             assert client.post(upload, headers={**tunnel, "Authorization": f"Bearer {key}"}, files={"video": data}).status_code == 200
         assert client.get(f"/api/sessions/{sid}").json()["video"]["state"] == "ready"
     app.state.processor.pool.shutdown(wait=True)
+
+
+def test_video_upload_check_is_kept_off_the_dashboard(client, video):
+    import uuid
+    sid = str(uuid.uuid4())
+    assert client.post("/api/sessions", json={"id": sid, "source": "glasses", "check": True, "upload_token": uuid.uuid4().hex * 2}).status_code == 201
+    with video.open("rb") as data:
+        assert client.post(f"/api/sessions/{sid}/video", files={"video": data}).status_code == 200
+    result = client.get(f"/api/sessions/{sid}").json()
+    assert result["video"]["state"] == "ready" and result["video"]["bytes"] > 0
+    assert sid not in [item["id"] for item in client.get("/api/sessions").json()]

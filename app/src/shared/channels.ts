@@ -36,6 +36,9 @@ export interface State {
   wifi: boolean;
   /** The glasses' Wi-Fi name and address, to compare with the server's network. */
   glassesNetwork: string;
+  glassesIp: string;
+  /** Result of the last "Test video upload". */
+  uploadCheck: string;
   /** Internet address the glasses upload video to, when the server runs a tunnel. */
   videoUploadBase: string;
   videoEnabled: boolean;
@@ -62,6 +65,7 @@ export interface Channels {
   connect: { server: string };
   video: { enabled: boolean };
   wifi: Record<string, never>;
+  checkUpload: Record<string, never>;
   report: Record<string, never>;
   copyDiagnostics: Rpc<Record<string, never>, void>;
 }

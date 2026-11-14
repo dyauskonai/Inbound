@@ -17,6 +17,8 @@ class SessionInput(BaseModel):
     # The phone's per-capture secret for the glasses' video upload through the tunnel. Only its hash is kept.
     upload_token: str | None = Field(default=None, min_length=32, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     auto_report: bool = False
+    # A "Test video upload" from the MiniApp: kept off the dashboard's list.
+    check: bool = False
 
 
 class AudioPart(BaseModel):

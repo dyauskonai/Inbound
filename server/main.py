@@ -155,7 +155,7 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
     @app.get("/api/sessions")
     def sessions():
         return [{key: item[key] for key in ("id", "title", "source", "created_at", "status", "duration", "progress")}
-                for item in store.list()]
+                for item in store.list() if not item.get("hidden")]
 
     @app.post("/api/sessions", status_code=201)
     def create_session(body: SessionInput, response: Response):
@@ -172,6 +172,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
             session = store.update(session["id"], auto_report=True)
         if body.upload_token:
             session = store.update(session["id"], upload_token_hash=hashlib.sha256(body.upload_token.encode()).hexdigest())
+        if body.check:
+            session = store.update(session["id"], hidden=True)
         log.info("Inbound capture created session=%s source=%s", session["id"], body.source)
         return {**session, "live_capture": live is not None} if body.source == "glasses" else session
 
@@ -396,7 +398,7 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
                     except ValueError as error:
                         raise HTTPException(422, str(error))
                     details = {**(session.get("video") or {}), "state": "ready", "file": "video.mp4",
-                               "duration": info["duration"], "has_audio": info["has_audio"], "detail": None}
+                               "duration": info["duration"], "has_audio": info["has_audio"], "bytes": size, "detail": None}
                     store.update(session_id, video=details, video_hash=checksum)
                     log.info("Inbound glasses video saved session=%s bytes=%d duration=%.2f", session_id, size, info["duration"])
                     added = await asyncio.to_thread(attach_frames, session_id)

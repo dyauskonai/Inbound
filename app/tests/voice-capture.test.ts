@@ -48,6 +48,8 @@ async function connect({ journal = null as string | null, video = false, failVid
   let cloudDown = 0;
   let uploadUnreachable = false;
   let tunnelUrl: string | null = null;
+  let uploadTimesOut = false;
+  let serverVideo: object | undefined;
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = ((callback: () => void, interval: number) => {
     if (interval === 1000) tick = callback;
@@ -100,6 +102,7 @@ async function connect({ journal = null as string | null, video = false, failVid
       }
       case Request.VIDEO_RECORDING_STOP:
         if (uploadUnreachable && payload.uploadUrl) reply(undefined, { code: "ERR_UNEXPECTED", message: "Video upload error: failed to connect to /192.0.2.1 (port 8000) from /10.16.95.18 (port 38510) after 10000ms" });
+        else if (uploadTimesOut && payload.uploadUrl) reply(undefined, { code: "ACTION_TIMEOUT", message: "Request timed out waiting for a response from the host" });
         else reply();
         break;
       case Request.VIDEO_RECORDING_START:
@@ -139,7 +142,7 @@ async function connect({ journal = null as string | null, video = false, failVid
     if (status) return Response.json({ detail: "Refused" }, { status });
     if (path === "/api/health") return Response.json({ ok: true, ai_configured: true, video_upload_url: tunnelUrl });
     if (path === "/api/sessions") return Response.json({ id: (body as { id: string }).id }, { status: 201 });
-    if (method === "GET") return Response.json({ status: macStatus, progress: "Transcribing 0–30 seconds" });
+    if (method === "GET") return Response.json({ status: macStatus, progress: "Transcribing 0–30 seconds", video: serverVideo });
     return Response.json({ ok: true });
   }) as typeof fetch;
 
@@ -171,6 +174,10 @@ async function connect({ journal = null as string | null, video = false, failVid
     cloudDown: () => { cloudDown++; },
     glassesCannotReachServer: () => { uploadUnreachable = true; },
     serverTunnel: (url: string) => { tunnelUrl = url; },
+    uploadTimesOut: () => { uploadTimesOut = true; },
+    serverHasVideo: (video: object) => { serverVideo = video; },
+    glassesAt: (ip: string) => event("glasses_wifi", { connected: true, ssid: "Test Wi-Fi", localIp: ip }),
+    checkUpload: () => event("_ui", { type: "UI_MESSAGE", channel: "checkUpload", payload: {} }),
     toggleVideo: (enabled: boolean) => event("_ui", { type: "UI_MESSAGE", channel: "video", payload: { enabled } }),
     reject: (endpoint: string, status: number) => rejected.set(endpoint, status),
     photoReply: (value: object | null) => { photoReply = value; },
@@ -519,9 +526,9 @@ test("when the glasses can't reach the server, the app says why and where the vi
   await app.settle();
   app.button("stop");
   await app.settle();
-  expect(app.videoStates()).toEqual(["recording", "failed"]);
+  // The dashboard shows the upload as soon as Stop is said, then why it failed.
+  expect(app.videoStates()).toEqual(["recording", "uploading", "failed"]);
   const detail = app.calls.filter(call => call.path.endsWith("/video-state")).at(-1)!.body as { state: string; detail: string };
-  expect(detail.state).toBe("failed");
   expect(detail.detail).toContain("The glasses (10.16.95.18) could not reach the server (192.0.2.1)");
   expect(detail.detail).toContain("attach it on the dashboard");
 });
@@ -540,4 +547,48 @@ test("with the server's tunnel, the glasses upload the video over the internet w
   expect(stop.uploadAuthToken).toBe(create.upload_token);
   // Everything else still goes to the server on the local network.
   expect(app.calls.every(call => !call.path.startsWith("https://"))).toBe(true);
+});
+
+test("video goes over local Wi-Fi when the glasses share the server's subnet, and through the tunnel when they don't", async () => {
+  const app = await connect({ video: true });
+  app.serverTunnel("https://inbound-demo.trycloudflare.com");
+  app.glassesAt("192.0.2.77");
+  app.button("start");
+  await app.settle();
+  app.button("stop");
+  await app.settle();
+  app.glassesAt("10.16.95.18");
+  app.button("start");
+  await app.settle();
+  app.button("stop");
+  await app.settle();
+  const urls = app.requests.filter(request => request.type === Request.VIDEO_RECORDING_STOP).map(request => String(request.uploadUrl));
+  expect(urls[0].startsWith(`${SERVER}/api/sessions/`)).toBe(true);
+  expect(urls[1].startsWith("https://inbound-demo.trycloudflare.com/api/sessions/")).toBe(true);
+});
+
+test("the video upload test records a short clip and confirms it reached the server", async () => {
+  const app = await connect({ video: true });
+  app.serverHasVideo({ state: "ready", bytes: 6_000_000, duration: 3 });
+  app.checkUpload();
+  await app.settle(50);
+  // Voice can't start a capture while the test holds the camera.
+  app.voice("start", true);
+  expect(app.state.phase).toBe("ready");
+  await app.settle(3200);
+  const create = app.calls.find(call => call.path === "/api/sessions")!.body as { check: boolean; upload_token: string; id: string };
+  expect(create.check).toBe(true);
+  const stop = app.requests.find(request => request.type === Request.VIDEO_RECORDING_STOP)!;
+  expect(stop).toMatchObject({ uploadUrl: `${SERVER}/api/sessions/${create.id}/video`, uploadAuthToken: create.upload_token });
+  expect(app.state.uploadCheck).toMatch(/^✓ The glasses uploaded a test clip over local Wi-Fi in [\d.]+ s\. Video is about 120 MB per minute\.$/);
+});
+
+test("a video upload test that never finishes points at the glasses' Wi-Fi", async () => {
+  const app = await connect({ video: true });
+  app.glassesAt("10.16.95.18");
+  app.uploadTimesOut();
+  app.checkUpload();
+  await app.settle(3300);
+  expect(app.state.uploadCheck).toContain("✗ The glasses did not finish uploading. Their Wi-Fi (Test Wi-Fi · 10.16.95.18) may need a sign-in page");
+  expect(app.state.uploadCheck).toContain("phone hotspot");
 });
