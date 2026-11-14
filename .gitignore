@@ -1,0 +1,43 @@
+# Local environment and signing material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*.jks
+*.keystore
+
+# React Native and Expo
+node_modules/
+.expo/
+dist/
+web-build/
+coverage/
+*.tsbuildinfo
+
+# Native builds and machine settings
+.gradle/
+build/
+DerivedData/
+Pods/
+local.properties
+xcuserdata/
+*.xcuserstate
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local demo data
+runtime/
+uploads/
+*.sqlite3
+*.log
+.DS_Store
