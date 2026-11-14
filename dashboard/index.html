@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Inbound · Handoff reports</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" type="module"></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="/">inbound<span>↘</span></a>
+      <div class="workspace">ER WORKSPACE <span class="local">Local</span></div>
+      <button id="record-mac" class="primary">● Record on Mac</button>
+      <button id="new-session" class="sidebar-import">
+        ＋ Import recording
+      </button>
+      <h2 class="sidebar-label">Recordings</h2>
+      <nav id="sessions" aria-label="Recordings"></nav>
+      <div class="sidebar-bottom">
+        <span class="status-dot"></span><span id="connection">Connecting</span
+        ><small>Immerse the Bay · Prototype</small>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <span>Handoff reports</span>
+        <div class="header-actions">
+          <span id="ai-status" class="pill">Checking AI</span
+          ><button id="sample" class="quiet">Open sample</button>
+        </div>
+      </header>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <section id="welcome" class="welcome">
+        <span class="eyebrow">FROM FIRST-PERSON RECORDING TO HANDOFF</span>
+        <h1>Keep the details.<br />Stay with the patient.</h1>
+        <p>Review the account, the moments, and the evidence in one place.</p>
+        <div class="welcome-actions">
+          <button id="welcome-record" class="primary">Record on this Mac</button
+          ><button id="welcome-import" class="secondary">
+            Import a recording</button
+          ><button id="welcome-sample" class="quiet">Open sample ↗</button>
+        </div>
+        <div class="workflow">
+          <div>
+            <b>Record</b>
+            <p>Enable the camera, then say “start recording”.</p>
+          </div>
+          <div>
+            <b>Mark the moment</b>
+            <p>Say “snap” to save a frame and a surrounding clip.</p>
+          </div>
+          <div>
+            <b>Review</b>
+            <p>Say “stop recording” and open the report here.</p>
+          </div>
+        </div>
+        <p class="muted small">
+          Use a staged training scenario for this local prototype.
+        </p>
+      </section>
+      <section id="session-view" hidden>
+        <div class="session-heading">
+          <div>
+            <div id="session-meta" class="eyebrow"></div>
+            <h1 id="session-title"></h1>
+          </div>
+          <div class="header-actions">
+            <button id="print" class="secondary" hidden>Print / PDF</button
+            ><button id="export" class="secondary" hidden>Export JSON</button>
+          </div>
+        </div>
+        <div id="sample-label" class="sample-label" hidden>
+          Sample session · Scripted report and transcript with generated
+          training video
+        </div>
+        <div id="processing" class="processing" hidden>
+          <div>
+            <b id="process-title"></b>
+            <p id="process-detail"></p>
+          </div>
+          <button id="attach-video" class="secondary" hidden>
+            Attach recording</button
+          ><button id="retry" class="primary" hidden>Generate report</button>
+        </div>
+        <div class="report-layout">
+          <article id="report" class="report-card">
+            <div class="empty-report">
+              The report will appear here after processing.
+            </div>
+          </article>
+          <aside class="evidence-panel">
+            <div class="panel-heading">
+              <h2>Source recording</h2>
+              <span id="duration" class="muted"></span>
+            </div>
+            <video
+              id="recording"
+              controls
+              preload="metadata"
+              playsinline
+            ></video>
+            <p class="muted small">
+              Select a source reference to jump to that moment.
+            </p>
+            <div class="panel-heading">
+              <h2>Marked moments</h2>
+              <span id="snap-count" class="pill"></span>
+            </div>
+            <div id="snaps"></div>
+            <details id="transcript-section">
+              <summary>Transcript <span id="transcript-count"></span></summary>
+              <div id="transcript"></div>
+            </details>
+          </aside>
+        </div>
+      </section>
+    </main>
+    <dialog id="record-dialog">
+      <div class="dialog-heading">
+        <h2>Record on this Mac</h2>
+        <button id="close-record" class="quiet" aria-label="Close recorder">
+          ✕
+        </button>
+      </div>
+      <p class="muted small">
+        Camera and microphone capture on this computer. Voice commands are
+        recognized locally.
+      </p>
+      <video id="camera-preview" muted autoplay playsinline></video>
+      <div class="capture-status">
+        <b id="capture-state">Camera is off</b
+        ><span id="capture-timer">0:00</span>
+      </div>
+      <p id="capture-message" class="small muted">
+        Enable the camera, then say “start recording”, “snap”, or “stop
+        recording”.
+      </p>
+      <p id="capture-error" class="error" role="alert" hidden></p>
+      <div class="capture-buttons">
+        <button id="enable-camera" class="primary">
+          Enable camera & microphone</button
+        ><button id="start-capture" class="primary" hidden>
+          Start recording</button
+        ><button id="snap-capture" class="secondary" hidden>Snap</button
+        ><button id="stop-capture" class="stop-button" hidden>
+          Stop recording</button
+        ><button id="save-capture" class="primary" hidden>Retry upload</button
+        ><button id="download-capture" class="secondary" hidden>
+          Download recording
+        </button>
+      </div>
+      <div id="capture-marks" class="capture-marks"></div>
+      <p class="muted small">
+        After recording, AI report generation sends audio and selected frames to
+        OpenAI when your API key is configured.
+      </p>
+    </dialog>
+    <dialog id="import-dialog">
+      <form id="import-form">
+        <div class="dialog-heading">
+          <h2>Import recording</h2>
+          <button
+            type="button"
+            id="close-import"
+            aria-label="Close import"
+            class="quiet"
+          >
+            ✕
+          </button>
+        </div>
+        <p class="muted">
+          Upload a training video and mark the moments to include in the report.
+        </p>
+        <label
+          >Recording title<input
+            id="import-title"
+            maxlength="120"
+            placeholder="e.g. Training handoff · Unit 04"
+            required
+        /></label>
+        <label class="file-label"
+          >Video file<input
+            type="file"
+            id="video-file"
+            accept="video/*"
+            required
+        /></label>
+        <video id="import-preview" controls playsinline hidden></video>
+        <div class="snap-controls">
+          <input
+            id="snap-label"
+            aria-label="Snap label"
+            maxlength="160"
+            placeholder="Optional moment label"
+          /><button type="button" id="add-snap" class="secondary" disabled>
+            Snap current frame
+          </button>
+        </div>
+        <div id="import-snaps"></div>
+        <p class="small muted">
+          AI processing sends audio and sampled images to OpenAI when a key is
+          configured.
+        </p>
+        <p id="import-error" role="alert" class="error" hidden></p>
+        <button type="submit" id="import-submit" class="primary wide">
+          Upload and prepare report
+        </button>
+      </form>
+    </dialog>
+    <dialog id="evidence-dialog">
+      <div class="dialog-heading">
+        <h2 id="evidence-title">Marked moment</h2>
+        <button id="close-evidence" class="quiet" aria-label="Close evidence">
+          ✕
+        </button>
+      </div>
+      <img id="evidence-image" alt="Frame from the recording" /><video
+        id="evidence-clip"
+        controls
+        playsinline
+      ></video>
+    </dialog>
+  </body>
+</html>

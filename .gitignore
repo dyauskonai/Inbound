@@ -9,7 +9,7 @@
 *.jks
 *.keystore
 
-# React Native and Expo
+# JavaScript builds and development tools
 node_modules/
 .expo/
 dist/
