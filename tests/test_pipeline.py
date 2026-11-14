@@ -391,6 +391,7 @@ def test_confirmed_vitals_decide_the_handoff_card(client, monkeypatch):
             # The model read the first, misheard value.
             handoff={"patient_age": None, "patient_sex": None, "blood_pressure": "190/60", "heart_rate": "110", "spo2": None,
                      "respiratory_rate": None, "injuries": [], "mechanism": None, "allergies": None, "eta_minutes": None,
+               "consciousness": None, "treatment": [], "medications": None, "history": None,
                      "missing_fields": ["blood_pressure", "spo2", "respiratory_rate"], "evidence_ids": ["note_1"]})
         return validate_evidence(result, evidence)
     monkeypatch.setattr(ai, "generate_report", report)
@@ -472,6 +473,7 @@ def test_invented_citations_are_dropped_instead_of_failing_the_report():
                 {"id": "snap_photo-1", "kind": "image", "start": 4, "end": 4, "file": "photo-1.jpg"}]
     handoff = {"patient_age": None, "patient_sex": None, "blood_pressure": None, "heart_rate": None, "spo2": None,
                "respiratory_rate": None, "injuries": [], "mechanism": None, "allergies": None, "eta_minutes": None,
+               "consciousness": None, "treatment": [], "medications": None, "history": None,
                "missing_fields": [], "evidence_ids": ["audio_0", "vital_99"]}
     report = GeneratedReport(
         title="t", summary=[{"text": "Supported.", "evidence_ids": ["audio_0", "photo_1"]}, {"text": "Invented.", "evidence_ids": ["note_9"]}],
@@ -491,6 +493,7 @@ def test_report_generation_retries_once_when_nothing_is_supported(monkeypatch):
     from server.models import GeneratedReport
     handoff = {"patient_age": None, "patient_sex": None, "blood_pressure": None, "heart_rate": None, "spo2": None,
                "respiratory_rate": None, "injuries": [], "mechanism": None, "allergies": None, "eta_minutes": None,
+               "consciousness": None, "treatment": [], "medications": None, "history": None,
                "missing_fields": [], "evidence_ids": []}
     replies = [GeneratedReport(title="t", summary=[{"text": "x", "evidence_ids": ["nope"]}], sections=[], timeline=[], uncertainties=[], snap_captions=[], handoff=handoff),
                GeneratedReport(title="t", summary=[{"text": "y", "evidence_ids": ["audio_0"]}], sections=[], timeline=[], uncertainties=[], snap_captions=[], handoff=handoff)]
@@ -499,3 +502,23 @@ def test_report_generation_retries_once_when_nothing_is_supported(monkeypatch):
     monkeypatch.setattr(ai, "client", lambda: fake)
     report = ai.generate_report(Path("."), [{"id": "audio_0", "kind": "transcript", "start": 0, "end": 30}])
     assert len(calls) == 2 and report["summary"][0]["text"] == "y"
+
+
+def test_sample_patient_fills_the_dashboard_and_stays_current(client):
+    sample = client.post("/api/sample").json()
+    assert sample["source"] == "sample" and sample["status"] == "complete"
+    handoff = sample["report"]["handoff"]
+    assert handoff["confirmed_fields"] == ["blood_pressure"] and handoff["updated_fields"] == ["heart_rate"]
+    assert [vital["status"] for vital in sample["vitals"] if vital["kind"] == "hr"] == ["heard", "updated"]
+    # Every source the report cites exists, so each one on the dashboard opens something.
+    report = sample["report"]
+    cited = {source for item in [*report["summary"], *report["timeline"], handoff, *(s for section in report["sections"] for s in section["statements"])]
+             for source in item["evidence_ids"]}
+    assert cited <= {item["id"] for item in sample["evidence"]}
+    assert {caption["evidence_id"] for caption in report["snap_captions"]} == {item["id"] for item in sample["evidence"] if item["id"].startswith("snap_")}
+    assert client.post("/api/sample").json()["id"] == sample["id"]
+    # An outdated sample makes way for a fresh one and leaves the board.
+    client.app.state.store.update(sample["id"], sample_version=1)
+    fresh = client.post("/api/sample").json()
+    assert fresh["id"] != sample["id"]
+    assert [item["id"] for item in client.get("/api/sessions").json() if item["source"] == "sample"] == [fresh["id"]]

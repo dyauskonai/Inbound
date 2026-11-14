@@ -11,6 +11,7 @@ import sqlite3
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -154,8 +155,14 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
 
     @app.get("/api/sessions")
     def sessions():
-        return [{key: item[key] for key in ("id", "title", "source", "created_at", "status", "duration", "progress")}
-                for item in store.list() if not item.get("hidden")]
+        # Enough for the ER's incoming board: who, what, ETA, and the latest vitals.
+        def card(item: dict) -> dict:
+            report = item.get("report") or {}
+            return {key: item.get(key) for key in ("id", "title", "source", "created_at", "updated_at", "status", "duration", "progress", "capture_seconds")} | {
+                "headline": report.get("title"), "handoff": report.get("handoff"), "vitals": item.get("vitals", []),
+                "photo_count": len(item.get("photos", [])), "video_state": (item.get("video") or {}).get("state"),
+            }
+        return [card(item) for item in store.list() if not item.get("hidden")]
 
     @app.post("/api/sessions", status_code=201)
     def create_session(body: SessionInput, response: Response):
@@ -474,11 +481,16 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
 
     @app.post("/api/sample")
     async def sample():
-        from .sample import create_sample
+        from .sample import SAMPLE_VERSION, create_sample
         async with demo_lock:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
             for entry in store.list():
-                if entry["source"] == "sample" and entry["status"] == "complete":
+                if entry["source"] != "sample" or entry.get("hidden"):
+                    continue
+                # A recent sample opens again. An older one shows an ETA long gone, so a fresh one replaces it.
+                if entry["status"] == "complete" and entry.get("sample_version") == SAMPLE_VERSION and datetime.fromisoformat(entry["created_at"]) > cutoff:
                     return entry
+                store.update(entry["id"], hidden=True)
             return await asyncio.to_thread(create_sample, store)
 
     @app.get("/events")
@@ -500,7 +512,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
 
     @app.get("/")
     def index():
-        return FileResponse(ROOT / "dashboard/index.html")
+        # The ER dashboard, built from dashboard/src into dashboard/dist.
+        return FileResponse(ROOT / "dashboard/dist/index.html")
 
     return app
 

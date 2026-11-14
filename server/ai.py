@@ -62,12 +62,20 @@ Use the uncertainties list for missing information, unclear audio, visibility li
 unconfirmed facts. Leave absent categories out of sections rather than fabricate their content.
 Sections should be useful to an ER handoff, with multiple specific statements when supported.
 Thoroughness means preserving supported details. Return a report with summary, sections,
-timeline, and uncertainties. No Markdown, no HTML, no advice, no fabricated source IDs.
+timeline, and uncertainties. The title is this patient's one-line headline on the ER arrivals board:
+the main problem in the medic's plain clinical words, for example "Fall from ladder, left forearm pain"
+or "Chest pain for 30 minutes". Never a generic label like "Ambulance-to-ER Handoff Report". If nothing
+clinical was reported, use "No clinical details reported". No Markdown, no HTML, no advice, no fabricated source IDs.
 Also fill the handoff card with values exactly as reported, using null or an empty list when a value
 was not stated. For a corrected value, use the final stated value and note the correction in the
 report. Keep units as spoken, e.g. "90/60", "110", "98%". Never estimate a value from an image.
+consciousness is the level of consciousness as reported (for example "GCS 14" or "alert").
+treatment lists only treatment the medic says was given ("splint applied", "IV access"); never
+suggest any. medications are the patient's regular medications, and history their background
+medical history, as reported.
 List every one of patient_age, patient_sex, blood_pressure, heart_rate, spo2, respiratory_rate,
-injuries, mechanism, allergies, and eta_minutes that is null or empty in missing_fields.
+consciousness, injuries, mechanism, allergies, medications, and eta_minutes that is null or empty
+in missing_fields.
 Cite the evidence for the card's values in its evidence_ids.
 """
 

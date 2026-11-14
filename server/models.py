@@ -113,17 +113,23 @@ class SnapCaption(BaseModel):
 
 
 class Handoff(BaseModel):
-    """The ER handoff card. Every value is what the medic reported, or null."""
+    """The ER handoff card, in IMIST-AMBO order. Every value is what the medic reported, or null."""
     model_config = ConfigDict(extra="forbid")
     patient_age: str | None
     patient_sex: str | None
+    mechanism: str | None
+    injuries: list[str]
     blood_pressure: str | None
     heart_rate: str | None
     spo2: str | None
     respiratory_rate: str | None
-    injuries: list[str]
-    mechanism: str | None
+    # Level of consciousness as reported: "GCS 14", "alert", "responds to voice".
+    consciousness: str | None
+    # Only treatment the medic reports giving. Never a suggestion.
+    treatment: list[str]
     allergies: str | None
+    medications: str | None
+    history: str | None
     eta_minutes: int | None
     missing_fields: list[str]
     evidence_ids: list[str]
