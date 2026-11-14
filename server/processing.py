@@ -27,6 +27,8 @@ def vital_evidence(vital: dict) -> dict:
         "heard": f"Inbound heard the medic report {name} {value}.",
         "conflict": f"Inbound heard two different {name} values close together ({heard}) and asked the medic to repeat it.",
         "confirmed": f"Asked to repeat the {name} after hearing {heard}, the medic said {value}. This is the confirmed value.",
+        "updated": f"The medic changed the {name} from {shown(vital['kind'], vital['candidates'][0]) if vital['candidates'] else 'an earlier value'} "
+                   f"to {value}, and Inbound read it back. This replaces the earlier value.",
         "unconfirmed": f"The medic did not repeat the {name} when asked. It is unconfirmed: Inbound heard {heard}.",
     }[vital["status"]]
     return {"id": f"vital_{vital['seq']}", "kind": "vital", "start": vital["seconds"], "end": vital["seconds"],
@@ -38,7 +40,7 @@ def apply_vitals(report: dict, vitals: list[dict]) -> None:
     handoff = report.get("handoff")
     if not handoff:
         return
-    confirmed, unconfirmed = [], []
+    confirmed, updated, unconfirmed = [], [], []
     for kind, field in VITAL_FIELDS.items():
         events = [vital for vital in vitals if vital["kind"] == kind]
         settled = [index for index, vital in enumerate(events) if vital["status"] != "heard"]
@@ -48,17 +50,18 @@ def apply_vitals(report: dict, vitals: list[dict]) -> None:
         # A different value reported afterwards is a new reading; the model weighs it from the evidence.
         if any(vital["value"] != last["value"] for vital in events[settled[-1] + 1:]):
             continue
-        if last["status"] == "confirmed":
+        if last["status"] in {"confirmed", "updated"}:
             handoff[field] = shown(kind, last["value"])
-            confirmed.append(field)
+            (confirmed if last["status"] == "confirmed" else updated).append(field)
         else:
             handoff[field] = " or ".join(shown(kind, value) for value in last["candidates"]) + " (unconfirmed)"
             unconfirmed.append(field)
             report["uncertainties"].insert(0, f"The {VITAL_NAMES[kind]} is unconfirmed: the medic gave "
                                               f"{' and '.join(shown(kind, value) for value in last['candidates'])} and did not repeat it when asked.")
         handoff["evidence_ids"] = [*dict.fromkeys([*handoff["evidence_ids"], f"vital_{last['seq']}"])]
-    handoff["missing_fields"] = [field for field in handoff["missing_fields"] if field not in confirmed + unconfirmed]
+    handoff["missing_fields"] = [field for field in handoff["missing_fields"] if field not in confirmed + updated + unconfirmed]
     handoff["confirmed_fields"] = confirmed
+    handoff["updated_fields"] = updated
     handoff["unconfirmed_fields"] = unconfirmed
 
 

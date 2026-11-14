@@ -27,9 +27,9 @@ export interface Capture {
 /**
  * A critical vital as Inbound last logged it. `conflict`: two different values close together,
  * so the glasses asked the medic to repeat it. `confirmed`: the medic's answer.
- * `unconfirmed`: no answer came.
+ * `updated`: the medic later changed a logged value. `unconfirmed`: no answer came.
  */
-export interface Vital { kind: VitalKind; value: string; status: "heard" | "conflict" | "confirmed" | "unconfirmed"; candidates?: string[] }
+export interface Vital { kind: VitalKind; value: string; status: "heard" | "conflict" | "confirmed" | "updated" | "unconfirmed"; candidates?: string[] }
 /** The most recent finished capture, followed until the Mac's report is ready. */
 export interface Delivered { id: string; server: string; status: string; progress: string; video?: string }
 export interface State {

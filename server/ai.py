@@ -41,7 +41,11 @@ Evidence with kind "vital" records critical vitals Inbound heard. When the medic
 values close together, Inbound's glasses asked aloud to repeat it ("Can you repeat the blood pressure?")
 and logged the answer ("Blood pressure 90 over 60, logged."). Those prompts appear in the audio but are
 not the medic's words. A confirmed vital is the medic's final value: use it, and mention the earlier
-value as a correction. An unconfirmed vital must stay unconfirmed in the report.
+value as a correction. An updated vital means the medic later changed it on purpose: the newest
+value replaces the earlier one. Report a confirmed or updated vital's value everywhere, even where
+the audio transcript shows a different number: the medic heard it read back and did not correct it.
+If the transcript differs, add that discrepancy to uncertainties. An unconfirmed vital must stay
+unconfirmed in the report.
 Transcript entries with "source": "phone" come from the phone's on-device recognizer. It is less
 accurate for clinical values, but each photo was taken the moment it heard the medic say "snap".
 Where the audio transcript has a similar word instead (for example "splint" or "snapped") and the
@@ -77,15 +81,22 @@ def generate_report(directory: Path, evidence: list[dict]) -> dict:
                 {"type": "input_text", "text": f"Image {entry['id']} at {entry['start']:.2f} seconds"},
                 {"type": "input_image", "image_url": "data:image/jpeg;base64," + image, "detail": "auto"},
             ])
-    response = client().responses.parse(
-        model=os.getenv("OPENAI_REPORT_MODEL", "gpt-4.1"),
-        instructions=REPORT_INSTRUCTIONS,
-        input=[{"role": "user", "content": content}],
-        text_format=GeneratedReport,
-        max_output_tokens=10000,
-    )
-    if response.output_parsed is None:
-        raise ValueError("The AI could not complete this report. Your recording is saved. Retry generation.")
-    report = validate_evidence(response.output_parsed, evidence)
+    # One more try when the model returns nothing usable, so the report appears without a manual retry.
+    for attempt in range(2):
+        response = client().responses.parse(
+            model=os.getenv("OPENAI_REPORT_MODEL", "gpt-4.1"),
+            instructions=REPORT_INSTRUCTIONS,
+            input=[{"role": "user", "content": content}],
+            text_format=GeneratedReport,
+            max_output_tokens=10000,
+        )
+        try:
+            if response.output_parsed is None:
+                raise ValueError("The AI could not complete this report. Your recording is saved. Retry generation.")
+            report = validate_evidence(response.output_parsed, evidence)
+            break
+        except ValueError:
+            if attempt:
+                raise
     report["uncertainties"].append("Visual review uses sampled frames and marked snaps. Reported clinical details require human review.")
     return report

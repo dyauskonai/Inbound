@@ -37,6 +37,10 @@ const VIDEO_START_TIMEOUT_MS = 30000;
 const videoOptions = { width: 1280, height: 720, fps: 30, save: true, sound: false };
 // Stop resolves only after the glasses finish uploading, so allow for a long video on slow Wi-Fi.
 const VIDEO_UPLOAD_TIMEOUT_MS = 15 * 60 * 1000;
+// Cloudflare refuses uploads over ~100 MB, and 720p30 from Mentra Live is ~39 MB a minute. A failed
+// upload also leaves Mentra holding the recording until it restarts, so over the internet the video
+// stops at 2:20 while audio, photos, and vitals carry on.
+const VIDEO_INTERNET_LIMIT_MS = 140_000;
 // A command word at the end of a partial transcript can still grow ("stop" → "stopped").
 const SETTLE_MS = 350;
 const REPEAT_MS = 1500;
@@ -64,8 +68,14 @@ registerMiniapp<Channels>(async (session) => {
   let lastPhoto: Promise<void> = Promise.resolve();
   let videoStarting: Promise<void> | null = null;
   let warmTimer: ReturnType<typeof setTimeout> | undefined;
+  let videoLimit: ReturnType<typeof setTimeout> | undefined;
+  // Mentra blocks new recordings until the last video finishes uploading.
+  let uploading: Promise<void> | null = null;
+  const videoRecording = (capture: Capture) => capture.video?.state === "starting" || capture.video?.state === "recording";
   let checking = false;
-  const lastVitals = new Map<VitalKind, { value: string; at: number }>();
+  // `settled`: the medic confirmed or deliberately changed it. A later value replaces it.
+  const lastVitals = new Map<VitalKind, { value: string; at: number; settled: boolean }>();
+  let speech = Promise.resolve(true);
   type Repeat = { capture: Capture; kind: VitalKind; candidates: string[]; asks: number; timer?: ReturnType<typeof setTimeout> };
   let repeat: Repeat | null = null;
   const repeatQueue: Repeat[] = [];
@@ -295,7 +305,7 @@ registerMiniapp<Channels>(async (session) => {
 
   async function shoot(capture: Capture, photo: Photo, previous: Promise<void>) {
     if (capture.video?.state === "starting") await videoStarting;
-    if (capture.video && capture.video.state !== "failed") {
+    if (videoRecording(capture)) {
       // The glasses refuse photos while they record video. The still comes from
       // the video at this exact moment once the glasses upload it.
       photo.status = "from_video";
@@ -313,7 +323,7 @@ registerMiniapp<Channels>(async (session) => {
   // camera, so only photo-only captures warm it.
   function keepCameraWarm(capture: Capture) {
     clearTimeout(warmTimer);
-    if (state.capture !== capture || (capture.video && capture.video.state !== "failed")) return;
+    if (state.capture !== capture || videoRecording(capture)) return;
     // Warming while a photo is being captured makes the glasses report busy.
     if (!photoTasks.size) {
       void session.camera.warmUp({ size: "medium", mode: "photo", durationMs: WARM_MS })
@@ -404,7 +414,8 @@ registerMiniapp<Channels>(async (session) => {
       result = await request();
     } catch (error) {
       const stale = await session.storage.get("videoRecording").catch(() => null);
-      if ((error as { code?: string })?.code !== "ALREADY_RECORDING" || !stale) throw error;
+      // While that recording is still uploading, leave it alone: it isn't stuck, just busy.
+      if ((error as { code?: string })?.code !== "ALREADY_RECORDING" || !stale || uploading) throw error;
       diagnostic("video.releasing_previous");
       await releaseVideo(stale);
       result = await request();
@@ -427,15 +438,21 @@ registerMiniapp<Channels>(async (session) => {
 
   // Stop resolves only after the glasses finish uploading. A failed upload can leave Mentra
   // holding the recording, so release it to save the clip to the gallery and free the camera.
-  async function stopAndUpload(recordingId: string, url: string, token: string) {
-    try {
-      await session.sendRequest<void>({ type: MiniappRequestType.VIDEO_RECORDING_STOP, recordingId, uploadUrl: url, uploadAuthToken: token }, { timeoutMs: VIDEO_UPLOAD_TIMEOUT_MS });
-    } catch (error) {
-      const { code, message } = (error as { code?: string; message?: string }) ?? {};
-      if (code === "media_error" || /upload/i.test(message ?? "")) await releaseVideo(recordingId);
-      throw error;
-    }
-    void session.storage.delete("videoRecording").catch(() => {});
+  function stopAndUpload(recordingId: string, url: string, token: string) {
+    const upload = (async () => {
+      try {
+        await session.sendRequest<void>({ type: MiniappRequestType.VIDEO_RECORDING_STOP, recordingId, uploadUrl: url, uploadAuthToken: token }, { timeoutMs: VIDEO_UPLOAD_TIMEOUT_MS });
+      } catch (error) {
+        const { code, message } = (error as { code?: string; message?: string }) ?? {};
+        if (code === "media_error" || /upload/i.test(message ?? "")) await releaseVideo(recordingId);
+        throw error;
+      }
+      void session.storage.delete("videoRecording").catch(() => {});
+    })();
+    const tracked = upload.then(() => {}, () => {});
+    uploading = tracked;
+    void tracked.then(() => { if (uploading === tracked) uploading = null; });
+    return upload;
   }
 
   function uploadProblem(error: unknown): string {
@@ -462,13 +479,42 @@ registerMiniapp<Channels>(async (session) => {
         diagnostic("video.started", { session: capture.id, offset: video.offset });
         videoState(capture, video);
         // Stop was said while the camera was still starting.
-        if (state.capture !== capture) void stopVideo(capture);
+        if (state.capture !== capture) {
+          void stopVideo(capture);
+          return;
+        }
+        clearTimeout(videoLimit);
+        videoLimit = setTimeout(() => {
+          // The route is checked now: the tunnel's address can arrive after recording started.
+          if (state.capture !== capture || video.state !== "recording" || uploadRoute(capture.server).route !== "internet") return;
+          diagnostic("video.limit_reached", { session: capture.id });
+          state.message = "Video stopped at 2:20 to fit the internet upload. Audio, photos, and vitals are still recording.";
+          void stopVideo(capture);
+          keepCameraWarm(capture);
+          publish();
+        }, VIDEO_INTERNET_LIMIT_MS);
       })
       .catch((error: { code?: string; message?: string }) => {
+        const previous = uploading;
+        if (error?.code === "ALREADY_RECORDING" && previous) {
+          // Not stuck: the glasses are sending the last capture's video. Start this one when they're done.
+          video.state = "failed";
+          video.detail = "The glasses are still uploading the previous video. Video starts here as soon as that finishes.";
+          diagnostic("video.waiting_for_upload", { session: capture.id });
+          videoState(capture, video);
+          if (state.capture === capture) state.message = video.detail;
+          keepCameraWarm(capture);
+          void previous.then(() => {
+            if (state.capture === capture && capture.video === video) startVideo(capture);
+          });
+          return;
+        }
         video.state = "failed";
         video.detail = error?.code === "ALREADY_RECORDING"
           ? "Mentra still thinks an earlier video is recording. Fully quit and reopen the Mentra app to record video again. Photos and audio work meanwhile."
           : `The glasses did not start video. ${error?.message ?? ""} If the recording light is on, press the glasses' button to stop it.`.trim();
+        // Say so where the medic looks: until Mentra restarts, every capture will be missing video.
+        if (state.capture === capture) state.error = `No video for this capture. ${video.detail}`;
         diagnostic("video.start_failed", { session: capture.id, code: error?.code });
         videoState(capture, video);
         keepCameraWarm(capture);
@@ -560,6 +606,7 @@ registerMiniapp<Channels>(async (session) => {
     state.phase = "ready";
     void stopVideo(capture);
     clearTimeout(warmTimer);
+    clearTimeout(videoLimit);
     state.delivered = { id: capture.id, server: capture.server, status: "uploading", progress: "Sending the last audio and photos to the Mac…" };
     state.message = "Stopped. Nothing more is recorded or sent. The report will appear on the dashboard.";
     diagnostic("capture.stopped", { session: capture.id, seconds, audio: capture.audioSeq, photos: capture.photos.length, notes: capture.noteSeq });
@@ -585,18 +632,23 @@ registerMiniapp<Channels>(async (session) => {
   }
 
   // Speak through the glasses (the phone's audio route). Listening for vitals pauses meanwhile.
-  async function say(text: string): Promise<boolean> {
-    speakingUntil = Number.POSITIVE_INFINITY;
-    try {
-      await session.speaker.speak(text, { processing: "preferLocal" });
-      diagnostic("speech.said", { words: text.split(" ").length });
-      return true;
-    } catch (error) {
-      diagnostic("speech.say_failed", { code: (error as { code?: string })?.code });
-      return false;
-    } finally {
-      speakingUntil = Date.now() + ECHO_TAIL_MS;
-    }
+  // One phrase at a time: a new one would cut off the one playing.
+  function say(text: string): Promise<boolean> {
+    const spoken = speech.then(async () => {
+      speakingUntil = Number.POSITIVE_INFINITY;
+      try {
+        await session.speaker.speak(text, { processing: "preferLocal" });
+        diagnostic("speech.said", { words: text.split(" ").length });
+        return true;
+      } catch (error) {
+        diagnostic("speech.say_failed", { code: (error as { code?: string })?.code });
+        return false;
+      } finally {
+        speakingUntil = Date.now() + ECHO_TAIL_MS;
+      }
+    });
+    speech = spoken;
+    return spoken;
   }
 
   function logVital(capture: Capture, kind: VitalKind, value: string, status: Vital["status"], candidates: string[] = []) {
@@ -629,12 +681,28 @@ registerMiniapp<Channels>(async (session) => {
       const said = readings.filter(reading => reading.kind === kind);
       const clear = [...new Set(said.filter(reading => !reading.unclear).map(reading => reading.value))];
       const last = lastVitals.get(kind);
-      const recent = last && Date.now() - last.at < CORRECTION_WINDOW_MS ? [last.value] : [];
-      const values = [...new Set([...recent, ...clear])];
+      // A quick change to a value nobody has confirmed is a correction, so ask.
+      const correcting = last && !last.settled && Date.now() - last.at < CORRECTION_WINDOW_MS;
+      const values = [...new Set([...(correcting ? [last.value] : []), ...clear])];
       const unclear = said.some(reading => reading.unclear);
-      if (clear.length) lastVitals.set(kind, { value: clear.at(-1)!, at: Date.now() });
-      if (live && (unclear || values.length > 1)) askToRepeat(capture, kind, unclear ? [...values, UNCLEAR] : values);
-      else for (const value of clear) logVital(capture, kind, value, "heard");
+      if (live && (unclear || values.length > 1)) {
+        if (clear.length) lastVitals.set(kind, { value: clear.at(-1)!, at: Date.now(), settled: false });
+        askToRepeat(capture, kind, unclear ? [...values, UNCLEAR] : values);
+        continue;
+      }
+      for (const value of clear) {
+        if (live && last && last.value !== value) {
+          // The medic changed a logged value: the newest wins, read back so a mishearing gets caught.
+          lastVitals.set(kind, { value, at: Date.now(), settled: true });
+          logVital(capture, kind, value, "updated", [last.value, value]);
+          const name = vitalNames[kind];
+          state.voiceCommand = `Changed the ${name} from ${last.value} to ${value}.`;
+          void say(`${name[0].toUpperCase()}${name.slice(1)} updated to ${spokenValue(kind, value)}.`);
+        } else {
+          lastVitals.set(kind, { value, at: Date.now(), settled: last?.settled ?? false });
+          logVital(capture, kind, value, "heard");
+        }
+      }
     }
   }
 
@@ -688,7 +756,7 @@ registerMiniapp<Channels>(async (session) => {
     const request = repeat!;
     clearTimeout(request.timer);
     repeat = null;
-    lastVitals.set(request.kind, { value, at: Date.now() });
+    lastVitals.set(request.kind, { value, at: Date.now(), settled: true });
     logVital(request.capture, request.kind, value, "confirmed", request.candidates);
     const name = vitalNames[request.kind];
     state.voiceCommand = `Logged the ${name} as ${value}.`;
@@ -983,5 +1051,5 @@ registerMiniapp<Channels>(async (session) => {
       void checkDelivered();
     }
   }, 1000);
-  session.on("disconnect", () => { closed = true; streamAudio(false); resetSpeech(); clearTimeout(warmTimer); clearInterval(ticker); });
+  session.on("disconnect", () => { closed = true; streamAudio(false); resetSpeech(); clearTimeout(warmTimer); clearTimeout(videoLimit); clearInterval(ticker); });
 });

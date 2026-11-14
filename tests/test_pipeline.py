@@ -449,3 +449,53 @@ def test_an_unclear_vital_stays_unclear_on_the_card(client):
     apply_vitals(report, client.get(f"/api/sessions/{sid}").json()["vitals"])
     assert report["handoff"]["blood_pressure"] == "90/60 or unclear (unconfirmed)"
     assert report["handoff"]["heart_rate"] == "unclear (unconfirmed)"
+
+
+def test_a_vital_the_medic_changes_later_replaces_the_confirmed_one():
+    from server.processing import apply_vitals, vital_evidence
+    vitals = [
+        {"seq": 1, "kind": "hr", "value": "110", "status": "confirmed", "seconds": 8, "candidates": ["100", "110"]},
+        {"seq": 2, "kind": "hr", "value": "125", "status": "updated", "seconds": 300, "candidates": ["110", "125"]},
+        # The read-back's echo, same value.
+        {"seq": 3, "kind": "hr", "value": "125", "status": "heard", "seconds": 302, "candidates": []},
+    ]
+    report = {"uncertainties": [], "handoff": {"heart_rate": "110", "missing_fields": [], "evidence_ids": []}}
+    apply_vitals(report, vitals)
+    assert report["handoff"]["heart_rate"] == "125" and report["handoff"]["updated_fields"] == ["heart_rate"]
+    assert report["handoff"]["confirmed_fields"] == []
+    assert vital_evidence(vitals[1])["text"] == "The medic changed the heart rate from 110 to 125, and Inbound read it back. This replaces the earlier value."
+
+
+def test_invented_citations_are_dropped_instead_of_failing_the_report():
+    from server.models import GeneratedReport
+    evidence = [{"id": "audio_0", "kind": "transcript", "start": 0, "end": 30},
+                {"id": "snap_photo-1", "kind": "image", "start": 4, "end": 4, "file": "photo-1.jpg"}]
+    handoff = {"patient_age": None, "patient_sex": None, "blood_pressure": None, "heart_rate": None, "spo2": None,
+               "respiratory_rate": None, "injuries": [], "mechanism": None, "allergies": None, "eta_minutes": None,
+               "missing_fields": [], "evidence_ids": ["audio_0", "vital_99"]}
+    report = GeneratedReport(
+        title="t", summary=[{"text": "Supported.", "evidence_ids": ["audio_0", "photo_1"]}, {"text": "Invented.", "evidence_ids": ["note_9"]}],
+        sections=[{"heading": "Vitals", "statements": [{"text": "Invented.", "evidence_ids": ["vital_99"]}]}],
+        timeline=[], uncertainties=[], snap_captions=[], handoff=handoff)
+    result = validate_evidence(report, evidence)
+    assert [item["text"] for item in result["summary"]] == ["Supported."]
+    assert result["summary"][0]["evidence_ids"] == ["audio_0"]
+    assert result["sections"] == []
+    assert result["handoff"]["evidence_ids"] == ["audio_0"]
+    assert result["snap_captions"] == [{"evidence_id": "snap_photo-1", "caption": "The AI did not describe this photo."}]
+    assert result["uncertainties"] == ["2 statements were left out because they cited no supplied evidence."]
+
+
+def test_report_generation_retries_once_when_nothing_is_supported(monkeypatch):
+    from types import SimpleNamespace
+    from server.models import GeneratedReport
+    handoff = {"patient_age": None, "patient_sex": None, "blood_pressure": None, "heart_rate": None, "spo2": None,
+               "respiratory_rate": None, "injuries": [], "mechanism": None, "allergies": None, "eta_minutes": None,
+               "missing_fields": [], "evidence_ids": []}
+    replies = [GeneratedReport(title="t", summary=[{"text": "x", "evidence_ids": ["nope"]}], sections=[], timeline=[], uncertainties=[], snap_captions=[], handoff=handoff),
+               GeneratedReport(title="t", summary=[{"text": "y", "evidence_ids": ["audio_0"]}], sections=[], timeline=[], uncertainties=[], snap_captions=[], handoff=handoff)]
+    calls = []
+    fake = SimpleNamespace(responses=SimpleNamespace(parse=lambda **kwargs: calls.append(1) or SimpleNamespace(output_parsed=replies[len(calls) - 1])))
+    monkeypatch.setattr(ai, "client", lambda: fake)
+    report = ai.generate_report(Path("."), [{"id": "audio_0", "kind": "transcript", "start": 0, "end": 30}])
+    assert len(calls) == 2 and report["summary"][0]["text"] == "y"

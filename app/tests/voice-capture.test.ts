@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { MiniappRequestType as Request, MiniappResponseType as ResponseType } from "@mentra/miniapp/background";
 import type { State } from "../src/shared/channels";
 import { commandFrom, findCommands, speechWords } from "../src/shared/commands";
@@ -50,6 +50,8 @@ async function connect({ journal = null as string | null, video = false, failVid
   let tunnelUrl: string | null = null;
   let uploadTimesOut = false;
   let holdSpeech = false;
+  let holdVideoStop = false;
+  const heldVideoStops: (() => void)[] = [];
   const heldSpeech: (() => void)[] = [];
   let serverVideo: object | undefined;
   const originalSetInterval = globalThis.setInterval;
@@ -103,12 +105,15 @@ async function connect({ journal = null as string | null, video = false, failVid
         break;
       }
       case Request.VIDEO_RECORDING_STOP:
-        if (uploadUnreachable && payload.uploadUrl) reply(undefined, { code: "ERR_UNEXPECTED", message: "Video upload error: failed to connect to /192.0.2.1 (port 8000) from /10.16.95.18 (port 38510) after 10000ms" });
+        if (holdVideoStop && payload.uploadUrl) heldVideoStops.push(() => reply());
+        else if (uploadUnreachable && payload.uploadUrl) reply(undefined, { code: "ERR_UNEXPECTED", message: "Video upload error: failed to connect to /192.0.2.1 (port 8000) from /10.16.95.18 (port 38510) after 10000ms" });
         else if (uploadTimesOut && payload.uploadUrl) reply(undefined, { code: "ACTION_TIMEOUT", message: "Request timed out waiting for a response from the host" });
         else reply();
         break;
       case Request.VIDEO_RECORDING_START:
-        if (alreadyRecording > 0) {
+        // Mentra refuses a new recording while the last one is still uploading.
+        if (heldVideoStops.length) reply(undefined, { code: "ALREADY_RECORDING", message: "A video recording is already in progress" });
+        else if (alreadyRecording > 0) {
           alreadyRecording--;
           reply(undefined, { code: "ALREADY_RECORDING", message: "A video recording is already in progress" });
         } else if (failVideoStart) reply(undefined, { code: "ERR_UNEXPECTED", message: "Start timed out waiting for glasses response." });
@@ -183,6 +188,8 @@ async function connect({ journal = null as string | null, video = false, failVid
     spoken: () => requests.filter(request => request.type === Request.SPEAK).map(request => request.text),
     vitalPosts: () => calls.filter(call => call.path.endsWith("/vitals")).map(call => call.body as { kind: string; value: string; status: string; candidates: string[] }),
     holdSpeech: () => { holdSpeech = true; },
+    slowVideoUploads: () => { holdVideoStop = true; },
+    finishVideoUpload: () => heldVideoStops.shift()?.(),
     finishSpeech: () => heldSpeech.shift()?.(),
     uploadTimesOut: () => { uploadTimesOut = true; },
     serverHasVideo: (video: object) => { serverVideo = video; },
@@ -701,4 +708,83 @@ test("the speaker test talks through the glasses", async () => {
   await app.settle();
   expect(app.spoken()).toEqual(["This is Inbound. If you can hear me on the glasses, read-backs will work."]);
   expect(app.state.message).toContain("Played.");
+});
+
+test("a logged vital can be changed anytime by saying it again, and the glasses read the change back", async () => {
+  const app = await connect();
+  app.button("start");
+  app.voice("heart rate one ten, no, one twenty", true);
+  await app.settle(AFTER_SPEECH);
+  app.voice("one twenty", true);
+  await app.settle(AFTER_SPEECH);
+  expect(app.vitalPosts().at(-1)).toMatchObject({ kind: "hr", value: "120", status: "confirmed" });
+  // Right after confirming, the medic changes it on purpose: no question, just the new value read back.
+  app.voice("heart rate one thirty", true);
+  await app.settle();
+  expect(app.vitalPosts().at(-1)).toMatchObject({ kind: "hr", value: "130", status: "updated", candidates: ["120", "130"] });
+  expect(app.spoken().at(-1)).toBe("Heart rate updated to 130.");
+  expect(app.state.vitals[0]).toMatchObject({ value: "130", status: "updated" });
+});
+
+test("an unconfirmed vital changed after the correction window is an update, not a question", async () => {
+  const app = await connect();
+  app.button("start");
+  app.voice("sats ninety two", true);
+  await app.settle();
+  setSystemTime(new Date(Date.now() + 60_000));
+  try {
+    app.voice("sats ninety five", true);
+    await app.settle();
+  } finally {
+    setSystemTime();
+  }
+  expect(app.vitalPosts().map(vital => `${vital.status} ${vital.value}`)).toEqual(["heard 92", "updated 95"]);
+  expect(app.spoken()).toEqual(["Oxygen saturation updated to 95 percent."]);
+});
+
+test("over the internet the video stops before the upload limit, and snaps become photos again", async () => {
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((callback: () => void, ms?: number) => realSetTimeout(callback, ms === 140_000 ? 30 : ms)) as typeof setTimeout;
+  try {
+    const app = await connect({ video: true });
+    app.serverTunnel("https://inbound-demo.trycloudflare.com");
+    app.button("start");
+    await app.settle();
+    app.button("snap");
+    await app.settle(60);
+    // The video was stopped and sent; the capture goes on.
+    expect(app.state.phase).toBe("recording");
+    expect(app.state.message).toContain("Video stopped at 2:20");
+    expect(app.requests.filter(request => request.type === Request.VIDEO_RECORDING_STOP)).toHaveLength(1);
+    app.button("snap");
+    await app.settle();
+    expect(app.state.capture!.photos.map(photo => photo.status)).toEqual(["from_video", "saved"]);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+});
+
+test("when Mentra still holds an old recording, the medic is told right away", async () => {
+  const app = await connect({ video: true, alreadyRecording: 2, staleRecording: "camera-old" });
+  app.button("start");
+  await app.settle();
+  expect(app.state.error).toContain("No video for this capture. Mentra still thinks an earlier video is recording");
+});
+
+test("while the last video is still uploading, the next capture starts its video as soon as it finishes", async () => {
+  const app = await connect({ video: true });
+  app.slowVideoUploads();
+  app.button("start");
+  await app.settle();
+  app.button("stop");
+  await app.settle();
+  app.button("start");
+  await app.settle();
+  expect(app.state.message).toBe("The glasses are still uploading the previous video. Video starts here as soon as that finishes.");
+  // Not released: it's uploading, not stuck.
+  expect(app.requests.filter(request => request.type === Request.VIDEO_RECORDING_STOP)).toHaveLength(1);
+  app.finishVideoUpload();
+  await app.settle();
+  expect(app.state.capture!.video).toMatchObject({ state: "recording" });
+  expect(app.videoStates()).toEqual(["recording", "uploading", "failed", "recording"]);
 });

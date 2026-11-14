@@ -144,7 +144,11 @@ function renderVideo(session, snaps) {
     : `<p class="muted small">${ready ? "No photos were taken in this capture." : "Photo moments appear here once the video is ready."}</p>`;
   showTab(tab);
 }
-const player = () => (selected?.has_video ? $("recording") : $("recording-audio"));
+// The glasses' own video, once it has arrived for a capture that went through the phone.
+const glassesVideo = (session) => (!session?.has_video && session?.video?.state === "ready" ? session.video : null);
+const player = () => (selected?.has_video || glassesVideo(selected) ? $("recording") : $("recording-audio"));
+// Evidence times count from Start; the glasses' video starts a moment later.
+const playerTime = (seconds) => Math.max(0, seconds - (glassesVideo(selected)?.offset || 0));
 
 function refs(ids) {
   return ids
@@ -163,9 +167,13 @@ function handoffCard(card) {
     text === null || text === undefined || text === ""
       ? '<span class="not-reported">Not reported</span>'
       : escapeHtml(text);
-  // Vitals the medic repeated when the glasses asked are confirmed; the rest are as reported.
-  const confirmed = new Set(card.confirmed_fields || []);
-  const unconfirmed = new Set(card.unconfirmed_fields || []);
+  // Vitals the medic repeated when the glasses asked are confirmed, and ones the medic changed
+  // later are updated. The rest are as reported.
+  const marks = new Map([
+    ...(card.confirmed_fields || []).map((field) => [field, ["confirmed", "✓ confirmed", "The medic repeated this value when the glasses asked"]]),
+    ...(card.updated_fields || []).map((field) => [field, ["confirmed", "✓ updated", "The medic changed this value, and the glasses read it back"]]),
+    ...(card.unconfirmed_fields || []).map((field) => [field, ["unconfirmed", "", ""]]),
+  ]);
   const rows = [
     ["BP", "blood_pressure", card.blood_pressure],
     ["Heart rate", "heart_rate", card.heart_rate],
@@ -177,7 +185,10 @@ function handoffCard(card) {
     ["ETA", "eta_minutes", card.eta_minutes === null ? null : `${card.eta_minutes} min`],
   ];
   return `<section class="handoff"><h2>Handoff card · medic's report</h2>
-    <dl>${rows.map(([label, field, text]) => `<div class="${confirmed.has(field) ? "confirmed" : unconfirmed.has(field) ? "unconfirmed" : ""}"><dt>${label}${confirmed.has(field) ? ' <span title="The medic repeated this value when the glasses asked">✓ confirmed</span>' : ""}</dt><dd>${value(text)}</dd></div>`).join("")}</dl>
+    <dl>${rows.map(([label, field, text]) => {
+      const [style, badge, title] = marks.get(field) || ["", "", ""];
+      return `<div class="${style}"><dt>${label}${badge ? ` <span title="${title}">${badge}</span>` : ""}</dt><dd>${value(text)}</dd></div>`;
+    }).join("")}</dl>
     <p><b>Injuries</b> ${card.injuries.length ? card.injuries.map(escapeHtml).join("; ") : value(null)}</p>
     <p><b>Mechanism</b> ${value(card.mechanism)}</p>
     ${card.missing_fields.length ? `<p class="missing-fields">Missing: ${card.missing_fields.map((field) => escapeHtml(field.replaceAll("_", " "))).join(", ")}</p>` : ""}
@@ -185,7 +196,7 @@ function handoffCard(card) {
 }
 
 const vitalLabels = { bp: "BP", hr: "Heart rate", spo2: "SpO₂", rr: "Resp. rate" };
-const vitalStatus = { heard: "Heard", conflict: "Asked to repeat", confirmed: "✓ Confirmed", unconfirmed: "Not confirmed" };
+const vitalStatus = { heard: "Heard", conflict: "Asked to repeat", confirmed: "✓ Confirmed", updated: "✓ Updated", unconfirmed: "Not confirmed" };
 
 // Before the report is written, the ER sees each vital as the phone logs it.
 function liveVitals(vitals) {
@@ -194,7 +205,7 @@ function liveVitals(vitals) {
     .map((vital) => {
       // Until the medic repeats it, both values stay on screen.
       const shown = ["conflict", "unconfirmed"].includes(vital.status) && vital.candidates.length ? vital.candidates.join(" or ") : vital.value;
-      return `<div class="${vital.status === "confirmed" ? "confirmed" : vital.status === "heard" ? "" : "unconfirmed"}"><dt>${vitalLabels[vital.kind]} · ${vitalStatus[vital.status]}</dt><dd>${escapeHtml(shown)}${vital.kind === "spo2" ? "%" : ""}</dd></div>`;
+      return `<div class="${["confirmed", "updated"].includes(vital.status) ? "confirmed" : vital.status === "heard" ? "" : "unconfirmed"}"><dt>${vitalLabels[vital.kind]} · ${vitalStatus[vital.status]}</dt><dd>${escapeHtml(shown)}${vital.kind === "spo2" ? "%" : ""}</dd></div>`;
     })
     .join("")}</dl></section>`;
 }
@@ -208,9 +219,11 @@ function render(session) {
   $("sample-label").hidden = session.source !== "sample";
   $("duration").textContent = session.duration ? time(session.duration) : "";
   const audioOnly = session.media === "audio";
+  const fromGlasses = glassesVideo(session);
   for (const [id, name, show] of [
-    ["recording", "recording.mp4", session.has_video && session.duration],
-    ["recording-audio", "recording.wav", audioOnly],
+    ["recording", fromGlasses ? fromGlasses.file : "recording.mp4", (session.has_video && session.duration) || fromGlasses],
+    // The phone's audio, unless the glasses' video already carries sound.
+    ["recording-audio", "recording.wav", audioOnly && !fromGlasses?.has_audio],
   ]) {
     const element = $(id);
     if (show && element.getAttribute("src") !== mediaUrl(name))
@@ -283,7 +296,7 @@ document.addEventListener("click", (event) => {
   const sourceItem = source && selected.evidence.find((entry) => entry.id === source.dataset.source);
   if (sourceItem && isPhoto(sourceItem)) showEvidence(sourceItem);
   else if (sourceItem && !player().hidden) {
-    player().currentTime = sourceItem.start;
+    player().currentTime = playerTime(sourceItem.start);
     player().scrollIntoView({ behavior: "smooth", block: "center" });
     player().play().catch(showError);
   }
