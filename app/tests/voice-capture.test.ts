@@ -32,6 +32,9 @@ async function connect({ journal = null as string | null, video = false, failVid
   let tick: (() => void) | undefined;
   let offline = 0;
   let refuseToken = false;
+  let holdPhotos = false;
+  let busyNext = 0;
+  const heldPhotos: (() => void)[] = [];
   let macStatus = "processing";
   let photoReply: object | null = { photoUrl: "https://photos.example/1.jpg", mimeType: "image/jpeg" };
   const rejected = new Map<string, number>();
@@ -76,10 +79,15 @@ async function connect({ journal = null as string | null, video = false, failVid
         storage.delete(payload.key);
         reply();
         break;
-      case Request.PHOTO:
-        if (photoReply) reply(photoReply);
-        else reply(undefined, { code: "camera_busy", message: "Camera is busy" });
+      case Request.PHOTO: {
+        const answer = () => photoReply ? reply(photoReply) : reply(undefined, { code: "camera_busy", message: "Camera is busy" });
+        if (busyNext > 0) {
+          busyNext--;
+          reply(undefined, { code: "camera_busy", message: "Camera is busy" });
+        } else if (holdPhotos) heldPhotos.push(answer);
+        else answer();
         break;
+      }
       case Request.VIDEO_RECORDING_START:
         if (failVideoStart) reply(undefined, { code: "ERR_UNEXPECTED", message: "Start timed out waiting for glasses response." });
         else reply({ recordingId: "camera-1" });
@@ -138,6 +146,10 @@ async function connect({ journal = null as string | null, video = false, failVid
     tick: () => tick?.(),
     goOffline: (requests: number) => { offline = requests; },
     refuseToken: (value: boolean) => { refuseToken = value; },
+    // Photos that take a while to capture and transfer.
+    holdPhotos: () => { holdPhotos = true; },
+    releasePhoto: () => heldPhotos.shift()?.(),
+    busyNextPhoto: () => { busyNext++; },
     toggleVideo: (enabled: boolean) => event("_ui", { type: "UI_MESSAGE", channel: "video", payload: { enabled } }),
     reject: (endpoint: string, status: number) => rejected.set(endpoint, status),
     photoReply: (value: object | null) => { photoReply = value; },
@@ -365,12 +377,14 @@ test("start also records video, and stop asks the glasses to upload it to the se
   expect(app.posts().at(-1)).toBe("/finish");
 });
 
-test("a snap the camera refuses during video becomes a still from the video", async () => {
+test("during video a snap is marked instantly, and its still comes from the video", async () => {
   const app = await connect({ video: true });
-  app.photoReply(null);
   app.button("start");
   app.voice("snap the left forearm", true);
   await app.settle();
+  // The glasses refuse photos while recording, so Inbound doesn't ask.
+  expect(app.requests.some(request => request.type === Request.PHOTO)).toBe(false);
+  expect(app.requests.some(request => request.type === Request.CAMERA_WARM_UP)).toBe(false);
   expect(app.state.capture!.photos[0].status).toBe("from_video");
   expect(app.state.error).toBe("");
   const seconds = app.state.capture!.photos[0].seconds;
@@ -398,4 +412,44 @@ test("audio and photos keep recording when the glasses can't start video, and vi
   await app.settle();
   expect(app.requests.filter(request => request.type === Request.VIDEO_RECORDING_START)).toHaveLength(1);
   expect(app.storage.get("video")).toBe("off");
+});
+
+test("without video, the camera stays warm and each snap fires without waiting for the last photo", async () => {
+  const app = await connect();
+  app.holdPhotos();
+  app.button("start");
+  await app.settle();
+  expect(app.requests.find(request => request.type === Request.CAMERA_WARM_UP)).toMatchObject({ size: "medium", mode: "photo" });
+  app.voice("snap the arm then snap the leg", true);
+  await app.settle();
+  // Both shutters fired while the first photo was still transferring.
+  expect(app.requests.filter(request => request.type === Request.PHOTO)).toHaveLength(2);
+  app.button("stop");
+  await app.settle();
+  expect(app.posts()).not.toContain("/finish");
+  app.releasePhoto();
+  app.releasePhoto();
+  await app.settle();
+  expect(app.state.delivered).not.toBeNull();
+  expect(app.posts().slice(-3)).toEqual(["/photos", "/photos", "/finish"]);
+});
+
+test("a snap the camera is too busy for is retried once the previous photo is done", async () => {
+  const app = await connect();
+  app.holdPhotos();
+  app.button("start");
+  app.button("snap");
+  await app.settle();
+  app.busyNextPhoto();
+  app.button("snap");
+  await app.settle();
+  expect(app.requests.filter(request => request.type === Request.PHOTO)).toHaveLength(2);
+  app.releasePhoto();
+  await app.settle();
+  // The retry went out after the first photo finished.
+  expect(app.requests.filter(request => request.type === Request.PHOTO)).toHaveLength(3);
+  app.releasePhoto();
+  await app.settle();
+  expect(app.state.capture!.photos.map(photo => photo.status)).toEqual(["saved", "saved"]);
+  expect(app.state.error).toBe("");
 });

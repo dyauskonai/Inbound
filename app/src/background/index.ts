@@ -28,8 +28,8 @@ const AUDIO_FLUSH_CHARS = 256 * 1024;
 const OUTBOX_LIMIT = 48 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 20000;
 const PHOTO_TIMEOUT_MS = 30000;
-// While the camera records video it may refuse photos; don't hold up the next snap for long.
-const PHOTO_DURING_VIDEO_TIMEOUT_MS = 12000;
+// Re-warmed while a photo-only capture runs, and cools down within this long after Stop.
+const WARM_MS = 60000;
 const VIDEO_START_TIMEOUT_MS = 30000;
 // `save` keeps a copy in the glasses' gallery in case the Wi-Fi upload fails.
 const videoOptions = { width: 1280, height: 720, fps: 30, save: true, sound: false };
@@ -48,7 +48,11 @@ registerMiniapp<Channels>(async (session) => {
   };
   let hydrated = false;
   let closed = false;
-  let photoChain = Promise.resolve();
+  // Photos in flight. Stop sends finish only after all of them settle.
+  const photoTasks = new Set<Promise<void>>();
+  let lastPhoto: Promise<void> = Promise.resolve();
+  let videoStarting: Promise<void> | null = null;
+  let warmTimer: ReturnType<typeof setTimeout> | undefined;
   let journalWrite = Promise.resolve();
   let audioChunks: string[] = [];
   let audioChars = 0;
@@ -235,6 +239,7 @@ registerMiniapp<Channels>(async (session) => {
     diagnostic("capture.started", { session: capture.id, glasses: state.connected });
     void save().catch(problem);
     if (state.videoEnabled && state.camera) startVideo(capture);
+    else keepCameraWarm(capture);
     publish();
     if (!state.online) {
       void selectServer(state.server, true).then((server) => {
@@ -257,12 +262,42 @@ registerMiniapp<Channels>(async (session) => {
     }
     const photo: Photo = { seq: capture.photos.length + 1, seconds: elapsed(capture), status: "taking" };
     capture.photos.push(photo);
-    state.message = `Taking photo ${photo.seq}…`;
     diagnostic("photo.requested", { session: capture.id, number: photo.seq, seconds: photo.seconds });
+    // Fire the shutter now rather than after the previous photo finishes transferring.
+    const task = shoot(capture, photo, lastPhoto);
+    lastPhoto = task;
+    photoTasks.add(task);
+    void task.finally(() => photoTasks.delete(task));
     publish();
-    // One camera request at a time; overlapping requests make the glasses report busy.
-    const taken = photoChain.then(() => takePhoto(capture, photo));
-    photoChain = taken.catch(() => {});
+  }
+
+  async function shoot(capture: Capture, photo: Photo, previous: Promise<void>) {
+    if (capture.video?.state === "starting") await videoStarting;
+    if (capture.video && capture.video.state !== "failed") {
+      // The glasses refuse photos while they record video. The still comes from
+      // the video at this exact moment once the glasses upload it.
+      photo.status = "from_video";
+      diagnostic("photo.from_video", { session: capture.id, number: photo.seq });
+      if (state.capture === capture) state.message = `Photo ${photo.seq} marked. Its still comes from the glasses video.`;
+      publish();
+      return;
+    }
+    if (state.capture === capture) state.message = `Taking photo ${photo.seq}…`;
+    publish();
+    await takePhoto(capture, photo, previous);
+  }
+
+  // A warm camera captures without its start-up delay. The glasses' video holds the
+  // camera, so only photo-only captures warm it.
+  function keepCameraWarm(capture: Capture) {
+    clearTimeout(warmTimer);
+    if (state.capture !== capture || (capture.video && capture.video.state !== "failed")) return;
+    // Warming while a photo is being captured makes the glasses report busy.
+    if (!photoTasks.size) {
+      void session.camera.warmUp({ size: "medium", mode: "photo", durationMs: WARM_MS })
+        .then(() => diagnostic("camera.warm", { session: capture.id }), (error: { code?: string }) => diagnostic("camera.warm_failed", { code: error?.code }));
+    }
+    warmTimer = setTimeout(() => keepCameraWarm(capture), WARM_MS - 10000);
   }
 
   async function download(url: string): Promise<Uint8Array | null> {
@@ -274,15 +309,26 @@ registerMiniapp<Channels>(async (session) => {
     }
   }
 
-  async function takePhoto(capture: Capture, photo: Photo) {
+  async function takePhoto(capture: Capture, photo: Photo, previous: Promise<void>) {
     const requestedAt = Date.now();
+    // Newer Mentra hosts keep the photo on the phone (`delivery: "local"`);
+    // older ones return a short-lived URL instead. Handle both.
+    const request = () => session.sendRequest<PhotoResult>({
+      type: MiniappRequestType.PHOTO, size: "medium", mode: "photo", transferMethod: "auto",
+      sound: true, saveToGallery: false, delivery: "local",
+    }, { timeoutMs: PHOTO_TIMEOUT_MS });
     try {
-      // Newer Mentra hosts keep the photo on the phone (`delivery: "local"`);
-      // older ones return a short-lived URL instead. Handle both.
-      const result = await session.sendRequest<PhotoResult>({
-        type: MiniappRequestType.PHOTO, size: "medium", mode: "photo", transferMethod: "auto",
-        sound: true, saveToGallery: false, delivery: "local",
-      }, { timeoutMs: capture.video?.state === "recording" ? PHOTO_DURING_VIDEO_TIMEOUT_MS : PHOTO_TIMEOUT_MS });
+      let result: PhotoResult;
+      try {
+        result = await request();
+      } catch (error) {
+        const { code, message } = (error as { code?: string; message?: string }) ?? {};
+        if (!/busy/i.test(`${code} ${message}`)) throw error;
+        // The previous photo still holds the camera. Take this one as soon as it's done.
+        diagnostic("photo.camera_busy", { session: capture.id, number: photo.seq });
+        await previous;
+        result = await request();
+      }
       let bytes: Uint8Array | null = null;
       if (result?.key) {
         bytes = await session.blob.bytes(result.key).catch(() => null);
@@ -301,14 +347,6 @@ registerMiniapp<Channels>(async (session) => {
         done: (ok) => { photo.status = ok ? "saved" : "failed"; publish(); },
       });
     } catch (error) {
-      if (capture.video?.state === "recording" || capture.video?.state === "stopping") {
-        // The camera is busy recording. The server takes this still from the video instead.
-        photo.status = "from_video";
-        diagnostic("photo.from_video", { session: capture.id, number: photo.seq, code: (error as { code?: string })?.code });
-        if (state.capture === capture) state.message = `Photo ${photo.seq} will be taken from the video.`;
-        publish();
-        return;
-      }
       photo.status = "failed";
       problem(error, `photo ${photo.seq}`);
     }
@@ -344,9 +382,10 @@ registerMiniapp<Channels>(async (session) => {
         video.detail = `The glasses did not start video. ${error?.message ?? ""} If the recording light is on, press the glasses' button to stop it.`.trim();
         diagnostic("video.start_failed", { session: capture.id, code: error?.code });
         videoState(capture, video);
+        keepCameraWarm(capture);
       });
-    // Photos wait for the camera to settle into recording.
-    photoChain = photoChain.then(() => started);
+    // Snaps said while the camera starts wait to see whether video is recording.
+    videoStarting = started;
   }
 
   async function stopVideo(capture: Capture) {
@@ -385,13 +424,14 @@ registerMiniapp<Channels>(async (session) => {
     state.capture = null;
     state.phase = "ready";
     void stopVideo(capture);
+    clearTimeout(warmTimer);
     state.delivered = { id: capture.id, server: capture.server, status: "uploading", progress: "Sending the last audio and photos to the Mac…" };
     state.message = "Stopped. Nothing more is recorded or sent. The report will appear on the dashboard.";
     diagnostic("capture.stopped", { session: capture.id, seconds, audio: capture.audioSeq, photos: capture.photos.length, notes: capture.noteSeq });
     void save().catch(problem);
     publish();
     // Finish only after the last photo is queued, so the Mac has everything when it starts the report.
-    void photoChain.then(() => finish(capture, seconds));
+    void Promise.allSettled([...photoTasks]).then(() => finish(capture, seconds));
   }
 
   function finish(capture: Capture, seconds: number) {
@@ -656,5 +696,5 @@ registerMiniapp<Channels>(async (session) => {
       void checkDelivered();
     }
   }, 1000);
-  session.on("disconnect", () => { closed = true; streamAudio(false); resetSpeech(); clearInterval(ticker); });
+  session.on("disconnect", () => { closed = true; streamAudio(false); resetSpeech(); clearTimeout(warmTimer); clearInterval(ticker); });
 });
