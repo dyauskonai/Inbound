@@ -38,7 +38,7 @@ registerMiniapp<Channels>(async (session) => {
     phase: "ready", server: INBOUND_SERVER, defaultServer: INBOUND_SERVER,
     online: false, aiConfigured: false, camera: false, connected: false, battery: null, audio: false,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
-    message: "Say “start” to begin. Say “snap” for a photo and “stop” to send the report.", error: "",
+    message: "Say “start” to begin. Nothing is recorded or sent until then.", error: "",
     capture: null, delivered: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
   };
   let hydrated = false;
@@ -221,6 +221,7 @@ registerMiniapp<Channels>(async (session) => {
       body: JSON.stringify({ id: capture.id, title: `Glasses capture · ${new Date().toLocaleTimeString()}`, source: "glasses", auto_report: true }),
     });
     resetAudio();
+    streamAudio(true);
     state.capture = capture;
     state.phase = "recording";
     state.audio = false;
@@ -303,12 +304,13 @@ registerMiniapp<Channels>(async (session) => {
     const capture = state.capture;
     if (!capture) return;
     flushAudio(capture);
+    streamAudio(false);
     if (state.heard && !state.heardFinal) note(capture, state.heard);
     const seconds = elapsed(capture);
     state.capture = null;
     state.phase = "ready";
     state.delivered = { id: capture.id, server: capture.server, status: "uploading", progress: "Sending the last audio and photos to the Mac…" };
-    state.message = "Stopped. The report will appear on the Mac dashboard.";
+    state.message = "Stopped. Nothing more is recorded or sent. The report will appear on the dashboard.";
     diagnostic("capture.stopped", { session: capture.id, seconds, audio: capture.audioSeq, photos: capture.photos.length, notes: capture.noteSeq });
     void save().catch(problem);
     publish();
@@ -445,7 +447,7 @@ registerMiniapp<Channels>(async (session) => {
     publish();
   }, { processing: "localOnly" });
 
-  session.mic.onAudioChunk((chunk) => {
+  function receiveAudio(chunk: { data: string; sampleRate?: number; format?: string }) {
     const capture = state.capture;
     if (!capture || !chunk?.data) return;
     const rate = chunk.sampleRate || 16000;
@@ -464,7 +466,18 @@ registerMiniapp<Channels>(async (session) => {
       publish();
     }
     if (audioChars >= AUDIO_FLUSH_CHARS) flushAudio(capture);
-  });
+  }
+
+  // Raw audio is wanted only between Start and Stop. While it is subscribed, Mentra has
+  // the glasses send a second, uncompressed stream; voice commands need only the first.
+  let stopAudio: (() => void) | null = null;
+  function streamAudio(on: boolean) {
+    if (on && !stopAudio) stopAudio = session.mic.onAudioChunk(receiveAudio);
+    else if (!on && stopAudio) {
+      stopAudio();
+      stopAudio = null;
+    }
+  }
 
   session.ui.handle("getState", snapshot);
   session.ui.handle("copyDiagnostics", () => session.system.copyToClipboard(state.diagnostics.join("\n")));
@@ -548,5 +561,5 @@ registerMiniapp<Channels>(async (session) => {
       void checkDelivered();
     }
   }, 1000);
-  session.on("disconnect", () => { closed = true; resetSpeech(); clearInterval(ticker); });
+  session.on("disconnect", () => { closed = true; streamAudio(false); resetSpeech(); clearInterval(ticker); });
 });

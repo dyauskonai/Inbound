@@ -42,7 +42,8 @@ export function App() {
       {!!state?.pending && <small>{state.pending} upload{state.pending === 1 ? "" : "s"} waiting · {Math.ceil(state.pendingBytes / 1024)} KB</small>}
       {state?.delivered && !recording && <small role="status">Last capture: {state.delivered.progress}</small>}
       <div className="voice">{state?.voice || "Loading voice controls"}</div>
-      {state?.heard && <small>{state.heardFinal ? "Heard" : "Listening"}: “{state.heard}”</small>}
+      {!recording && state?.voice === "Voice commands ready" && <small>The phone listens for “start” on its own. Nothing is recorded or sent until you start.</small>}
+      {state?.heard && <small>{recording ? state.heardFinal ? "Heard" : "Listening" : "Heard on the phone, not sent"}: “{state.heard}”</small>}
       {state?.voiceCommand && <small role="status">{state.voiceCommand}</small>}
     </section>
     <div className="commands"><span><b>“Start”</b>Record</span><span><b>“Snap”</b>Take a photo</span><span><b>“Stop”</b>Send report</span></div>

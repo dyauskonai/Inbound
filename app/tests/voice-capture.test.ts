@@ -323,3 +323,21 @@ test("the build's access token is sent, and a refused token keeps uploads queued
     host.INBOUND_TOKEN = "";
   }
 });
+
+test("raw audio streams only between start and stop", async () => {
+  const app = await connect();
+  // Plain streams are listed by name; transcription entries are objects.
+  const subscribed = () => ((app.requests.filter(request => request.type === Request.SUBSCRIBE).at(-1)?.subscriptions ?? []) as unknown[])
+    .includes("audio_chunk");
+  expect(subscribed()).toBe(false);
+  app.button("start");
+  await app.settle();
+  expect(subscribed()).toBe(true);
+  app.button("stop");
+  await app.settle();
+  expect(subscribed()).toBe(false);
+  // Voice commands keep listening for the next "start".
+  app.voice("okay start again", true);
+  expect(app.state.phase).toBe("recording");
+  expect(subscribed()).toBe(true);
+});
