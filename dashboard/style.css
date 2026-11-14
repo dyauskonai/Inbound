@@ -401,6 +401,54 @@ video {
   display: block;
   max-height: 380px;
 }
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 40px 24px;
+  border-bottom: 1px solid var(--line);
+}
+button.tab {
+  background: none;
+  color: var(--muted);
+  border-radius: 0;
+  padding: 10px 14px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+button.tab[aria-selected="true"] {
+  color: var(--green);
+  border-bottom-color: var(--green);
+}
+.tab-badge {
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+.video-view {
+  padding: 0 40px 50px;
+  max-width: 1100px;
+}
+#full-video {
+  max-height: 70vh;
+  margin-bottom: 12px;
+}
+button.moment-link {
+  margin: 0 8px 8px 0;
+  background: #edf3ee;
+  color: #2e4c3f;
+}
+button.moment-link small {
+  margin-left: 6px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 1100px) {
+  .tabs {
+    margin: 0 25px 20px;
+  }
+  .video-view {
+    padding: 0 25px 35px;
+  }
+}
 #recording-audio {
   width: 100%;
   display: block;

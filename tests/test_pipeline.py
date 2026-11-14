@@ -16,7 +16,7 @@ from server.store import Store
 
 @pytest.fixture
 def client(tmp_path):
-    app = create_app(tmp_path)
+    app = create_app(tmp_path, video_wait=0.3)
     with TestClient(app) as client:
         yield client
     app.state.processor.pool.shutdown(wait=True)
@@ -63,24 +63,6 @@ def test_browser_webm_snaps_and_missing_key(client, video, monkeypatch):
         assert response.status_code == 206
         assert len(response.content) == 101
     assert client.get(f"/media/{sid}/original").status_code == 404
-
-
-def test_glasses_upload_keeps_snap_near_the_end(client, video, monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    sid = client.post("/api/sessions", json={"source": "glasses", "auto_report": True}).json()["id"]
-    path = f"/api/sessions/{sid}"
-    bookmarks = [{"id": "mark-1", "seconds": 3.8, "label": "Snap 1"}]
-    assert client.put(f"{path}/capture", json={"bookmarks": bookmarks}).status_code == 200
-    with video.open("rb") as recording:
-        response = client.post(f"{path}/video", files={"video": recording}, data={"requestId": "camera-id"})
-    assert response.status_code == 200
-    result = finished(client, sid)
-    assert result["status"] == "awaiting_key"
-    assert result["has_audio"]
-    snap = next(item for item in result["evidence"] if item["id"] == "snap_mark-1")
-    assert 2.5 < snap["start"] < result["duration"]
-    assert client.get(f"/media/{sid}/{snap['file']}").status_code == 200
-    assert client.get(f"/media/{sid}/{snap['clip']}").status_code == 200
 
 
 def test_duplicate_upload_is_idempotent(client,video):
@@ -281,3 +263,56 @@ def test_cloud_transcript_gets_back_the_snap_the_phone_heard():
     assert len(corrections) == 1 and '"splinted"' in corrections[0]
     # Already correct: nothing changes.
     assert restore_snaps([{"text": "Snap the left forearm."}], notes[:1]) == []
+
+
+def test_glasses_video_fills_refused_snaps_and_shows_in_the_video_tab(client, video, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    sid, path = phone_capture(client)
+    # The glasses confirmed video one second after Start.
+    assert client.post(f"{path}/video-state", json={"state": "recording", "offset": 1.0}).status_code == 200
+    # Snap 3 was refused by the camera while recording, so it waits for the video.
+    finish = client.post(f"{path}/finish", json={"audio_parts": 2, "photos": 3, "notes": 1, "seconds": 6, "video_frames": [{"seq": 3, "seconds": 2.5}]})
+    assert finish.json()["status"] == "waiting_video"
+    assert client.post(f"{path}/video-state", json={"state": "uploading"}).status_code == 200
+    with video.open("rb") as data:
+        assert client.post(f"{path}/video", files={"video": ("glasses.mp4", data, "video/mp4")}, data={"requestId": "x", "type": "video_upload"}).status_code == 200
+    result = finished(client, sid)
+    assert result["status"] == "awaiting_key"
+    assert result["video"]["state"] == "ready" and result["video"]["offset"] == 1.0 and 2.9 < result["video"]["duration"] < 3.2
+    frame = next(photo for photo in result["photos"] if photo["seq"] == 3)
+    assert frame["from_video"] and frame["seconds"] == 2.5
+    assert "snap_photo-3" in [item["id"] for item in result["evidence"]]
+    for name in ["video.mp4", "photo-3.jpg"]:
+        assert client.get(f"/media/{sid}/{name}").status_code == 200
+    # A retried upload of the same file is accepted without changes; the video stays separate from the audio.
+    with video.open("rb") as data:
+        assert client.post(f"{path}/video", files={"video": data}).status_code == 200
+    assert not result["has_video"] and result["media"] == "audio"
+
+
+def test_report_does_not_wait_forever_for_a_video(client, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    sid, path = phone_capture(client)
+    client.post(f"{path}/video-state", json={"state": "recording", "offset": 0.5})
+    assert client.post(f"{path}/finish", json={"video_frames": [{"seq": 3, "seconds": 2}]}).json()["status"] == "waiting_video"
+    time.sleep(0.5)
+    result = finished(client, sid)
+    assert result["status"] == "awaiting_key"
+    assert all(photo["seq"] != 3 for photo in result["photos"])
+
+
+def test_video_before_finish_and_failed_video(client, video, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    sid, path = phone_capture(client)
+    client.post(f"{path}/video-state", json={"state": "recording", "offset": 0})
+    with video.open("rb") as data:
+        client.post(f"{path}/video", files={"video": data})
+    # The video arrived first, so finish takes the frame from it and doesn't wait.
+    assert client.post(f"{path}/finish", json={"video_frames": [{"seq": 3, "seconds": 1}]}).json()["status"] in {"processing", "awaiting_key"}
+    assert any(photo["seq"] == 3 for photo in finished(client, sid)["photos"])
+    other, other_path = phone_capture(client)
+    client.post(f"{other_path}/video-state", json={"state": "recording", "offset": 0})
+    assert client.post(f"{other_path}/finish", json={"video_frames": [{"seq": 3, "seconds": 1}]}).json()["status"] == "waiting_video"
+    # The glasses report the upload failed: write the report now.
+    client.post(f"{other_path}/video-state", json={"state": "failed", "detail": "Upload failed"})
+    assert finished(client, other)["status"] == "awaiting_key"

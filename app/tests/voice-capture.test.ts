@@ -27,7 +27,7 @@ afterEach(() => {
 
 interface Call { method: string; path: string; body: unknown; auth?: string }
 
-async function connect({ journal = null as string | null } = {}) {
+async function connect({ journal = null as string | null, video = false, failVideoStart = false } = {}) {
   let state!: State;
   let tick: (() => void) | undefined;
   let offline = 0;
@@ -37,7 +37,7 @@ async function connect({ journal = null as string | null } = {}) {
   const rejected = new Map<string, number>();
   const calls: Call[] = [];
   const requests: { type: string; [key: string]: unknown }[] = [];
-  const storage = new Map<string, string>(journal ? [["capture", journal]] : []);
+  const storage = new Map<string, string>([["video", video ? "on" : "off"], ...(journal ? [["capture", journal] as [string, string]] : [])]);
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = ((callback: () => void, interval: number) => {
     if (interval === 1000) tick = callback;
@@ -79,6 +79,10 @@ async function connect({ journal = null as string | null } = {}) {
       case Request.PHOTO:
         if (photoReply) reply(photoReply);
         else reply(undefined, { code: "camera_busy", message: "Camera is busy" });
+        break;
+      case Request.VIDEO_RECORDING_START:
+        if (failVideoStart) reply(undefined, { code: "ERR_UNEXPECTED", message: "Start timed out waiting for glasses response." });
+        else reply({ recordingId: "camera-1" });
         break;
       case Request.BLOB_OPEN_READ:
         reply({ handle: "photo-handle", meta: {} });
@@ -125,13 +129,16 @@ async function connect({ journal = null as string | null } = {}) {
   return {
     get state() { return state; },
     calls, requests, storage, settle,
-    posts: () => calls.filter(call => call.method === "POST").map(call => call.path.replace(/^\/api\/sessions\/[^/]+/, "").replace(/\?.*$/, "") || "/api/sessions"),
+    posts: () => calls.filter(call => call.method === "POST" && !call.path.endsWith("/video-state"))
+      .map(call => call.path.replace(/^\/api\/sessions\/[^/]+/, "").replace(/\?.*$/, "") || "/api/sessions"),
+    videoStates: () => calls.filter(call => call.path.endsWith("/video-state")).map(call => (call.body as { state: string }).state),
     voice: (text: string, isFinal = true) => event("transcription:en-US", { text, isFinal, source: "local" }, "forceLocal"),
     audio: (data: string, sampleRate = 16000) => event("audio_chunk", { data, sampleRate, format: "pcm16" }),
     button: (command: string) => event("_ui", { type: "UI_MESSAGE", channel: "command", payload: { command } }),
     tick: () => tick?.(),
     goOffline: (requests: number) => { offline = requests; },
     refuseToken: (value: boolean) => { refuseToken = value; },
+    toggleVideo: (enabled: boolean) => event("_ui", { type: "UI_MESSAGE", channel: "video", payload: { enabled } }),
     reject: (endpoint: string, status: number) => rejected.set(endpoint, status),
     photoReply: (value: object | null) => { photoReply = value; },
     macStatus: (value: string) => { macStatus = value; },
@@ -340,4 +347,55 @@ test("raw audio streams only between start and stop", async () => {
   app.voice("okay start again", true);
   expect(app.state.phase).toBe("recording");
   expect(subscribed()).toBe(true);
+});
+
+test("start also records video, and stop asks the glasses to upload it to the session", async () => {
+  const app = await connect({ video: true });
+  app.voice("okay start the handoff", false);
+  await app.settle();
+  const id = app.state.capture!.id;
+  const start = app.requests.find(request => request.type === Request.VIDEO_RECORDING_START)!;
+  expect(start).toMatchObject({ save: true, width: 1280, height: 720 });
+  expect(app.state.capture!.video).toMatchObject({ state: "recording", recordingId: "camera-1" });
+  app.voice("okay start the handoff and stop", true);
+  await app.settle();
+  const stop = app.requests.find(request => request.type === Request.VIDEO_RECORDING_STOP)!;
+  expect(stop).toMatchObject({ recordingId: "camera-1", uploadUrl: `${SERVER}/api/sessions/${id}/video` });
+  expect(app.videoStates()).toEqual(["recording", "uploading"]);
+  expect(app.posts().at(-1)).toBe("/finish");
+});
+
+test("a snap the camera refuses during video becomes a still from the video", async () => {
+  const app = await connect({ video: true });
+  app.photoReply(null);
+  app.button("start");
+  app.voice("snap the left forearm", true);
+  await app.settle();
+  expect(app.state.capture!.photos[0].status).toBe("from_video");
+  expect(app.state.error).toBe("");
+  const seconds = app.state.capture!.photos[0].seconds;
+  app.button("stop");
+  await app.settle();
+  const finish = app.calls.find(call => call.path.endsWith("/finish"))!.body as { video_frames: unknown[]; photos: number };
+  expect(finish.video_frames).toEqual([{ seq: 1, seconds }]);
+  expect(finish.photos).toBe(1);
+});
+
+test("audio and photos keep recording when the glasses can't start video, and video can be turned off", async () => {
+  const app = await connect({ video: true, failVideoStart: true });
+  app.button("start");
+  app.button("snap");
+  await app.settle();
+  expect(app.state.phase).toBe("recording");
+  expect(app.state.capture!.video?.state).toBe("failed");
+  expect(app.state.capture!.photos[0].status).toBe("saved");
+  expect(app.videoStates()).toEqual(["failed"]);
+  app.button("stop");
+  await app.settle();
+  expect(app.requests.some(request => request.type === Request.VIDEO_RECORDING_STOP)).toBe(false);
+  app.toggleVideo(false);
+  app.button("start");
+  await app.settle();
+  expect(app.requests.filter(request => request.type === Request.VIDEO_RECORDING_START)).toHaveLength(1);
+  expect(app.storage.get("video")).toBe("off");
 });

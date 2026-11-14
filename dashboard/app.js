@@ -9,6 +9,7 @@ let refreshSequence = 0;
 let renderRevision = null;
 let attachId = null;
 let seenGlassesVideos = null;
+let tab = "report";
 
 const escapeHtml = (text) =>
   String(text ?? "").replace(
@@ -24,6 +25,7 @@ const mediaUrl = (name) => `/media/${selectedId}/${encodeURIComponent(name)}`;
 const labels = {
   created: "Awaiting recording",
   recording: "Receiving from glasses",
+  waiting_video: "Waiting for glasses video",
   uploaded: "Ready to process",
   processing: "Processing",
   awaiting_key: "API key needed",
@@ -96,6 +98,51 @@ async function selectSession(id) {
 }
 
 const isPhoto = (item) => item.kind === "image" && item.id.startsWith("snap_");
+// Uploaded and Mac recordings are video themselves; glasses captures carry the glasses' video separately.
+const videoOf = (session) =>
+  session.has_video
+    ? { state: "ready", file: "recording.mp4", offset: 0, duration: session.duration }
+    : session.video || null;
+const videoMessages = {
+  recording: "The glasses are recording video. It uploads over their Wi-Fi after Stop.",
+  stopping: "The glasses are stopping the video.",
+  uploading: "Waiting for the glasses to upload the video over Wi-Fi. Keep them connected to a network that reaches this server.",
+  failed: "The glasses could not record or upload video. The report uses the phone's audio and photos.",
+};
+
+function showTab(name) {
+  tab = name;
+  for (const button of document.querySelectorAll("[data-tab]"))
+    button.setAttribute("aria-selected", String(button.dataset.tab === name));
+  $("report-layout").hidden = name !== "report";
+  $("video-view").hidden = name !== "video";
+  if (name !== "video") $("full-video").pause();
+}
+
+function renderVideo(session, snaps) {
+  const video = videoOf(session);
+  const ready = video?.state === "ready";
+  const full = $("full-video");
+  if (ready && full.getAttribute("src") !== mediaUrl(video.file)) full.src = mediaUrl(video.file);
+  if (!ready) full.removeAttribute("src");
+  full.hidden = !ready;
+  $("video-badge").textContent = ready
+    ? `· ${time(video.duration || 0)}`
+    : video?.state === "failed" ? "· unavailable" : video?.state === "recording" ? "· recording" : video ? "· uploading" : "";
+  $("video-status").textContent = ready
+    ? video.offset ? `The glasses started recording ${time(video.offset)} after Start. Photo times below are matched to the video.` : ""
+    : video
+      ? [videoMessages[video.state], video.state === "failed" ? video.detail : ""].filter(Boolean).join(" ")
+      : "No video was recorded for this capture. Turn on “Also record video on the glasses” in Inbound before starting.";
+  const offset = ready ? video.offset || 0 : 0;
+  $("video-moments").innerHTML = ready && snaps.length
+    ? snaps.map((item) => {
+        const at = Math.max(0, item.start - offset);
+        return `<button class="moment-link" data-seek="${at}">${escapeHtml(item.label)}<small>${time(at)}</small></button>`;
+      }).join("")
+    : `<p class="muted small">${ready ? "No photos were taken in this capture." : "Photo moments appear here once the video is ready."}</p>`;
+  showTab(tab);
+}
 const player = () => (selected?.has_video ? $("recording") : $("recording-audio"));
 
 function refs(ids) {
@@ -189,6 +236,7 @@ function render(session) {
   const lines = session.transcript.length
     ? session.transcript
     : notes.map((note) => ({ id: `note_${note.seq}`, start: note.seconds, end: note.seconds, text: note.text }));
+  renderVideo(session, snaps);
   $("transcript-count").textContent = `(${lines.length} ${lines.length === 1 ? "entry" : "entries"})`;
   $("transcript-section").open ||= session.status === "recording" && lines.length > 0;
   $("transcript").innerHTML =
@@ -202,6 +250,13 @@ function render(session) {
 }
 
 document.addEventListener("click", (event) => {
+  const tabButton = event.target.closest("[data-tab]");
+  if (tabButton) showTab(tabButton.dataset.tab);
+  const seek = event.target.closest("[data-seek]");
+  if (seek) {
+    $("full-video").currentTime = Number(seek.dataset.seek);
+    $("full-video").play().catch(showError);
+  }
   const sessionButton = event.target.closest("[data-session]");
   if (sessionButton) void selectSession(sessionButton.dataset.session);
   const source = event.target.closest("[data-source]");

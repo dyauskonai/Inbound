@@ -35,7 +35,7 @@ Everything goes through the phone, which retries until the Mac confirms. The gla
 
 Every upload is idempotent, so a retry never duplicates audio, photos, or transcript lines. If the Mac is unreachable, recording continues and uploads wait in order; the MiniApp shows how many are queued. The dashboard switches to an incoming capture as soon as its first upload arrives, and shows photos and transcript lines live.
 
-Video is not part of v1, per the project outline.
+**Video (optional, on by default).** The MiniApp also records video on the glasses, keeping a copy in their gallery. On Stop, the glasses upload it directly to the server over their own Wi-Fi, so they must be on a network that reaches the server; a phone hotspot works. The dashboard shows it under **Full video**, with each photo as a jump point. The report never depends on the video. If the camera refuses a photo while recording, that snap becomes a still from the video, and the report waits up to two minutes for it. Turn video off with **Also record video on the glasses** in Inbound.
 
 ## Host it online
 

@@ -32,6 +32,19 @@ class NoteInput(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
+class VideoFrame(BaseModel):
+    """A snap the camera refused while recording video; its still comes from the video."""
+    seq: int = Field(ge=1, le=40)
+    seconds: float = Field(ge=0, le=7200, allow_inf_nan=False)
+
+
+class VideoState(BaseModel):
+    state: Literal["recording", "uploading", "failed"]
+    # Seconds from Start until the glasses confirmed video recording.
+    offset: float | None = Field(default=None, ge=0, le=7200, allow_inf_nan=False)
+    detail: str | None = Field(default=None, max_length=300)
+
+
 class PhotoLink(BaseModel):
     url: str = Field(min_length=8, max_length=8_000_000)
 
@@ -41,6 +54,7 @@ class FinishInput(BaseModel):
     notes: int = Field(default=0, ge=0, le=100_000)
     photos: int = Field(default=0, ge=0, le=40)
     seconds: float = Field(default=0, ge=0, le=7200, allow_inf_nan=False)
+    video_frames: list[VideoFrame] = Field(default_factory=list, max_length=40)
 
 
 class CaptureInput(BaseModel):

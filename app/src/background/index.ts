@@ -1,5 +1,5 @@
 import { MiniappRequestType, registerMiniapp } from "@mentra/miniapp/background";
-import type { Capture, Channels, Command, Photo, State } from "../shared/channels";
+import type { Capture, CaptureVideo, Channels, Command, Photo, State } from "../shared/channels";
 import { findCommands, isPhoneRelay, serverOrigin, speechWords } from "../shared/commands";
 
 declare const INBOUND_SERVER: string;
@@ -28,6 +28,11 @@ const AUDIO_FLUSH_CHARS = 256 * 1024;
 const OUTBOX_LIMIT = 48 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 20000;
 const PHOTO_TIMEOUT_MS = 30000;
+// While the camera records video it may refuse photos; don't hold up the next snap for long.
+const PHOTO_DURING_VIDEO_TIMEOUT_MS = 12000;
+const VIDEO_START_TIMEOUT_MS = 30000;
+// `save` keeps a copy in the glasses' gallery in case the Wi-Fi upload fails.
+const videoOptions = { width: 1280, height: 720, fps: 30, save: true, sound: false };
 // A command word at the end of a partial transcript can still grow ("stop" → "stopped").
 const SETTLE_MS = 350;
 const REPEAT_MS = 1500;
@@ -36,7 +41,7 @@ const finished = new Set(["complete", "awaiting_key", "failed", "interrupted"]);
 registerMiniapp<Channels>(async (session) => {
   const state: State = {
     phase: "ready", server: INBOUND_SERVER, defaultServer: INBOUND_SERVER,
-    online: false, aiConfigured: false, camera: false, connected: false, battery: null, audio: false,
+    online: false, aiConfigured: false, camera: false, connected: false, wifi: false, videoEnabled: true, battery: null, audio: false,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
     message: "Say “start” to begin. Nothing is recorded or sent until then.", error: "",
     capture: null, delivered: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
@@ -229,6 +234,7 @@ registerMiniapp<Channels>(async (session) => {
     state.message = "Recording. Say “snap” for a photo, then “stop” to send the report.";
     diagnostic("capture.started", { session: capture.id, glasses: state.connected });
     void save().catch(problem);
+    if (state.videoEnabled && state.camera) startVideo(capture);
     publish();
     if (!state.online) {
       void selectServer(state.server, true).then((server) => {
@@ -276,7 +282,7 @@ registerMiniapp<Channels>(async (session) => {
       const result = await session.sendRequest<PhotoResult>({
         type: MiniappRequestType.PHOTO, size: "medium", mode: "photo", transferMethod: "auto",
         sound: true, saveToGallery: false, delivery: "local",
-      }, { timeoutMs: PHOTO_TIMEOUT_MS });
+      }, { timeoutMs: capture.video?.state === "recording" ? PHOTO_DURING_VIDEO_TIMEOUT_MS : PHOTO_TIMEOUT_MS });
       let bytes: Uint8Array | null = null;
       if (result?.key) {
         bytes = await session.blob.bytes(result.key).catch(() => null);
@@ -295,9 +301,78 @@ registerMiniapp<Channels>(async (session) => {
         done: (ok) => { photo.status = ok ? "saved" : "failed"; publish(); },
       });
     } catch (error) {
+      if (capture.video?.state === "recording" || capture.video?.state === "stopping") {
+        // The camera is busy recording. The server takes this still from the video instead.
+        photo.status = "from_video";
+        diagnostic("photo.from_video", { session: capture.id, number: photo.seq, code: (error as { code?: string })?.code });
+        if (state.capture === capture) state.message = `Photo ${photo.seq} will be taken from the video.`;
+        publish();
+        return;
+      }
       photo.status = "failed";
       problem(error, `photo ${photo.seq}`);
     }
+  }
+
+  function videoState(capture: Capture, video: CaptureVideo) {
+    enqueue({
+      capture, path: `/api/sessions/${capture.id}/video-state`, label: `video ${video.state}`, contentType: "application/json",
+      body: JSON.stringify({ state: video.state, offset: video.offset ?? null, detail: video.detail?.slice(0, 300) ?? null }),
+    });
+    void save().catch(() => {});
+    publish();
+  }
+
+  // Video is extra: the report comes from the phone's audio and photos even if the glasses never record or upload it.
+  function startVideo(capture: Capture) {
+    const video: CaptureVideo = { state: "starting" };
+    capture.video = video;
+    diagnostic("video.start_requested", { session: capture.id, wifi: state.wifi });
+    const started = session.sendRequest<{ recordingId?: string }>({ type: MiniappRequestType.VIDEO_RECORDING_START, ...videoOptions }, { timeoutMs: VIDEO_START_TIMEOUT_MS })
+      .then((result) => {
+        if (!result?.recordingId) throw new Error("The glasses did not return a recording ID.");
+        video.recordingId = result.recordingId;
+        video.state = "recording";
+        video.offset = elapsed(capture);
+        diagnostic("video.started", { session: capture.id, offset: video.offset });
+        videoState(capture, video);
+        // Stop was said while the camera was still starting.
+        if (state.capture !== capture) void stopVideo(capture);
+      })
+      .catch((error: { code?: string; message?: string }) => {
+        video.state = "failed";
+        video.detail = `The glasses did not start video. ${error?.message ?? ""} If the recording light is on, press the glasses' button to stop it.`.trim();
+        diagnostic("video.start_failed", { session: capture.id, code: error?.code });
+        videoState(capture, video);
+      });
+    // Photos wait for the camera to settle into recording.
+    photoChain = photoChain.then(() => started);
+  }
+
+  async function stopVideo(capture: Capture) {
+    const video = capture.video;
+    if (!video?.recordingId || video.state !== "recording") return;
+    video.state = "stopping";
+    publish();
+    try {
+      // The glasses upload the finished video themselves, over their own Wi-Fi.
+      await session.camera.stopVideoRecording(video.recordingId, {
+        uploadUrl: `${capture.server}/api/sessions/${capture.id}/video`,
+        ...(INBOUND_TOKEN ? { uploadAuthToken: INBOUND_TOKEN } : {}),
+      });
+      video.state = "uploading";
+      diagnostic("video.stopped", { session: capture.id, wifi: state.wifi });
+    } catch (error) {
+      const { code, message } = (error as { code?: string; message?: string }) ?? {};
+      const uploadFailed = code === "media_error" || /upload/i.test(message ?? "");
+      // Mentra can keep the recording after a failed upload. Stop it without a URL so it
+      // saves to the gallery and frees the camera.
+      if (uploadFailed) await session.camera.stopVideoRecording(video.recordingId).catch(() => {});
+      video.state = "failed";
+      video.detail = uploadFailed ? "The glasses could not upload the video. It is saved in the Mentra gallery." : message || "The glasses did not confirm the video stopped.";
+      diagnostic("video.stop_failed", { session: capture.id, code, uploadFailed });
+    }
+    videoState(capture, video);
   }
 
   function stop() {
@@ -309,6 +384,7 @@ registerMiniapp<Channels>(async (session) => {
     const seconds = elapsed(capture);
     state.capture = null;
     state.phase = "ready";
+    void stopVideo(capture);
     state.delivered = { id: capture.id, server: capture.server, status: "uploading", progress: "Sending the last audio and photos to the Mac…" };
     state.message = "Stopped. Nothing more is recorded or sent. The report will appear on the dashboard.";
     diagnostic("capture.stopped", { session: capture.id, seconds, audio: capture.audioSeq, photos: capture.photos.length, notes: capture.noteSeq });
@@ -321,7 +397,10 @@ registerMiniapp<Channels>(async (session) => {
   function finish(capture: Capture, seconds: number) {
     enqueue({
       capture, path: `/api/sessions/${capture.id}/finish`, label: "finish", contentType: "application/json",
-      body: JSON.stringify({ audio_parts: capture.audioSeq, notes: capture.noteSeq, photos: capture.photos.filter(photo => photo.status !== "failed").length, seconds }),
+      body: JSON.stringify({
+        audio_parts: capture.audioSeq, notes: capture.noteSeq, photos: capture.photos.filter(photo => photo.status !== "failed").length, seconds,
+        video_frames: capture.photos.filter(photo => photo.status === "from_video").map(({ seq, seconds }) => ({ seq, seconds })),
+      }),
       done: (ok) => {
         if (state.delivered?.id !== capture.id) return;
         state.delivered = { ...state.delivered, status: ok ? "processing" : "failed", progress: ok ? "Preparing the report on the Mac…" : "The Mac could not finish this capture. Open the dashboard to retry." };
@@ -340,16 +419,19 @@ registerMiniapp<Channels>(async (session) => {
 
   async function checkDelivered() {
     const delivered = state.delivered;
-    if (!delivered || finished.has(delivered.status) || delivered.status === "uploading") return;
+    if (!delivered || delivered.status === "uploading") return;
+    // Keep following a finished report while the glasses' video is still on its way.
+    if (finished.has(delivered.status) && !["recording", "uploading"].includes(delivered.video ?? "")) return;
     if (outbox.some(job => job.capture.id === delivered.id)) return;
     try {
-      const result = await request<{ status: string; progress: string; error?: string }>(delivered.server, `/api/sessions/${delivered.id}`);
+      const result = await request<{ status: string; progress: string; error?: string; video?: { state: string } }>(delivered.server, `/api/sessions/${delivered.id}`);
       if (state.delivered?.id !== delivered.id) return;
       const progress = result.status === "complete" ? "Report ready on the Mac dashboard."
         : result.status === "awaiting_key" ? "Saved on the Mac. Add the OpenAI key there to generate the report."
         : result.error || result.progress;
-      if (result.status !== delivered.status || progress !== delivered.progress) {
-        state.delivered = { ...delivered, status: result.status, progress };
+      const video = result.video?.state;
+      if (result.status !== delivered.status || progress !== delivered.progress || video !== delivered.video) {
+        state.delivered = { ...delivered, status: result.status, progress, video };
         diagnostic("mac.capture_status", { session: delivered.id, status: result.status });
         publish();
       }
@@ -489,6 +571,13 @@ registerMiniapp<Channels>(async (session) => {
     if (capture && !sent.get(capture)) capture.server = state.server;
     state.message = "Mac connected. Say “start” to record.";
   }); });
+  session.ui.on("video", ({ enabled }) => {
+    if (typeof enabled !== "boolean") return;
+    state.videoEnabled = enabled;
+    void session.storage.set("video", enabled ? "on" : "off").catch(problem);
+    publish();
+  });
+  session.ui.on("wifi", () => { void run(() => session.glasses.requestWifiSetup("Inbound's glasses upload their video to the server over Wi-Fi.")); });
   session.ui.on("report", () => {
     const target = state.capture ?? state.delivered;
     const base = target?.server || state.server;
@@ -501,6 +590,11 @@ registerMiniapp<Channels>(async (session) => {
     publish();
   });
   session.glasses.onBattery((data) => { state.battery = data.level; publish(); });
+  session.glasses.onWifi((data) => {
+    if (state.wifi !== data.connected) diagnostic("glasses.wifi", { connected: data.connected });
+    state.wifi = data.connected;
+    publish();
+  });
   session.on("ready", () => {
     state.camera = !!session.capabilities?.hasCamera;
     diagnostic("mentra.ready", { camera: state.camera });
@@ -537,6 +631,7 @@ registerMiniapp<Channels>(async (session) => {
     // A new build's server address replaces one saved under a different or older build.
     const savedBuild = await session.storage.get("serverBuild");
     state.server = savedServer && !isPhoneRelay(savedServer) && savedBuild === INBOUND_SERVER ? savedServer : INBOUND_SERVER;
+    state.videoEnabled = (await session.storage.get("video")) !== "off";
     const journal = await session.storage.get("capture");
     if (journal) {
       // The MiniApp closed mid-capture. Queued uploads were lost with it; ask

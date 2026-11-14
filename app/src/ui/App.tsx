@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import type { Command, State } from "../shared/channels";
 
 const time = (seconds: number) => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
-const photoStatus = { taking: "Taking…", uploading: "Sending…", saved: "On the Mac", failed: "Failed" };
+const photoStatus = { taking: "Taking…", uploading: "Sending…", saved: "On the Mac", failed: "Failed", from_video: "From the video" };
+const videoStatus = { starting: "Starting video on the glasses…", recording: "● Video recording on the glasses", stopping: "Stopping video…", uploading: "Glasses uploading video over Wi-Fi…", failed: "Video unavailable" };
 export function App() {
   const [state, setState] = useState<State | null>(null);
   const [server, setServer] = useState("");
@@ -37,10 +38,12 @@ export function App() {
       <div className="clock">{recording && state?.capture ? time(Math.max(0, (now - state.capture.startedAt)/1000)) : "Ready when you are."}</div>
       <p>{state?.message || "Connecting to the Mentra app…"}</p>
       {recording && !state.audio && now - (state.capture?.startedAt ?? now) > 5000 && <small>No mic audio yet. Transcript lines from the phone will still reach the Mac.</small>}
+      {recording && state.capture?.video && <small>{videoStatus[state.capture.video.state]}{state.capture.video.state === "failed" && state.capture.video.detail ? `. ${state.capture.video.detail}` : ""}</small>}
       {state && !recording && <button className="primary" disabled={!state.server} onClick={() => send("start")}>● Start recording</button>}
+      {state && !recording && <label className="fine"><input type="checkbox" checked={state.videoEnabled} onChange={event => mentra.send("video", {enabled: event.target.checked})}/> Also record video on the glasses {state.videoEnabled && !state.wifi && "· the glasses need Wi-Fi to upload it"}</label>}
       {recording && <div className="controls"><button className="primary" onClick={() => send("snap")}>＋ Snap photo</button><button onClick={() => send("stop")}>■ Stop</button></div>}
       {!!state?.pending && <small>{state.pending} upload{state.pending === 1 ? "" : "s"} waiting · {Math.ceil(state.pendingBytes / 1024)} KB</small>}
-      {state?.delivered && !recording && <small role="status">Last capture: {state.delivered.progress}</small>}
+      {state?.delivered && !recording && <small role="status">Last capture: {state.delivered.progress}{state.delivered.video === "ready" ? " Video on the dashboard." : state.delivered.video === "uploading" ? " Video uploading from the glasses…" : ""}</small>}
       <div className="voice">{state?.voice || "Loading voice controls"}</div>
       {!recording && state?.voice === "Voice commands ready" && <small>The phone listens for “start” on its own. Nothing is recorded or sent until you start.</small>}
       {state?.heard && <small>{recording ? state.heardFinal ? "Heard" : "Listening" : "Heard on the phone, not sent"}: “{state.heard}”</small>}
@@ -50,7 +53,7 @@ export function App() {
     {(error || state?.error) && <p className="error" role="alert">{error || state?.error}</p>}
     {state?.capture && <section className="moments"><div className="section-head"><h2>Photos</h2><span>{state.capture.photos.length}</span></div>{state.capture.photos.map(photo => <div key={photo.seq} className="moment"><span>↗ Photo {photo.seq} · {photoStatus[photo.status]}</span><time>{time(photo.seconds)}</time></div>)}<p className="fine">Photos, audio, and transcript lines appear on the Mac dashboard as they arrive.</p></section>}
     {(state?.capture || state?.delivered) && <button className="text-button" onClick={() => mentra.send("report", {})}>Open on the Mac dashboard ↗</button>}
-    <details open={!state?.online}><summary>Connection settings <span>{state?.online ? "Mac connected" : "Set up"}</span></summary><label htmlFor="server">Mac server address</label><input id="server" type="url" value={server} onChange={event=>setServer(event.target.value)} placeholder="http://192.168.1.20:8000" autoCapitalize="none" autoCorrect="off"/><button disabled={!state || state.busy} onClick={() => mentra.send("connect", {server})}>Connect to Mac</button>{state?.defaultServer && server !== state.defaultServer && <button className="text-button" onClick={() => setServer(state.defaultServer)}>Use this build’s Mac address</button>}<p className="fine">The phone and Mac must reach each other. The glasses only need Bluetooth to the phone.</p></details>
+    <details open={!state?.online}><summary>Connection settings <span>{state?.online ? "Mac connected" : "Set up"}</span></summary><label htmlFor="server">Mac server address</label><input id="server" type="url" value={server} onChange={event=>setServer(event.target.value)} placeholder="http://192.168.1.20:8000" autoCapitalize="none" autoCorrect="off"/><button disabled={!state || state.busy} onClick={() => mentra.send("connect", {server})}>Connect to Mac</button>{state?.defaultServer && server !== state.defaultServer && <button className="text-button" onClick={() => setServer(state.defaultServer)}>Use this build’s Mac address</button>}<p className="fine">The phone and Mac must reach each other. Audio and photos need only Bluetooth from the glasses to the phone. The glasses’ video uploads over their own Wi-Fi: {state?.wifi ? "connected." : "not connected."}</p><button className="text-button" disabled={!state || state.busy} onClick={() => mentra.send("wifi", {})}>Set up glasses Wi-Fi ↗</button></details>
     {state && <details className="diagnostics"><summary>Capture diagnostics</summary><button className="text-button" onClick={copyLogs}>Copy logs</button><span className="fine" role="status">{copied}</span><pre tabIndex={0}>{state.diagnostics.join("\n")}</pre></details>}
     <footer>Immerse the Bay · Training prototype<br/>Use fictional scenarios and consenting volunteers.</footer>
   </main>;

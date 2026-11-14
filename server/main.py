@@ -21,7 +21,8 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import ValidationError
 
 from .auth import AccessControl
-from .models import AudioPart, CaptureInput, FinishInput, NoteInput, PhotoLink, SessionInput
+from . import media
+from .models import AudioPart, CaptureInput, FinishInput, NoteInput, PhotoLink, SessionInput, VideoState
 from .processing import Processor
 from .store import Store
 
@@ -66,7 +67,7 @@ def live_progress(session: dict) -> str:
             f"{photos} photo{'' if photos == 1 else 's'} · {len(session.get('notes', []))} transcript lines")
 
 
-def create_app(data_dir: Path | None = None, live_port: int | None = None):
+def create_app(data_dir: Path | None = None, live_port: int | None = None, video_wait: float = 120):
     store = Store(data_dir or Path(os.getenv("INBOUND_DATA_DIR", ROOT / "runtime")))
     processor = Processor(store)
     upload_locks = {}
@@ -265,25 +266,79 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
                 record_upload(session, notes=sorted([*notes, body.model_dump()], key=lambda item: item["seq"]))
         return {"ok": True}
 
+    def attach_frames(session_id: str) -> int:
+        """Fill snaps the camera refused while recording with stills from the glasses video."""
+        session = store.get(session_id)
+        video = session.get("video") or {}
+        taken = {photo["seq"] for photo in session.get("photos", [])}
+        frames = [frame for frame in session.get("video_frames", []) if frame["seq"] not in taken]
+        if video.get("state") != "ready" or not frames:
+            return 0
+        directory = store.media_dir(session_id)
+        added = []
+        for frame in frames:
+            name = f"photo-{frame['seq']}.jpg"
+            try:
+                media.extract_frame(directory / video["file"], frame["seconds"] - (video.get("offset") or 0),
+                                    video["duration"], directory / name)
+            except ValueError:
+                log.warning("Inbound could not extract snap %d from the video session=%s", frame["seq"], session_id)
+                continue
+            added.append({"id": f"snap_photo-{frame['seq']}", "seq": frame["seq"], "seconds": frame["seconds"],
+                          "file": name, "from_video": True})
+        store.update(session_id, photos=sorted([*session.get("photos", []), *added], key=lambda item: item["seq"]))
+        return len(added)
+
+    def waiting_frames(session: dict) -> int:
+        taken = {photo["seq"] for photo in session.get("photos", [])}
+        return sum(frame["seq"] not in taken for frame in session.get("video_frames", []))
+
     @app.post("/api/sessions/{session_id}/finish")
     async def finish(session_id: str, body: FinishInput):
         async with upload_locks.setdefault(session_id, asyncio.Lock()):
             session = phone_session(session_id)
             if session.get("capture_finished"):
                 return session
-            received = bool(session.get("audio_parts") or session.get("photos") or session.get("notes"))
+            frames = [frame.model_dump() for frame in body.video_frames]
+            video_coming = (session.get("video") or {}).get("state") in {"recording", "uploading"}
+            received = bool(session.get("audio_parts") or session.get("photos") or session.get("notes") or (frames and video_coming))
             session = store.update(
-                session_id, capture_finished=True, capture_seconds=body.seconds,
+                session_id, capture_finished=True, capture_seconds=body.seconds, video_frames=frames,
                 expected_audio_parts=body.audio_parts, expected_photos=body.photos,
                 status="uploaded" if received else "failed",
                 progress="Ready to generate report" if received else "Needs attention",
                 error=None if received else "No audio, transcript, or photos reached the Mac for this capture.",
             )
-            log.info("Inbound capture finished session=%s audio_parts=%d photos=%d notes=%d", session_id,
-                     len(session.get("audio_parts", {})), len(session.get("photos", [])), len(session.get("notes", [])))
-        if received and session.get("auto_report"):
+            # The video can arrive before Stop's finish request.
+            await asyncio.to_thread(attach_frames, session_id)
+            pending = waiting_frames(store.get(session_id)) if received and video_coming else 0
+            if pending:
+                # Snaps the camera refused while recording come from the video, so the report waits for it.
+                session = store.update(session_id, status="waiting_video",
+                                       progress=f"Waiting for the glasses to upload the video for {pending} photo{'s' if pending > 1 else ''}")
+
+                def give_up():
+                    if store.get(session_id)["status"] == "waiting_video":
+                        log.warning("Inbound video did not arrive; writing the report without it session=%s", session_id)
+                        processor.submit(session_id)
+                asyncio.get_running_loop().call_later(video_wait, give_up)
+            log.info("Inbound capture finished session=%s audio_parts=%d photos=%d notes=%d video_frames=%d", session_id,
+                     len(session.get("audio_parts", {})), len(session.get("photos", [])), len(session.get("notes", [])), len(frames))
+        if received and session.get("auto_report") and not pending:
             processor.submit(session_id)
         return store.get(session_id)
+
+    @app.post("/api/sessions/{session_id}/video-state")
+    async def video_state(session_id: str, body: VideoState):
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = phone_session(session_id)
+            video = session.get("video") or {}
+            if video.get("state") != "ready":
+                offset = {"offset": body.offset} if body.offset is not None else {}
+                session = store.update(session_id, video={**video, "state": body.state, **offset, "detail": body.detail})
+        if body.state == "failed" and session["status"] == "waiting_video":
+            processor.submit(session_id)
+        return {"ok": True}
 
     async def receive_video(session_id: str, video: UploadFile):
         session = get_session(session_id)
@@ -313,11 +368,25 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
                     if session["video_hash"] != checksum:
                         raise HTTPException(409, "This session already has a different recording. Create a new session.")
                     return {"success": True, "requestId": session_id, "statusUrl": f"/api/sessions/{session_id}"}
-                from .media import inspect
                 try:
-                    info = await asyncio.to_thread(inspect, temporary)
+                    info = await asyncio.to_thread(media.inspect, temporary)
                 except ValueError as error:
                     raise HTTPException(422, str(error))
+                if session["source"] == "glasses":
+                    # The glasses' own video sits beside the phone's audio and photos. The report
+                    # doesn't depend on it, except for snaps the camera refused while recording.
+                    try:
+                        await asyncio.to_thread(media.web_video, temporary, directory / "video.mp4")
+                    except ValueError as error:
+                        raise HTTPException(422, str(error))
+                    details = {**(session.get("video") or {}), "state": "ready", "file": "video.mp4",
+                               "duration": info["duration"], "has_audio": info["has_audio"], "detail": None}
+                    store.update(session_id, video=details, video_hash=checksum)
+                    log.info("Inbound glasses video saved session=%s bytes=%d duration=%.2f", session_id, size, info["duration"])
+                    await asyncio.to_thread(attach_frames, session_id)
+                    if store.get(session_id)["status"] == "waiting_video":
+                        processor.submit(session_id)
+                    return {"success": True, "requestId": session_id, "statusUrl": f"/api/sessions/{session_id}"}
                 temporary.replace(directory / "original")
                 store.update(session_id, has_video=True, video_hash=checksum, status="uploaded", progress="Ready to generate report")
                 log.info("Inbound upload saved session=%s bytes=%d audio=%s duration=%.2f", session_id, size, info["has_audio"], info["duration"])
@@ -361,7 +430,7 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
     @app.get("/media/{session_id}/{filename}")
     def media_file(session_id: str, filename: str):
         session = get_session(session_id)
-        allowed = {"recording.mp4", "recording.wav", *(item["file"] for item in session.get("photos", []))}
+        allowed = {"recording.mp4", "recording.wav", "video.mp4", *(item["file"] for item in session.get("photos", []))}
         for item in session["evidence"]:
             allowed.update(item[key] for key in ("file", "clip") if key in item)
         if filename not in allowed:

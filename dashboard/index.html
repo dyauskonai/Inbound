@@ -83,7 +83,19 @@
             Attach recording</button
           ><button id="retry" class="primary" hidden>Generate report</button>
         </div>
-        <div class="report-layout">
+        <div class="tabs" role="tablist" aria-label="Session views">
+          <button class="tab" role="tab" data-tab="report" aria-selected="true">Report</button
+          ><button class="tab" role="tab" data-tab="video" aria-selected="false">
+            Full video <span id="video-badge" class="tab-badge"></span>
+          </button>
+        </div>
+        <section id="video-view" class="video-view" role="tabpanel" hidden>
+          <video id="full-video" controls playsinline preload="metadata" hidden></video>
+          <p id="video-status" class="muted small"></p>
+          <div class="panel-heading"><h2>Photo moments</h2></div>
+          <div id="video-moments"></div>
+        </section>
+        <div id="report-layout" class="report-layout" role="tabpanel">
           <article id="report" class="report-card">
             <div class="empty-report">
               The report will appear here after processing.
