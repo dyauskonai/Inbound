@@ -31,6 +31,7 @@ async function connect(savedAddress: string | null = null, live = false, buildAd
   let finishText: string | null = null;
   let finishUnsupported = false;
   let failStop = false;
+  let failUploadAndLocalStop = false;
   let uploadStatus = "created";
   let liveState = "waiting";
   let streamStartError: {code: string; message: string} | undefined;
@@ -95,7 +96,13 @@ async function connect(savedAddress: string | null = null, live = false, buildAd
         reply();
         break;
       case Request.VIDEO_RECORDING_STOP:
-        if (failStop) {
+        if (failUploadAndLocalStop) {
+          const uploading = !!payload.uploadUrl;
+          if (!uploading) failUploadAndLocalStop = false;
+          reply(undefined, uploading
+            ? { code: "ERR_UNEXPECTED", message: "Video upload error: failed to connect to Mac" }
+            : { code: "ERR_UNEXPECTED", message: "Video recording command failed." });
+        } else if (failStop) {
           failStop = false;
           reply(undefined, { code: "BLE_SEND_FAILED", message: "Glasses disconnected" });
         } else reply();
@@ -174,6 +181,9 @@ async function connect(savedAddress: string | null = null, live = false, buildAd
     confirmStart: () => finishStart?.(),
     rejectStart: () => rejectStart?.(),
     failNextStop: () => { failStop = true; },
+    failUploadAndLocalStop: () => { failUploadAndLocalStop = true; },
+    recoverCamera: () => event("_ui", { type: "UI_MESSAGE", channel: "recoverCamera", payload: {} }),
+    newCapture: () => event("_ui", { type: "UI_MESSAGE", channel: "newCapture", payload: {} }),
     holdNextSync: () => { holdCaptureSync = true; },
     releaseSync: () => releaseCaptureSync?.(),
     holdCreate: () => { holdCreate = true; },
@@ -281,6 +291,34 @@ test("a saved live mode cannot revive unsupported streaming on a new install", a
     await app.settle();
     expect(app.requests.find(({ type }) => type === Request.VIDEO_RECORDING_STOP)?.uploadUrl)
       .toBe(`${SERVER}/api/sessions/session-1/video`);
+  } finally { app.close(); }
+});
+
+test("failed upload retains the recording ID until the camera can be released", async () => {
+  const app = await connect();
+  try {
+    app.voice("Start");
+    await app.settle();
+    app.confirmStart();
+    await app.settle();
+    app.failUploadAndLocalStop();
+    app.voice("Stop");
+    await app.settle();
+    expect(app.state.phase).toBe("stopping");
+    expect(app.state.capture?.recordingId).toBe("camera-1");
+    expect(app.state.capture?.cameraReleased).toBe(false);
+    app.stoppedOnGlasses();
+    await app.settle();
+    app.newCapture();
+    await app.settle();
+    expect(app.state.capture?.recordingId).toBe("camera-1");
+    app.recoverCamera();
+    await app.settle();
+    expect(app.state.phase).toBe("waiting_upload");
+    expect(app.state.capture?.cameraReleased).toBe(true);
+    app.newCapture();
+    await app.settle();
+    expect(app.state.phase).toBe("ready");
   } finally { app.close(); }
 });
 

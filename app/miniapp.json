@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/@mentra/miniapp-cli/schema/miniapp.schema.json",
   "packageName": "com.inbound.capture",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "name": "Inbound",
   "description": "Voice-controlled recording and evidence-linked handoff reports.",
   "icon": "icon.png",

@@ -226,6 +226,7 @@ registerMiniapp<Channels>(async (session) => {
       const recording = await session.camera.startVideoRecording(recordingOptions);
       if (!recording?.recordingId) throw new Error("The glasses did not return a recording ID.");
       capture.recordingId = recording.recordingId;
+      capture.cameraReleased = false;
       capture.startedAt = Date.now();
       state.phase = "recording";
       diagnostic("camera.started", { session: capture.id, recording: recording.recordingId, elapsedMs: Date.now() - cameraRequestedAt });
@@ -373,6 +374,7 @@ registerMiniapp<Channels>(async (session) => {
         publish();
         try {
           await session.camera.stopVideoRecording(capture.recordingId);
+          capture.cameraReleased = true;
           state.phase = "waiting_upload";
           state.message = "The glasses could not reach the Mac’s upload address. The clip may be in Mentra’s Camera gallery.";
           void save().catch(problem);
@@ -398,6 +400,7 @@ registerMiniapp<Channels>(async (session) => {
       clearTimeout(stopWarning);
     }
     state.phase = "waiting_upload";
+    capture.cameraReleased = true;
     diagnostic("camera.stop_acknowledged", { session: capture.id, elapsedMs: Date.now() - requestedAt });
     state.message = autoUpload ? "Waiting for the glasses to upload. Keep the glasses connected to Wi-Fi." : galleryMessage;
     void save().catch(problem);
@@ -646,6 +649,32 @@ registerMiniapp<Channels>(async (session) => {
       } else state.message = "No video has arrived. Check glasses Wi-Fi, or import their saved recording into this session on the Mac.";
     }
   }); });
+  session.ui.on("recoverCamera", () => { void run(async () => {
+    const capture = state.capture;
+    if (!capture?.recordingId || capture.cameraReleased || !["stopping", "waiting_upload"].includes(state.phase)) return;
+    diagnostic("camera.release_requested", { session: capture.id });
+    try {
+      await session.camera.stopVideoRecording(capture.recordingId);
+      capture.cameraReleased = true;
+      state.phase = "waiting_upload";
+      state.message = "The camera stopped. The saved clip may be in Mentra’s gallery; the Mac did not receive it.";
+      diagnostic("camera.released", { session: capture.id });
+      await save();
+    } catch (error) {
+      state.message = "Mentra still owns the recording. Fully quit Mentra on the iPhone, reopen it, and reconnect the glasses. Check that the recording light is off.";
+      diagnostic("camera.release_failed", { session: capture.id, code: (error as {code?: string})?.code });
+      publish();
+    }
+  }); });
+  session.ui.on("resetAfterRestart", () => { void run(async () => {
+    const capture = state.capture;
+    if (!capture?.recordingId || capture.cameraReleased || !["stopping", "waiting_upload"].includes(state.phase)) return;
+    capture.cameraReleased = true;
+    state.phase = "waiting_upload";
+    state.message = "Mentra restarted and the recording light is off. You can start a new capture; the old clip may still be in Mentra’s gallery.";
+    diagnostic("camera.restart_confirmed", { session: capture.id });
+    await save();
+  }); });
   session.ui.on("wifi", () => { void run(() => session.glasses.requestWifiSetup("Inbound uploads recordings directly to your Mac over Wi-Fi.")); });
   session.ui.on("resetUnconfirmedStart", () => { void run(async () => {
     if (state.phase !== "start_unconfirmed") return;
@@ -667,6 +696,7 @@ registerMiniapp<Channels>(async (session) => {
   }); });
   session.ui.on("newCapture", () => { void run(async () => {
     if (state.phase !== "waiting_upload") return;
+    if (state.capture?.recordingId && !state.capture.cameraReleased) throw new Error("Release the previous camera recording or restart Mentra before starting again.");
     if (publisherStop) throw new Error("Wait for the glasses to finish stopping before starting another capture.");
     await journalWrite;
     await session.storage.delete("capture");

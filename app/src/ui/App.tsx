@@ -43,9 +43,10 @@ export function App() {
       {recording && <div className="controls"><button className="primary" disabled={state.busy} onClick={() => send("snap")}>＋ Snap</button><button onClick={() => send("stop")}>■ Stop</button></div>}
       {state?.phase === "starting" && <button disabled={state.stopPending} onClick={() => send("stop")}>{state.stopPending ? "Stop requested" : "■ Stop"}</button>}
       {state?.capture && ["stopping", "waiting_upload", "processing", "awaiting_key"].includes(state.phase) && <button disabled={state.busy} onClick={() => mentra.send("retry", {})}>Retry / check upload</button>}
-      {state?.phase === "waiting_upload" && !state.busy && <button onClick={() => mentra.send("newCapture", {})}>Camera is idle · Start a new capture</button>}
+      {state?.capture?.recordingId && !state.capture.cameraReleased && ["stopping", "waiting_upload"].includes(state.phase) && !state.busy && <div className="controls"><button onClick={() => mentra.send("recoverCamera", {})}>Stop and save on glasses</button><button onClick={() => mentra.send("resetAfterRestart", {})}>Mentra restarted · light is off</button></div>}
+      {state?.phase === "waiting_upload" && !state.busy && (!state.capture?.recordingId || state.capture.cameraReleased) && <button onClick={() => mentra.send("newCapture", {})}>Camera is idle · Start a new capture</button>}
       {state?.capture?.live && ["start_unconfirmed", "waiting_upload", "processing", "awaiting_key", "complete"].includes(state.phase) && <button onClick={() => mentra.send("stopPublisher", {})}>Stop glasses</button>}
-      {(unconfirmed || state?.phase === "stopping") && state.capture && !state.busy && <div className="controls">
+      {unconfirmed && state.capture && !state.busy && <div className="controls">
         <button onClick={() => mentra.send("confirmStoppedOnGlasses", {})}>I stopped it on the glasses</button>
         {unconfirmed && <button onClick={() => mentra.send("resetUnconfirmedStart", {})}>Camera is idle · try again</button>}
       </div>}

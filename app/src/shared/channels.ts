@@ -6,6 +6,7 @@ export interface Bookmark { id: string; seconds: number; label: string }
 export interface Capture {
   id: string;
   recordingId?: string;
+  cameraReleased?: boolean;
   live?: boolean;
   streamId?: string;
   startedAt: number;
@@ -51,6 +52,8 @@ export interface Channels {
   resetUnconfirmedStart: Record<string, never>;
   confirmStoppedOnGlasses: Record<string, never>;
   newCapture: Record<string, never>;
+  recoverCamera: Record<string, never>;
+  resetAfterRestart: Record<string, never>;
   stopPublisher: Record<string, never>;
   report: Record<string, never>;
   copyDiagnostics: Rpc<Record<string, never>, void>;
