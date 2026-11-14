@@ -44,7 +44,10 @@ async function connect(savedAddress: string | null = null, live = false, buildAd
   const savedMarks: string[][] = [];
   const processedMarks: string[][] = [];
   const storage = new Map<string, string>();
-  if (live && buildAddress === SERVER) storage.set("captureMode", liveOnly ? "device" : "live");
+  if (live && buildAddress === SERVER) {
+    storage.set("captureMode", "live");
+    storage.set("autoUpload", "off");
+  }
   // The app uses one interval to check for an upload. Run it on demand.
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = ((callback: () => void, interval: number) => {
@@ -196,6 +199,7 @@ test("a fresh relay URL overrides an expired one and uses device recording on a 
   try {
     expect(app.state.server).toBe(current);
     expect(app.state.captureMode).toBe("device");
+    expect(app.state.autoUpload).toBe(true);
     app.voice("start");
     await app.settle();
     expect(app.requests.some(({ type }) => type === Request.VIDEO_RECORDING_START)).toBe(true);
@@ -261,72 +265,22 @@ test("only finalized command phrases act, consecutive snaps persist, and a faile
   } finally { app.close(); }
 });
 
-test("voice Start, Snap and Stop use the Mac recorder even when Mentra never confirms Start", async () => {
-  const app = await connect(null, true, SERVER, true);
-  try {
-    app.voice("Start");
-    await app.settle();
-    expect(app.state.phase).toBe("starting");
-    expect(app.requests.find(({ type }) => type === Request.STREAM_START)).toMatchObject({ streamUrl: "rtmp://192.0.2.1:1935/live/capture-key" });
-    app.voice("Snap");
-    app.receiveLiveVideo();
-    app.poll();
-    await app.settle();
-    expect(app.state.phase).toBe("recording");
-    expect(app.state.capture?.bookmarks).toHaveLength(1);
-    expect(app.state.capture?.streamId).toBeUndefined();
-    app.voice("Stop");
-    await app.settle();
-    expect(app.requests.filter(({ type }) => type === Request.STREAM_STOP)).toHaveLength(1);
-    expect(app.state.phase).toBe("waiting_upload");
-    app.poll();
-    await app.settle();
-    expect(app.processedMarks).toEqual([["mark-1"]]);
-  } finally { app.close(); }
-});
-
-test("a firmware block releases the live receiver and lets the next Start use on-glasses recording", async () => {
+test("a saved live mode cannot revive unsupported streaming on a new install", async () => {
   const app = await connect(null, true);
   try {
-    app.requireStreamingUpdate();
-    app.voice("Start");
-    await app.settle();
-    expect(app.state.phase).toBe("ready");
     expect(app.state.captureMode).toBe("device");
-    expect(app.state.streamUpdateRequired).toBe(true);
-    expect(app.state.capture).toBeNull();
-    expect(app.state.diagnostics.join("\n")).toContain("live.update_required");
-    app.voice("Start");
-    await app.settle();
-    app.confirmStart();
-    await app.settle();
-    expect(app.state.phase).toBe("recording");
-    expect(app.requests.filter(({ type }) => type === Request.STREAM_START)).toHaveLength(1);
-    expect(app.requests.filter(({ type }) => type === Request.VIDEO_RECORDING_START)).toHaveLength(1);
-    app.voice("Snap");
-    await app.settle();
-    expect(app.state.capture?.bookmarks).toHaveLength(1);
-    app.voice("Stop");
-    await app.settle();
-    expect(app.requests.filter(({ type }) => type === Request.VIDEO_RECORDING_STOP)).toHaveLength(1);
-  } finally { app.close(); }
-});
-
-test("the camera's unsupported streaming request switches to on-glasses recording", async () => {
-  const app = await connect(null, true);
-  try {
-    app.rejectStreamingRequest();
-    app.voice("Start");
-    await app.settle();
-    expect(app.state.phase).toBe("ready");
-    expect(app.state.captureMode).toBe("device");
-    expect(app.state.capture).toBeNull();
+    expect(app.state.autoUpload).toBe(true);
     app.voice("Start");
     await app.settle();
     expect(app.requests.filter(({ type }) => type === Request.VIDEO_RECORDING_START)).toHaveLength(1);
+    expect(app.requests.filter(({ type }) => type === Request.STREAM_START)).toHaveLength(0);
     app.confirmStart();
     await app.settle();
     expect(app.state.phase).toBe("recording");
+    app.voice("Stop");
+    await app.settle();
+    expect(app.requests.find(({ type }) => type === Request.VIDEO_RECORDING_STOP)?.uploadUrl)
+      .toBe(`${SERVER}/api/sessions/session-1/video`);
   } finally { app.close(); }
 });
 

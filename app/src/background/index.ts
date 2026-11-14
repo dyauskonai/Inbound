@@ -20,10 +20,10 @@ const rejectedStarts = new Set<string>([
 
 registerMiniapp<Channels>(async (session) => {
   const state: State = {
-    phase: "ready", server: INBOUND_LIVE_ONLY ? INBOUND_LOCAL_SERVER : INBOUND_SERVER,
-    defaultServer: INBOUND_LIVE_ONLY ? INBOUND_LOCAL_SERVER : INBOUND_SERVER,
-    localServer: INBOUND_LOCAL_SERVER, liveOnly: INBOUND_LIVE_ONLY, online: false, aiConfigured: false,
-    captureMode: INBOUND_LIVE_ONLY ? "live" : "device", autoUpload: true, streamUpdateRequired: false,
+    phase: "ready", server: INBOUND_SERVER,
+    defaultServer: INBOUND_SERVER,
+    localServer: INBOUND_LOCAL_SERVER, liveOnly: false, online: false, aiConfigured: false,
+    captureMode: "device", autoUpload: true, streamUpdateRequired: false,
     camera: false, connected: false, wifi: false, battery: null,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
     message: "Say “start recording” or connect to the Mac below.", error: "", capture: null, busy: false, stopPending: false, diagnostics: [],
@@ -47,7 +47,6 @@ registerMiniapp<Channels>(async (session) => {
   let pendingSnapTimes: number[] = [];
   let captureSync = Promise.resolve();
   let journalWrite = Promise.resolve();
-  let preferredMode: State["captureMode"] | null = null;
   const snapshot = () => ({ ...state, diagnostics: [...state.diagnostics] });
   const publish = () => session.ui.send("state", snapshot());
   function diagnostic(event: string, fields: Record<string, string | number | boolean | undefined> = {}) {
@@ -85,7 +84,6 @@ registerMiniapp<Channels>(async (session) => {
 
   function setCaptureMode(mode: State["captureMode"]) {
     state.captureMode = mode;
-    preferredMode = mode;
     return session.storage.set("captureMode", mode);
   }
 
@@ -128,7 +126,7 @@ registerMiniapp<Channels>(async (session) => {
       if (health.ok !== true) throw new Error("The address did not return an Inbound health check.");
       return health;
     };
-    const fallback = state.liveOnly ? state.localServer : INBOUND_SERVER;
+    const fallback = INBOUND_SERVER;
     const addresses = allowFallback ? [...new Set([address, state.localServer, fallback].filter(Boolean))] : [address];
     for (const candidate of addresses) {
       let health: MacHealth;
@@ -147,7 +145,9 @@ registerMiniapp<Channels>(async (session) => {
         void session.storage.set("server", candidate).catch(problem);
       }
       state.aiConfigured = !!health.ai_configured;
-      state.captureMode = state.liveOnly || (preferredMode === "live" && !isPhoneRelay(candidate) && health.live_capture) ? "live" : "device";
+      // The glasses in this demo reject streaming requests. Always use the
+      // recording API, including after an older install saved "live" mode.
+      state.captureMode = "device";
       diagnostic("mac.connected", { connection: isPhoneRelay(candidate) ? "relay" : "local", captureMode: state.captureMode });
       return;
     }
@@ -211,7 +211,6 @@ registerMiniapp<Channels>(async (session) => {
         return;
       }
       const capture = state.capture;
-      if (state.liveOnly && !result.live_capture) throw new Error("The Mac did not enable live recording for this session.");
       if (result.live_capture && state.captureMode === "live" && !isPhoneRelay(capture.server)) {
         if (!await startLive(capture)) {
           await restorePreviousCapture();
@@ -606,17 +605,16 @@ registerMiniapp<Channels>(async (session) => {
   session.ui.onOpen(publish);
   session.ui.on("command", ({command}) => { void dispatch(command); });
   session.ui.on("captureMode", ({mode}) => { void run(async () => {
-    if (state.liveOnly) return;
     if (!canStartCapture(state.phase) || !["live", "device"].includes(mode)) return;
-    if (mode === "live" && isPhoneRelay(state.server)) throw new Error("Live to Mac needs the Mac’s local Wi-Fi address. The phone relay supports Record on glasses.");
+    if (mode === "live") throw new Error("Live streaming is unsupported on these glasses. Use on-glasses recording.");
     state.streamUpdateRequired = false;
-    state.message = mode === "live" ? "Ready to send video directly to the Mac." : "Ready to record on the glasses.";
+    state.message = "Ready to record on the glasses.";
     await setCaptureMode(mode);
   }); });
   session.ui.on("autoUpload", ({enabled}) => { void run(async () => {
     if (!canStartCapture(state.phase) || typeof enabled !== "boolean") return;
-    state.autoUpload = enabled;
-    await session.storage.set("autoUpload", enabled ? "on" : "off");
+    state.autoUpload = true;
+    await session.storage.set("autoUpload", "on");
   }); });
   session.ui.on("connect", ({server}) => { void run(async () => {
     if (state.capture && !canStartCapture(state.phase)) throw new Error("Finish the current session before changing the Mac address.");
@@ -858,11 +856,9 @@ registerMiniapp<Channels>(async (session) => {
 
   try {
     const savedServer = await session.storage.get("server");
-    state.server = savedServer && !isPhoneRelay(savedServer) ? savedServer : state.localServer || INBOUND_SERVER;
-    const savedMode = await session.storage.get("captureMode");
-    if (savedMode === "device" || savedMode === "live") preferredMode = savedMode;
-    state.captureMode = state.liveOnly || (preferredMode === "live" && !isPhoneRelay(state.server)) ? "live" : "device";
-    state.autoUpload = await session.storage.get("autoUpload") !== "off";
+    state.server = savedServer && !isPhoneRelay(savedServer) ? savedServer : INBOUND_SERVER;
+    state.captureMode = "device";
+    state.autoUpload = true;
     const journal = await session.storage.get("capture");
     if (journal) {
       state.capture = JSON.parse(journal) as Capture;
