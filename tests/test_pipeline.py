@@ -65,6 +65,25 @@ def test_browser_webm_snaps_and_missing_key(client, video, monkeypatch):
     assert client.get(f"/media/{sid}/original").status_code == 404
 
 
+def test_glasses_upload_keeps_snap_near_the_end(client, video, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    sid = client.post("/api/sessions", json={"source": "glasses"}).json()["id"]
+    path = f"/api/sessions/{sid}"
+    bookmarks = [{"id": "mark-1", "seconds": 3.8, "label": "Snap 1"}]
+    assert client.put(f"{path}/capture", json={"bookmarks": bookmarks}).status_code == 200
+    with video.open("rb") as recording:
+        response = client.post(f"{path}/video", files={"video": recording}, data={"requestId": "camera-id"})
+    assert response.status_code == 200
+    assert client.post(f"{path}/process").status_code == 202
+    result = finished(client, sid)
+    assert result["status"] == "awaiting_key"
+    assert result["has_audio"]
+    snap = next(item for item in result["evidence"] if item["id"] == "snap_mark-1")
+    assert 2.5 < snap["start"] < result["duration"]
+    assert client.get(f"/media/{sid}/{snap['file']}").status_code == 200
+    assert client.get(f"/media/{sid}/{snap['clip']}").status_code == 200
+
+
 def test_duplicate_upload_is_idempotent(client,video):
     sid = upload(client,video)
     with video.open("rb") as data:
@@ -121,9 +140,9 @@ def test_processing_claim_and_metadata_edit_are_serialized(client,video,monkeypa
     started=threading.Event()
     release=threading.Event()
     calls=[]
-    def slow(*args):
+    def slow(*args, **kwargs):
         calls.append(1);started.set();release.wait(2)
-        return original(*args)
+        return original(*args, **kwargs)
     monkeypatch.setattr(media,'prepare',slow)
     sid=upload(client,video)
     client.post(f'/api/sessions/{sid}/process')

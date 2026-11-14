@@ -39,11 +39,14 @@ def inspect(path: Path) -> dict:
     return {"duration": duration, "has_audio": "Audio:" in result.stderr}
 
 
-def prepare(directory: Path, bookmarks: list[dict]) -> tuple[dict, list[dict]]:
+def prepare(directory: Path, bookmarks: list[dict], *, glasses=False) -> tuple[dict, list[dict]]:
     source = directory / "original"
     info = inspect(source)
     duration = info["duration"]
-    if any(item["seconds"] > duration + 0.5 for item in bookmarks):
+    # The phone clock starts when the glasses acknowledge recording. The video
+    # duration comes from a separate clock and can differ at the end of a clip.
+    tolerance = 2 if glasses else 0.5
+    if any(item["seconds"] > duration + tolerance for item in bookmarks):
         raise ValueError("A snap falls outside the recording. Correct its timestamp before retrying.")
     ffmpeg("-i", source, "-map", "0:v:0", "-map", "0:a?", "-vf", "scale=1280:-2:force_original_aspect_ratio=decrease",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-c:a", "aac", "-movflags", "+faststart", directory / "recording.mp4")
@@ -57,7 +60,16 @@ def prepare(directory: Path, bookmarks: list[dict]) -> tuple[dict, list[dict]]:
     for item in selected + samples:
         seconds = min(item["seconds"], max(0, duration - 0.1))
         name = item["id"]
-        ffmpeg("-ss", seconds, "-i", directory / "recording.mp4", "-frames:v", "1", "-q:v", "3", directory / f"{name}.jpg")
+        still = directory / f"{name}.jpg"
+        still.unlink(missing_ok=True)
+        ffmpeg("-ss", seconds, "-i", directory / "recording.mp4", "-frames:v", "1", "-q:v", "3", still)
+        if not still.is_file():
+            # FFmpeg can return success with no image when a seek lands after
+            # the last decodable frame, particularly with low frame rates.
+            seconds = min(seconds, max(0, duration - 0.5))
+            ffmpeg("-ss", seconds, "-i", directory / "recording.mp4", "-frames:v", "1", "-q:v", "3", still)
+            if not still.is_file():
+                raise ValueError(f"Could not extract the still for {item['label']}.")
         entry = {"id": name, "kind": "image", "start": seconds, "end": seconds,
                  "label": item["label"], "file": f"{name}.jpg"}
         if name.startswith("snap_"):

@@ -66,3 +66,6 @@ class Store:
         for session in self.list():
             if session["status"] == "processing":
                 self.update(session["id"], status="interrupted", progress="Processing interrupted. Retry to resume.")
+            if session.get("live_state") in {"waiting", "recording"} and not session["has_video"]:
+                self.update(session["id"], live_state="failed", error="The Mac server restarted during capture.",
+                            progress="Start a new glasses recording.")

@@ -31,7 +31,7 @@ class Processor:
         try:
             session = self.store.get(session_id)
             directory = self.store.media_dir(session_id)
-            info, evidence = media.prepare(directory, session["bookmarks"])
+            info, evidence = media.prepare(directory, session["bookmarks"], glasses=session["source"] == "glasses")
             self.store.update(session_id, **info, evidence=evidence, progress="Recording and snaps ready")
             if not os.getenv("OPENAI_API_KEY"):
                 self.store.update(session_id, status="awaiting_key", progress="Add OPENAI_API_KEY to .env, restart the server, then retry.")

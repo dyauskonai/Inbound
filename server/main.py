@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
@@ -20,18 +21,26 @@ from .store import Store
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 MAX_UPLOAD = 512 * 1024 * 1024
+log = logging.getLogger("uvicorn.error")
 
 
-def create_app(data_dir: Path | None = None):
+def create_app(data_dir: Path | None = None, live_port: int | None = None):
     store = Store(data_dir or Path(os.getenv("INBOUND_DATA_DIR", ROOT / "runtime")))
     processor = Processor(store)
     upload_locks = {}
     demo_lock = asyncio.Lock()
+    if live_port:
+        from .live import LiveRecorder
+        live = LiveRecorder(store, live_port, upload_locks)
+    else:
+        live = None
 
     @asynccontextmanager
     async def lifespan(app):
         store.recover()
         yield
+        if live and live.active:
+            await live.stop(live.active.session_id, grace=0)
         processor.pool.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Inbound", lifespan=lifespan)
@@ -48,6 +57,7 @@ def create_app(data_dir: Path | None = None):
     def health():
         from .voice import MODEL_DIR
         return {"ok": True, "ai_configured": bool(os.getenv("OPENAI_API_KEY")),
+                "live_capture": live is not None,
                 "local_voice_ready": (MODEL_DIR / "am/final.mdl").exists(),
                 "transcribe_model": os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe"),
                 "report_model": os.getenv("OPENAI_REPORT_MODEL", "gpt-4.1")}
@@ -85,11 +95,27 @@ def create_app(data_dir: Path | None = None):
 
     @app.post("/api/sessions", status_code=201)
     def create_session(body: SessionInput):
-        return store.create(body.title, body.source)
+        session = store.create(body.title, body.source)
+        log.info("Inbound capture created session=%s source=%s", session["id"], body.source)
+        return {**session, "live_capture": live is not None} if body.source == "glasses" else session
 
     @app.get("/api/sessions/{session_id}")
     def session(session_id: str):
         return get_session(session_id)
+
+    @app.post("/api/sessions/{session_id}/live/start")
+    async def live_start(session_id: str):
+        get_session(session_id)
+        if not live:
+            raise HTTPException(503, "Run the Inbound Mac server with --lan to receive glasses video.")
+        return await live.open(session_id)
+
+    @app.post("/api/sessions/{session_id}/live/stop")
+    async def live_stop(session_id: str):
+        get_session(session_id)
+        if not live:
+            raise HTTPException(503, "The Mac live video receiver is disabled.")
+        return await live.stop(session_id)
 
     @app.put("/api/sessions/{session_id}/capture")
     def capture(session_id: str, body: CaptureInput):
@@ -105,12 +131,18 @@ def create_app(data_dir: Path | None = None):
             changes = {"bookmarks": bookmarks, "started_at": body.started_at}
             if bookmarks != session["bookmarks"] and session["report"]:
                 changes.update(report=None, status="uploaded", progress="Snaps changed. Generate the report again.")
-            return store.update(session_id, **changes)
+            saved = store.update(session_id, **changes)
+            log.info("Inbound capture marks saved session=%s count=%d", session_id, len(bookmarks))
+            return saved
 
     async def receive_video(session_id: str, video: UploadFile):
-        get_session(session_id)
+        session = get_session(session_id)
+        log.info("Inbound upload received session=%s source=%s", session_id, session["source"])
         lock = upload_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
+            if live and live.active and live.active.session_id == session_id:
+                await video.close()
+                raise HTTPException(409, "Wait for the Mac to finish the live recording before attaching a clip.")
             directory = store.media_dir(session_id)
             temporary = directory / f"upload-{uuid4().hex}.part"
             digest = hashlib.sha256()
@@ -133,12 +165,16 @@ def create_app(data_dir: Path | None = None):
                     return {"success": True, "requestId": session_id, "statusUrl": f"/api/sessions/{session_id}"}
                 from .media import inspect
                 try:
-                    await asyncio.to_thread(inspect, temporary)
+                    info = await asyncio.to_thread(inspect, temporary)
                 except ValueError as error:
                     raise HTTPException(422, str(error))
                 temporary.replace(directory / "original")
                 store.update(session_id, has_video=True, video_hash=checksum, status="uploaded", progress="Ready to generate report")
+                log.info("Inbound upload saved session=%s bytes=%d audio=%s duration=%.2f", session_id, size, info["has_audio"], info["duration"])
                 return {"success": True, "requestId": session_id, "statusUrl": f"/api/sessions/{session_id}"}
+            except HTTPException as error:
+                log.warning("Inbound upload rejected session=%s status=%d reason=%s", session_id, error.status_code, error.detail)
+                raise
             finally:
                 temporary.unlink(missing_ok=True)
                 await video.close()
@@ -216,4 +252,4 @@ def create_app(data_dir: Path | None = None):
     return app
 
 
-app = create_app()
+app = create_app(live_port=int(os.environ["INBOUND_RTMP_PORT"]) if os.getenv("INBOUND_RTMP_PORT") else None)
