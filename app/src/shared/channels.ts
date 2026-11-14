@@ -19,6 +19,8 @@ export interface Capture {
   noteSeq: number;
   photos: Photo[];
   video?: CaptureVideo;
+  /** Secret the glasses present to upload this capture's video through the server's tunnel. */
+  uploadToken: string;
 }
 /** The most recent finished capture, followed until the Mac's report is ready. */
 export interface Delivered { id: string; server: string; status: string; progress: string; video?: string }
@@ -34,6 +36,8 @@ export interface State {
   wifi: boolean;
   /** The glasses' Wi-Fi name and address, to compare with the server's network. */
   glassesNetwork: string;
+  /** Internet address the glasses upload video to, when the server runs a tunnel. */
+  videoUploadBase: string;
   videoEnabled: boolean;
   battery: number | null;
   audio: boolean;

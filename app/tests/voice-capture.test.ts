@@ -47,6 +47,7 @@ async function connect({ journal = null as string | null, video = false, failVid
   ]);
   let cloudDown = 0;
   let uploadUnreachable = false;
+  let tunnelUrl: string | null = null;
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = ((callback: () => void, interval: number) => {
     if (interval === 1000) tick = callback;
@@ -136,7 +137,7 @@ async function connect({ journal = null as string | null, video = false, failVid
     if (refuseToken) return Response.json({ detail: "Sign in to Inbound." }, { status: 401 });
     const status = rejected.get(path.replace(/\?.*$/, "").split("/").at(-1)!);
     if (status) return Response.json({ detail: "Refused" }, { status });
-    if (path === "/api/health") return Response.json({ ok: true, ai_configured: true });
+    if (path === "/api/health") return Response.json({ ok: true, ai_configured: true, video_upload_url: tunnelUrl });
     if (path === "/api/sessions") return Response.json({ id: (body as { id: string }).id }, { status: 201 });
     if (method === "GET") return Response.json({ status: macStatus, progress: "Transcribing 0–30 seconds" });
     return Response.json({ ok: true });
@@ -169,6 +170,7 @@ async function connect({ journal = null as string | null, video = false, failVid
     glassesWifi: (connected: boolean) => event("glasses_wifi", { connected }),
     cloudDown: () => { cloudDown++; },
     glassesCannotReachServer: () => { uploadUnreachable = true; },
+    serverTunnel: (url: string) => { tunnelUrl = url; },
     toggleVideo: (enabled: boolean) => event("_ui", { type: "UI_MESSAGE", channel: "video", payload: { enabled } }),
     reject: (endpoint: string, status: number) => rejected.set(endpoint, status),
     photoReply: (value: object | null) => { photoReply = value; },
@@ -522,4 +524,20 @@ test("when the glasses can't reach the server, the app says why and where the vi
   expect(detail.state).toBe("failed");
   expect(detail.detail).toContain("The glasses (10.16.95.18) could not reach the server (192.0.2.1)");
   expect(detail.detail).toContain("attach it on the dashboard");
+});
+
+test("with the server's tunnel, the glasses upload the video over the internet with the capture's own key", async () => {
+  const app = await connect({ video: true });
+  app.serverTunnel("https://inbound-demo.trycloudflare.com");
+  app.button("start");
+  await app.settle();
+  const create = app.calls.find(call => call.path === "/api/sessions")!.body as { id: string; upload_token: string };
+  expect(create.upload_token).toMatch(/^[a-f0-9]{64}$/);
+  app.button("stop");
+  await app.settle();
+  const stop = app.requests.find(request => request.type === Request.VIDEO_RECORDING_STOP)!;
+  expect(stop.uploadUrl).toBe(`https://inbound-demo.trycloudflare.com/api/sessions/${create.id}/video`);
+  expect(stop.uploadAuthToken).toBe(create.upload_token);
+  // Everything else still goes to the server on the local network.
+  expect(app.calls.every(call => !call.path.startsWith("https://"))).toBe(true);
 });

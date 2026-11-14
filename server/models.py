@@ -14,6 +14,8 @@ class SessionInput(BaseModel):
     id: str | None = Field(default=None, pattern=r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
     title: str = Field(default="New recording", min_length=1, max_length=120)
     source: Literal["glasses", "upload", "mac"] = "upload"
+    # The phone's per-capture secret for the glasses' video upload through the tunnel. Only its hash is kept.
+    upload_token: str | None = Field(default=None, min_length=32, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     auto_report: bool = False
 
 

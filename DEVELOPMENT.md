@@ -11,8 +11,9 @@ cd app && bun install
 ```
 
 ```sh
-# Terminal 1, from the repository root
-.venv/bin/python scripts/dev.py --lan
+# Terminal 1, from the repository root. --tunnel lets the glasses upload video over the
+# internet (needs `brew install cloudflared`); leave it off to upload over local Wi-Fi only.
+.venv/bin/python scripts/dev.py --lan --tunnel
 
 # Terminal 2, from the repository root
 cd app
@@ -35,7 +36,7 @@ Everything goes through the phone, which retries until the Mac confirms. The gla
 
 Every upload is idempotent, so a retry never duplicates audio, photos, or transcript lines. If the Mac is unreachable, recording continues and uploads wait in order; the MiniApp shows how many are queued. The dashboard switches to an incoming capture as soon as its first upload arrives, and shows photos and transcript lines live.
 
-**Video (optional, on by default).** The MiniApp also records video on the glasses, keeping a copy in their gallery. On Stop, the glasses upload it directly to the server over their own Wi-Fi, so they must be on the same network segment as the server. Venue Wi-Fi can put the glasses on a different segment than the laptop even with the same name, and then the upload times out; Inbound's connection settings show the glasses' address to compare. A phone hotspot shared by the glasses, phone, and laptop avoids this. If the upload fails, export the clip from the Mentra gallery and use **Attach glasses video** in the dashboard's Full video tab; the stills and report are updated from it. After a failed upload, Mentra may refuse new recordings until the Mentra app is reopened. The dashboard shows it under **Full video**, with each photo as a jump point. The report never depends on the video. Mentra Live can't take photos while it records video, so with video on, each snap is marked instantly and its still comes from the video at that moment. The report waits up to two minutes for the video; if the upload fails, those stills are lost. With video off, snaps are real photos delivered during the capture. The camera stays warm, and each snap fires immediately without waiting for the previous photo to transfer. Turn video off with **Also record video on the glasses** in Inbound.
+**Video (optional, on by default).** The MiniApp also records video on the glasses, keeping a copy in their gallery. On Stop, the glasses upload it directly to the server over their own Wi-Fi. With `scripts/dev.py --tunnel`, that upload goes over the internet through a Cloudflare quick tunnel, so the glasses' Wi-Fi only needs internet. The tunnel is an outgoing connection, so no port opens on the Mac. It passes only video uploads that carry the phone's random per-capture key, which the server stores only as a hash, and answers everything else with 404. It closes when the server stops, and Cloudflare limits each upload to about 100 MB, so video is recorded at 15 fps. Without the tunnel, the glasses must be on the same network segment as the server. Venue Wi-Fi can put the glasses on a different segment than the laptop even with the same name, and then the upload times out; Inbound's connection settings show the glasses' address to compare. A phone hotspot shared by the glasses, phone, and laptop avoids this. If the upload fails, export the clip from the Mentra gallery and use **Attach glasses video** in the dashboard's Full video tab; the stills and report are updated from it. After a failed upload, Mentra may refuse new recordings until the Mentra app is reopened. The dashboard shows it under **Full video**, with each photo as a jump point. The report never depends on the video. Mentra Live can't take photos while it records video, so with video on, each snap is marked instantly and its still comes from the video at that moment. The report waits up to two minutes for the video; if the upload fails, those stills are lost. With video off, snaps are real photos delivered during the capture. The camera stays warm, and each snap fires immediately without waiting for the previous photo to transfer. Turn video off with **Also record video on the glasses** in Inbound.
 
 ## Host it online
 

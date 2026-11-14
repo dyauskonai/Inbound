@@ -332,3 +332,36 @@ def test_video_before_finish_and_failed_video(client, video, monkeypatch):
     # The glasses report the upload failed: write the report now.
     client.post(f"{other_path}/video-state", json={"state": "failed", "detail": "Upload failed"})
     assert finished(client, other)["status"] == "awaiting_key"
+
+
+def test_tunnel_lets_through_only_the_glasses_video_upload(tmp_path, video, monkeypatch):
+    import uuid
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("INBOUND_PUBLIC_URL", "https://example.trycloudflare.com")
+    app = create_app(tmp_path)
+    with TestClient(app) as client:
+        key = uuid.uuid4().hex + uuid.uuid4().hex
+        sid = str(uuid.uuid4())
+        # The phone, on the local network, creates the capture with its upload key.
+        assert client.post("/api/sessions", json={"id": sid, "source": "glasses", "upload_token": key}).status_code == 201
+        assert "upload_token" not in json.dumps(client.get(f"/api/sessions/{sid}").json()).replace("upload_token_hash", "")
+        assert client.get("/api/health").json()["video_upload_url"] == "https://example.trycloudflare.com"
+        tunnel = {"cf-connecting-ip": "203.0.113.9", "cf-ray": "abc"}
+        upload = f"/api/sessions/{sid}/video"
+        # From the internet, nothing but the upload exists.
+        for method, path in [("GET", "/"), ("GET", "/api/health"), ("GET", "/api/sessions"), ("GET", f"/api/sessions/{sid}"),
+                             ("POST", f"/api/sessions/{sid}/notes"), ("GET", f"/media/{sid}/recording.wav"), ("POST", "/upload")]:
+            assert client.request(method, path, headers=tunnel).status_code == 404, path
+        with video.open("rb") as data:
+            assert client.post(upload, headers=tunnel, files={"video": data}).status_code == 404
+        with video.open("rb") as data:
+            assert client.post(upload, headers={**tunnel, "Authorization": "Bearer " + "0" * 64}, files={"video": data}).status_code == 404
+        other = str(uuid.uuid4())
+        client.post("/api/sessions", json={"id": other, "source": "glasses", "upload_token": uuid.uuid4().hex * 2})
+        with video.open("rb") as data:
+            # One capture's key doesn't open another capture.
+            assert client.post(f"/api/sessions/{other}/video", headers={**tunnel, "Authorization": f"Bearer {key}"}, files={"video": data}).status_code == 404
+        with video.open("rb") as data:
+            assert client.post(upload, headers={**tunnel, "Authorization": f"Bearer {key}"}, files={"video": data}).status_code == 200
+        assert client.get(f"/api/sessions/{sid}").json()["video"]["state"] == "ready"
+    app.state.processor.pool.shutdown(wait=True)

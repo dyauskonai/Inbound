@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -20,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import ValidationError
 
-from .auth import AccessControl
+from .auth import AccessControl, TunnelGuard
 from . import media
 from .models import AudioPart, CaptureInput, FinishInput, NoteInput, PhotoLink, SessionInput, VideoState
 from .processing import Processor
@@ -89,6 +90,18 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
     app = FastAPI(title="Inbound", lifespan=lifespan)
     app.add_middleware(AccessControl, device_token=os.getenv("INBOUND_DEVICE_TOKEN") or None,
                        dashboard_password=os.getenv("INBOUND_DASHBOARD_PASSWORD") or None)
+    public_url = os.getenv("INBOUND_PUBLIC_URL") or None
+
+    def upload_token_ok(session_id: str, token: str) -> bool:
+        try:
+            expected = store.get(session_id).get("upload_token_hash")
+        except KeyError:
+            return False
+        return bool(expected and token) and hmac.compare_digest(expected, hashlib.sha256(token.encode()).hexdigest())
+
+    if public_url:
+        # scripts/dev.py --tunnel: the glasses upload video over the internet; nothing else is exposed.
+        app.add_middleware(TunnelGuard, verify=upload_token_ok)
     app.state.store = store
     app.state.processor = processor
 
@@ -109,6 +122,7 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
         return {"ok": True, "ai_configured": bool(os.getenv("OPENAI_API_KEY")),
                 "live_capture": live is not None,
                 "local_voice_ready": voice_ready,
+                "video_upload_url": public_url,
                 "transcribe_model": os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe"),
                 "report_model": os.getenv("OPENAI_REPORT_MODEL", "gpt-4.1")}
 
@@ -156,6 +170,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
             return session
         if body.source == "glasses" and body.auto_report:
             session = store.update(session["id"], auto_report=True)
+        if body.upload_token:
+            session = store.update(session["id"], upload_token_hash=hashlib.sha256(body.upload_token.encode()).hexdigest())
         log.info("Inbound capture created session=%s source=%s", session["id"], body.source)
         return {**session, "live_capture": live is not None} if body.source == "glasses" else session
 

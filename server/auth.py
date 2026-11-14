@@ -58,3 +58,36 @@ class AccessControl:
             method = scope.get("method", "GET")
             return any(method == allowed and route.fullmatch(scope["path"]) for allowed, route in DEVICE_ROUTES)
         return False
+
+
+TUNNEL_UPLOAD = re.compile(r"/api/sessions/([a-f0-9-]{36})/video")
+
+
+class TunnelGuard:
+    """Through the laptop's Cloudflare tunnel, allow only the glasses' video upload.
+
+    cloudflared connects from this machine, so tunnel requests are told apart by the
+    header Cloudflare adds to every request it forwards. An upload must carry the
+    secret the phone made for that capture, checked before the body is read. Anything
+    else gets a plain 404, so the dashboard and captures never reach the internet.
+    """
+
+    def __init__(self, app, verify):
+        self.app = app
+        self.verify = verify
+
+    async def __call__(self, scope, receive, send):
+        headers = dict(scope.get("headers") or [])
+        if scope["type"] not in {"http", "websocket"} or not (b"cf-connecting-ip" in headers or b"cf-ray" in headers):
+            await self.app(scope, receive, send)
+            return
+        scheme, _, token = headers.get(b"authorization", b"").decode("latin-1").partition(" ")
+        match = TUNNEL_UPLOAD.fullmatch(scope["path"])
+        if scope["type"] == "http" and scope["method"] == "POST" and match and scheme.lower() == "bearer" and self.verify(match[1], token.strip()):
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await send({"type": "http.response.start", "status": 404, "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": b'{"detail":"Not Found"}'})

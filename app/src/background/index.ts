@@ -7,7 +7,7 @@ declare const INBOUND_LOCAL_SERVER: string;
 // Set when the build targets an internet server; that server refuses requests without it.
 declare const INBOUND_TOKEN: string;
 
-type MacHealth = { ok: boolean; ai_configured?: boolean };
+type MacHealth = { ok: boolean; ai_configured?: boolean; video_upload_url?: string | null };
 type PhotoResult = { photoUrl?: string; key?: string; url?: string; mimeType?: string };
 interface Job {
   capture: Capture;
@@ -32,7 +32,8 @@ const PHOTO_TIMEOUT_MS = 30000;
 const WARM_MS = 60000;
 const VIDEO_START_TIMEOUT_MS = 30000;
 // `save` keeps a copy in the glasses' gallery in case the Wi-Fi upload fails.
-const videoOptions = { width: 1280, height: 720, fps: 30, save: true, sound: false };
+// 15 fps keeps files about half the size, so longer captures fit the tunnel's ~100 MB upload limit.
+const videoOptions = { width: 1280, height: 720, fps: 15, save: true, sound: false };
 // A command word at the end of a partial transcript can still grow ("stop" → "stopped").
 const SETTLE_MS = 350;
 const REPEAT_MS = 1500;
@@ -41,7 +42,7 @@ const finished = new Set(["complete", "awaiting_key", "failed", "interrupted"]);
 registerMiniapp<Channels>(async (session) => {
   const state: State = {
     phase: "ready", server: INBOUND_SERVER, defaultServer: INBOUND_SERVER,
-    online: false, aiConfigured: false, camera: false, connected: false, wifi: false, glassesNetwork: "", videoEnabled: true, battery: null, audio: false,
+    online: false, aiConfigured: false, camera: false, connected: false, wifi: false, glassesNetwork: "", videoUploadBase: "", videoEnabled: true, battery: null, audio: false,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
     message: "Say “start” to begin. Nothing is recorded or sent until then.", error: "",
     capture: null, delivered: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
@@ -127,6 +128,7 @@ registerMiniapp<Channels>(async (session) => {
         const health = await request<MacHealth>(candidate, "/api/health", "GET", undefined, undefined, 3000);
         if (health.ok !== true) throw new Error("The address did not return an Inbound health check.");
         state.aiConfigured = !!health.ai_configured;
+        state.videoUploadBase = health.video_upload_url?.replace(/\/+$/, "") ?? "";
       } catch (error) {
         if (!allowFallback) throw error;
         continue;
@@ -222,12 +224,15 @@ registerMiniapp<Channels>(async (session) => {
   }
 
   function start() {
-    const capture: Capture = { id: crypto.randomUUID(), server: state.server, startedAt: Date.now(), audioSeq: 0, noteSeq: 0, photos: [] };
+    const capture: Capture = {
+      id: crypto.randomUUID(), server: state.server, startedAt: Date.now(), audioSeq: 0, noteSeq: 0, photos: [],
+      uploadToken: (crypto.randomUUID() + crypto.randomUUID()).replace(/-/g, ""),
+    };
     // The session ID is made here, so recording starts instantly and the
     // create request simply waits in the queue if the Mac is unreachable.
     enqueue({
       capture, path: "/api/sessions", label: "session", contentType: "application/json",
-      body: JSON.stringify({ id: capture.id, title: `Glasses capture · ${new Date().toLocaleTimeString()}`, source: "glasses", auto_report: true }),
+      body: JSON.stringify({ id: capture.id, title: `Glasses capture · ${new Date().toLocaleTimeString()}`, source: "glasses", auto_report: true, upload_token: capture.uploadToken }),
     });
     resetAudio();
     streamAudio(true);
@@ -241,15 +246,14 @@ registerMiniapp<Channels>(async (session) => {
     if (state.videoEnabled && state.camera) startVideo(capture);
     else keepCameraWarm(capture);
     publish();
-    if (!state.online) {
-      void selectServer(state.server, true).then((server) => {
-        if (!sent.get(capture) && server !== capture.server) {
-          capture.server = server;
-          void save().catch(() => {});
-        }
-        publish();
-      }).catch(() => diagnostic("mac.unreachable", { session: capture.id }));
-    }
+    // Also refreshes the server's video upload address, which changes whenever its tunnel restarts.
+    void selectServer(state.server, true).then((server) => {
+      if (!sent.get(capture) && server !== capture.server) {
+        capture.server = server;
+        void save().catch(() => {});
+      }
+      publish();
+    }).catch(() => diagnostic("mac.unreachable", { session: capture.id }));
   }
 
   function snap() {
@@ -431,12 +435,13 @@ registerMiniapp<Channels>(async (session) => {
     try {
       // The glasses upload the finished video themselves, over their own Wi-Fi.
       await session.camera.stopVideoRecording(video.recordingId, {
-        uploadUrl: `${capture.server}/api/sessions/${capture.id}/video`,
-        ...(INBOUND_TOKEN ? { uploadAuthToken: INBOUND_TOKEN } : {}),
+        // Through the server's internet tunnel when it has one, so the glasses' Wi-Fi only needs internet.
+        uploadUrl: `${state.videoUploadBase || capture.server}/api/sessions/${capture.id}/video`,
+        uploadAuthToken: INBOUND_TOKEN || capture.uploadToken,
       });
       video.state = "uploading";
       void session.storage.delete("videoRecording").catch(() => {});
-      diagnostic("video.stopped", { session: capture.id, wifi: state.wifi });
+      diagnostic("video.stopped", { session: capture.id, wifi: state.wifi, route: state.videoUploadBase ? "internet" : "local" });
     } catch (error) {
       const { code, message } = (error as { code?: string; message?: string }) ?? {};
       const uploadFailed = code === "media_error" || /upload/i.test(message ?? "");
