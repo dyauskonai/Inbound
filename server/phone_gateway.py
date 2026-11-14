@@ -6,7 +6,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE = ROOT / "runtime" / "phone-connection.json"
@@ -24,16 +24,18 @@ async def install(token: str, filename: str):
     authenticate(token)
     if filename == "__mentra_release/health":
         return {"ok": True}
+    manifest_path = ROOT / "app/miniapp.json"
+    manifest = json.loads(manifest_path.read_text())
     paths = {
-        "miniapp.json": ROOT / "app/miniapp.json",
+        "miniapp.json": manifest_path,
         "icon.png": ROOT / "app/icon.png",
-        "bundle.zip": ROOT / "app/build/com.inbound.capture-0.1.0.zip",
+        "bundle.zip": ROOT / "app/build" / f"{manifest['packageName']}-{manifest['version']}.zip",
     }
     path = paths.get(filename)
     if path is None or not path.is_file():
         raise HTTPException(404)
     if filename == "bundle.zip":
-        print("Phone downloaded the Inbound install bundle", flush=True)
+        print(f"Inbound MiniApp {manifest['version']} bundle downloaded", flush=True)
     return FileResponse(path, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
@@ -44,13 +46,15 @@ async def device(token: str, path: str, request: Request):
         return HTMLResponse("<body style='font:18px system-ui;padding:30px'><h1>Inbound is connected</h1><p>Use the Inbound MiniApp to record. Your full report appears in Inbound on the Mac.</p></body>", headers={"Referrer-Policy": "no-referrer"})
     allowed = (path == "api/health" and request.method == "GET") or (path == "api/sessions" and request.method == "POST")
     match = re.fullmatch(r"api/sessions/([a-f0-9-]{36})(/(capture|video|process|report.json))?", path)
-    if match and match[1] in config.get("sessions", []):
+    relay_session = match and match[1] in config.get("sessions", [])
+    local_upload = match and not relay_session and match[3] == "video" and request.method == "POST"
+    if relay_session:
         methods = {None: "GET", "capture": "PUT", "video": "POST", "process": "POST", "report.json": "GET"}
         allowed = request.method == methods[match[3]]
-    if not allowed:
+    if not allowed and not local_upload:
         raise HTTPException(404)
-    # Only sessions made by this phone connection are reachable. The tunnel
-    # cannot enumerate existing recordings, files, or server credentials.
+    # For sessions created over Wi-Fi, the glasses can upload to a known
+    # session UUID. The relay still cannot read or edit those sessions.
     maximum = 95 * 1024 * 1024
     if int(request.headers.get("content-length", "0")) > maximum:
         raise HTTPException(413, "Keep demo recordings under 95 MB.")
@@ -65,7 +69,13 @@ async def device(token: str, path: str, request: Request):
 
     headers = {key: value for key, value in request.headers.items() if key.lower() in {"content-type", "content-length"}}
     async with httpx.AsyncClient(timeout=180) as client:
+        if local_upload:
+            session = await client.get(f"http://127.0.0.1:8000/api/sessions/{match[1]}")
+            if not session.is_success or session.json().get("source") != "glasses":
+                raise HTTPException(404)
         response = await client.request(request.method, "http://127.0.0.1:8000/" + path, headers=headers, content=content())
+    if local_upload and response.is_success:
+        return JSONResponse({"success": True, "requestId": match[1]}, headers={"Cache-Control": "no-store"})
     if path == "api/sessions" and response.status_code == 201:
         config.setdefault("sessions", []).append(response.json()["id"])
         STATE.write_text(json.dumps(config))

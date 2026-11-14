@@ -39,8 +39,15 @@ await rm(distDir, {recursive: true, force: true})
 
 // Pick up MENTRA_PUBLIC_* env vars from the shell / .env. Bun loads .env
 // from cwd automatically; we just need to forward the keys to define.
-const lan = Object.values(networkInterfaces()).flat().find(item => item?.family === "IPv4" && !item.internal)?.address
-const define: Record<string, string> = { INBOUND_SERVER: JSON.stringify(process.env.INBOUND_SERVER || (lan ? `http://${lan}:8000` : "")) }
+const interfaces = networkInterfaces()
+const lan = (interfaces.en0 ?? []).find(item => item.family === "IPv4" && !item.internal && !item.address.startsWith("169.254."))?.address
+  ?? Object.values(interfaces).flat().find(item => item?.family === "IPv4" && !item.internal && !item.address.startsWith("169.254."))?.address
+const localServer = lan ? `http://${lan}:8000` : ""
+const define: Record<string, string> = {
+  INBOUND_SERVER: JSON.stringify(process.env.INBOUND_SERVER || localServer),
+  INBOUND_LOCAL_SERVER: JSON.stringify(localServer),
+  INBOUND_LIVE_ONLY: JSON.stringify(process.env.INBOUND_LIVE_ONLY === "1"),
+}
 for (const [k, v] of Object.entries(process.env)) {
   if (k.startsWith("MENTRA_PUBLIC_") && typeof v === "string") {
     define[`process.env.${k}`] = JSON.stringify(v)

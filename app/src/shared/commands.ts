@@ -6,7 +6,7 @@ export function normalizeSpeech(text: string): string {
 
 // Narrative containing these words must not interrupt a recording.
 export function commandFrom(text: string): Command | null {
-  const phrase = normalizeSpeech(text);
+  const phrase = normalizeSpeech(text).replace(/^in\s?bound(?:\s*[,.:!-]\s*|\s+)/, "");
   if (/^start(?: (?:the )?record(?:ings?)?)?$/.test(phrase)) return "start";
   if (/^stop(?: (?:the )?record(?:ings?)?)?$/.test(phrase)) return "stop";
   if (/^(?:take a )?(?:snap|snapshot|screen\s?shot)$/.test(phrase)) return "snap";
@@ -15,6 +15,10 @@ export function commandFrom(text: string): Command | null {
 
 export function canStartCapture(phase: Phase): boolean {
   return phase === "ready" || phase === "complete" || phase === "awaiting_key";
+}
+
+export function isPhoneRelay(address: string): boolean {
+  return /\/device\/[a-f0-9]{64}$/i.test(address);
 }
 
 export function serverOrigin(input: string): string {

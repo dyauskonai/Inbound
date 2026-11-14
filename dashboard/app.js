@@ -8,6 +8,7 @@ let previewUrl = null;
 let refreshSequence = 0;
 let renderRevision = null;
 let attachId = null;
+let seenGlassesVideos = null;
 
 const escapeHtml = (text) =>
   String(text ?? "").replace(
@@ -52,6 +53,17 @@ async function refresh() {
   try {
     const sessions = await api("/api/sessions");
     if (request !== refreshSequence) return;
+    const glassesVideos = sessions.filter(
+      (session) => session.source === "glasses" && session.status !== "created",
+    );
+    const incoming = seenGlassesVideos && glassesVideos.find(
+      (session) => !seenGlassesVideos.has(session.id),
+    );
+    seenGlassesVideos = new Set(glassesVideos.map((session) => session.id));
+    if (incoming && incoming.id !== selectedId && (!selectedId || selected?.status === "created") && !$("import-dialog").open) {
+      await selectSession(incoming.id);
+      return;
+    }
     $("sessions").innerHTML = sessions
       .map(
         (session) =>
@@ -124,12 +136,13 @@ function render(session) {
     $("report").innerHTML =
       '<div class="empty-report">The report will appear here after processing. Your recording and marked moments are saved locally.</div>';
   const snaps = session.evidence.filter((item) => item.clip);
+  const captions = new Map((session.report?.snap_captions || []).map((item) => [item.evidence_id, item.caption]));
   $("snap-count").textContent = String(snaps.length);
   $("snaps").innerHTML = snaps.length
     ? snaps
         .map(
           (item) =>
-            `<button class="snap" data-evidence="${escapeHtml(item.id)}"><img src="${mediaUrl(item.file)}" alt="${escapeHtml(item.label)}" loading="lazy"><span>${escapeHtml(item.label)}<small>${time(item.start)} · clip ↗</small></span></button>`,
+            `<button class="snap" data-evidence="${escapeHtml(item.id)}"><img src="${mediaUrl(item.file)}" alt="${escapeHtml(item.label)}" loading="lazy"><span>${escapeHtml(item.label)}<small>${time(item.start)} · clip ↗</small></span>${captions.has(item.id) ? `<p class="snap-caption">${escapeHtml(captions.get(item.id))}</p>` : ""}</button>`,
         )
         .join("")
     : '<p class="muted small">Marked moments appear here after video processing.</p>';
@@ -163,6 +176,9 @@ document.addEventListener("click", (event) => {
       (entry) => entry.id === snap.dataset.evidence,
     );
     $("evidence-title").textContent = `${item.label} · ${time(item.start)}`;
+    const caption = selected.report?.snap_captions?.find((entry) => entry.evidence_id === item.id)?.caption;
+    $("evidence-caption").textContent = caption || "";
+    $("evidence-caption").hidden = !caption;
     $("evidence-image").src = mediaUrl(item.file);
     $("evidence-clip").src = mediaUrl(item.clip);
     $("evidence-dialog").showModal();

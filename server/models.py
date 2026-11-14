@@ -12,6 +12,7 @@ class Bookmark(BaseModel):
 class SessionInput(BaseModel):
     title: str = Field(default="New recording", min_length=1, max_length=120)
     source: Literal["glasses", "upload", "mac"] = "upload"
+    auto_report: bool = False
 
 
 class CaptureInput(BaseModel):
@@ -48,6 +49,16 @@ class Report(BaseModel):
     uncertainties: list[str]
 
 
+class SnapCaption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    evidence_id: str
+    caption: str
+
+
+class GeneratedReport(Report):
+    snap_captions: list[SnapCaption]
+
+
 def validate_evidence(report: Report, evidence: list[dict]) -> dict:
     """Reject invented source links and derive timeline times from real media."""
     sources = {item["id"]: item for item in evidence}
@@ -58,6 +69,11 @@ def validate_evidence(report: Report, evidence: list[dict]) -> dict:
         if not entry.evidence_ids or any(key not in sources for key in entry.evidence_ids):
             raise ValueError("The report contains a statement without valid source evidence. Retry generation.")
     result = report.model_dump()
+    if isinstance(report, GeneratedReport):
+        expected = {item["id"] for item in evidence if item.get("clip")}
+        received = [item.evidence_id for item in report.snap_captions]
+        if set(received) != expected or len(received) != len(expected) or any(not item.caption.strip() for item in report.snap_captions):
+            raise ValueError("The report did not describe every saved snap. Retry generation.")
     for entry in result["timeline"]:
         entry["seconds"] = min(sources[key]["start"] for key in entry["evidence_ids"])
     result["timeline"].sort(key=lambda entry: entry["seconds"])

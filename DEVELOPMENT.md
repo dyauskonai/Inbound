@@ -1,17 +1,20 @@
-# Local development checkpoint
-
-The working project is local. Nothing from this implementation has been pushed to GitHub. The existing README is unchanged.
+# Local development
 
 ## Run on this Mac
 
-The Python environment, Bun executable, and app dependencies are already installed locally. VS Code has tasks under **Terminal → Run Task** for the Mac server, Mentra MiniApp, and backend tests. Stop an existing service before starting another copy on the same port.
+Install Python and Bun, create a virtual environment, and install the dependencies. VS Code also has tasks under **Terminal → Run Task** for the Mac server, Mentra MiniApp, and backend tests.
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+cd app && bun install
+```
 
 ```sh
 # Terminal 1, from the repository root
 .venv/bin/python scripts/dev.py --lan
 
 # Terminal 2, from the repository root
-export PATH="$PWD/runtime/bin:$PATH"
 cd app
 bun run dev
 ```
@@ -35,28 +38,26 @@ Inbound's connection settings show the Mac address. Its default is detected when
 7. If the log shows a Mac connection error, open **Connection settings**, choose **Use this build’s Mac address** if available, and tap **Connect to Mac**. If the recording light turns off but the dashboard still shows **Awaiting recording**, check glasses Wi-Fi and tap **Retry / check upload**. Look for `Inbound upload received` and `Inbound upload saved` in the Mac server terminal. If the video is in Mentra’s gallery, export it and use **Attach recording** on the same Mac session.
 8. To test Stop during startup, say **“start”**, then say **“stop”** while Inbound is still starting. If Start confirms, Inbound sends the queued Stop immediately. If the screen changes to **Start unconfirmed** and the recording light is still on, press the glasses' action button once. After the light turns off, tap **I stopped it on the glasses**. Sync and export the saved clip from Mentra's **Camera** and use **Attach recording** on that session in the Mac dashboard. If the light never turned on, choose **Camera is idle · try again**.
 9. If a previous session is stuck on **Waiting upload**, confirm that the recording light is off, then tap **Camera is idle · Start a new capture**. The old session remains in the Mac dashboard. For a direct capture, `live.mac_recording` confirms that the first video reached the Mac. `live.mac_finalized` confirms that Stop finished saving the video. If the camera light stays on after the Mac saves, use **Stop glasses** to retry the device stop separately.
-10. If Mentra asks for a glasses update to stream, choose **Recording mode → Record on glasses** before trying Start. Inbound also selects that mode when Mentra returns the update error to it. In this mode, the recording stays on the glasses first, and Snap marks become stills after the clip reaches the Mac. If Mentra again fails to confirm Start, the action-button and dashboard attachment steps above apply. After updating the glasses, switch back to **Live to Mac** to test direct recording.
+10. If Mentra rejects live streaming with `CAMERA_ERROR` and `Function not implemented (-38)`, choose **Recording mode → Record on glasses**. Inbound also selects that mode after this error. Say **“start”** again. In this mode, the recording stays on the glasses first, and Snap marks become stills after the clip reaches the Mac. If Mentra again fails to confirm Start, the action-button and dashboard attachment steps above apply.
 
 ## AI setup
 
-Copy `.env.example` to `.env`, enter `OPENAI_API_KEY` locally, restart the Mac server, then retry processing. API keys stay on the Mac. Live AI output has not been tested because no key is configured.
+Copy `.env.example` to `.env`, enter `OPENAI_API_KEY` locally, then start or restart the Mac server. An automatic report was verified with a synthetic recording after it reached the Mac.
 
 ## Implemented and checked
 
 - Mac camera recording and exact start/snap/stop commands, using a local Vosk model.
 - Uploads, durable session storage, FFmpeg still/clip extraction, report generation adapter, evidence links, dashboard, JSON export, and print view.
 - Mentra MiniApp using `@mentra/miniapp` 3.4.0, with video capture/upload, voice commands, phone controls, and a saved session journal.
-- Backend tests: 8 passing. MiniApp TypeScript check and production build pass.
+- Backend tests and MiniApp voice tests pass. The MiniApp also passes its TypeScript check and packages for installation.
 - Synthetic browser capture exercised voice start → snap → stop → upload → still/clip extraction. This did not use the actual glasses.
 
 ## Remaining device checks
 
-- Load the QR on the physical iPhone and verify this Mentra app version supports the MiniApp APIs.
-- Verify glasses video includes audio and can upload to the Mac on venue Wi-Fi.
-- Test commands on the glasses, including noisy surroundings and stop/retry behavior.
-- Add an OpenAI key and validate the actual transcript and report quality.
+- Start, Snap, and Stop were recognized on the physical glasses, and recording to the Mentra gallery worked.
+- Automatic delivery of glasses video to the Mac is still unverified. The venue network timed out on the glasses upload and on direct live video. Confirm reachability from the glasses, then check video, audio, snaps, and report generation in one take.
 - Snap timing is approximate: the MiniApp SDK provides no word timestamps or recording clock. Stills are extracted after upload; this is not an immediate camera photo.
 
 Use fictional training data. The report is a summary of captured evidence, not a diagnosis or treatment recommendation. The prototype's local server has no production patient-data protections.
 
-The earlier native Bluetooth prototype is retained only in ignored `runtime/native-prototype/`. The active phone project is `app/`, which runs inside Mentra. Do not upload the repo or replace its README without Dyaus's approval.
+The active phone project is `app/`, which runs inside Mentra. Keep keys, install bundles, connection QR codes, logs, and recordings local.

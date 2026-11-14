@@ -17,7 +17,10 @@ export interface State {
   phase: Phase;
   server: string;
   defaultServer: string;
+  localServer: string;
+  liveOnly: boolean;
   captureMode: "live" | "device";
+  autoUpload: boolean;
   streamUpdateRequired: boolean;
   online: boolean;
   aiConfigured: boolean;
@@ -42,6 +45,7 @@ export interface Channels {
   command: { command: Command };
   connect: { server: string };
   captureMode: { mode: State["captureMode"] };
+  autoUpload: { enabled: boolean };
   retry: Record<string, never>;
   wifi: Record<string, never>;
   resetUnconfirmedStart: Record<string, never>;

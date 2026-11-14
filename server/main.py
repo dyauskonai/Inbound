@@ -96,6 +96,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
     @app.post("/api/sessions", status_code=201)
     def create_session(body: SessionInput):
         session = store.create(body.title, body.source)
+        if body.source == "glasses" and body.auto_report:
+            session = store.update(session["id"], auto_report=True)
         log.info("Inbound capture created session=%s source=%s", session["id"], body.source)
         return {**session, "live_capture": live is not None} if body.source == "glasses" else session
 
@@ -171,6 +173,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
                 temporary.replace(directory / "original")
                 store.update(session_id, has_video=True, video_hash=checksum, status="uploaded", progress="Ready to generate report")
                 log.info("Inbound upload saved session=%s bytes=%d audio=%s duration=%.2f", session_id, size, info["has_audio"], info["duration"])
+                if session.get("auto_report"):
+                    processor.submit(session_id)
                 return {"success": True, "requestId": session_id, "statusUrl": f"/api/sessions/{session_id}"}
             except HTTPException as error:
                 log.warning("Inbound upload rejected session=%s status=%d reason=%s", session_id, error.status_code, error.detail)

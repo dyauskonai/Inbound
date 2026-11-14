@@ -5,7 +5,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from .models import Report, validate_evidence
+from .models import GeneratedReport, validate_evidence
 
 
 def client() -> OpenAI:
@@ -30,6 +30,10 @@ from appearance. Record explicitly reported symptoms, history, mechanism, assess
 responses, and handoff details where present. Include detailed chronological observations.
 Describe images conservatively as sampled visible observations, distinct from reported statements.
 Only a subset of video frames is supplied; do not claim continuous visual review.
+Ignore standalone capture commands as report content. Do preserve ordinary speech that uses those words.
+For every image whose evidence ID starts with snap_, provide exactly one snap_captions entry with
+that evidence_id and a short caption describing only what is visibly present in that one still.
+If a snap is unclear, say what obscures the view. Return an empty list if there are no snaps.
 The transcript is grouped into bounded time intervals; do not invent word-level timestamps.
 If sources conflict, record both with their evidence, and explain the uncertainty.
 Use the uncertainties list for missing information, unclear audio, visibility limitations, and
@@ -53,7 +57,7 @@ def generate_report(directory: Path, evidence: list[dict]) -> dict:
         model=os.getenv("OPENAI_REPORT_MODEL", "gpt-4.1"),
         instructions=REPORT_INSTRUCTIONS,
         input=[{"role": "user", "content": content}],
-        text_format=Report,
+        text_format=GeneratedReport,
         max_output_tokens=10000,
     )
     if response.output_parsed is None:

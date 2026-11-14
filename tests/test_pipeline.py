@@ -67,14 +67,13 @@ def test_browser_webm_snaps_and_missing_key(client, video, monkeypatch):
 
 def test_glasses_upload_keeps_snap_near_the_end(client, video, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    sid = client.post("/api/sessions", json={"source": "glasses"}).json()["id"]
+    sid = client.post("/api/sessions", json={"source": "glasses", "auto_report": True}).json()["id"]
     path = f"/api/sessions/{sid}"
     bookmarks = [{"id": "mark-1", "seconds": 3.8, "label": "Snap 1"}]
     assert client.put(f"{path}/capture", json={"bookmarks": bookmarks}).status_code == 200
     with video.open("rb") as recording:
         response = client.post(f"{path}/video", files={"video": recording}, data={"requestId": "camera-id"})
     assert response.status_code == 200
-    assert client.post(f"{path}/process").status_code == 202
     result = finished(client, sid)
     assert result["status"] == "awaiting_key"
     assert result["has_audio"]

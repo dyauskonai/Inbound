@@ -431,6 +431,15 @@ video {
   font-variant-numeric: tabular-nums;
   color: var(--muted);
 }
+.snap-caption {
+  color: var(--muted);
+  line-height: 1.45;
+}
+.snap .snap-caption {
+  margin: 0;
+  padding: 0 12px 12px;
+  font-size: 12px;
+}
 details {
   border-top: 1px solid var(--line);
   margin-top: 24px;

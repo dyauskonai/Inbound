@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Command, State } from "../shared/channels";
-import { canStartCapture } from "../shared/commands";
+import { canStartCapture, isPhoneRelay } from "../shared/commands";
 
 const time = (seconds: number) => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
 export function App() {
@@ -38,7 +38,7 @@ export function App() {
       <div className="capture-label">{recording ? "● RECORDING" : (state?.phase || "connecting").replaceAll("_", " ").toUpperCase()}</div>
       <div className="clock">{recording && state?.capture ? time(Math.max(0, (now - state.capture.startedAt)/1000)) : "Ready when you are."}</div>
       <p>{state?.message || "Connecting to the Mentra app…"}</p>
-      {ready && state.captureMode === "device" && <small>Recording on the glasses. The Mac receives the clip after Stop.</small>}
+      {ready && state.captureMode === "device" && <small>{state.autoUpload ? "Stop saves the clip and sends it to your Mac." : "Stop saves the clip to the glasses gallery."}</small>}
       {ready && <button className="primary" disabled={state.busy || !state.server} onClick={() => send("start")}>● Start recording</button>}
       {recording && <div className="controls"><button className="primary" disabled={state.busy} onClick={() => send("snap")}>＋ Snap</button><button onClick={() => send("stop")}>■ Stop</button></div>}
       {state?.phase === "starting" && <button disabled={state.stopPending} onClick={() => send("stop")}>{state.stopPending ? "Stop requested" : "■ Stop"}</button>}
@@ -57,13 +57,14 @@ export function App() {
     {(error || state?.error) && <p className="error" role="alert">{error || state?.error}</p>}
     {state?.capture && <section className="moments"><div className="section-head"><h2>Marked moments</h2><span>{state.capture.bookmarks.length}</span></div>{state.capture.bookmarks.map(mark => <div key={mark.id} className="moment"><span>↗ {mark.label}</span><time>{time(mark.seconds)}</time></div>)}<p className="fine">The Mac saves a still and clip from each mark after the video uploads.</p><button className="text-button" onClick={() => mentra.send("report", {})}>Open report on the Mac server ↗</button></section>}
     <details open={!state?.server}><summary>Connection settings <span>{state?.online ? "Mac connected" : "Set up"}</span></summary><label htmlFor="server">Mac server address</label><input id="server" type="url" value={server} onChange={event=>setServer(event.target.value)} placeholder="http://192.168.1.20:8000" autoCapitalize="none" autoCorrect="off"/><button disabled={!state || state.busy || (!!state.capture && !ready)} onClick={() => mentra.send("connect", {server})}>Connect to Mac</button>{state?.defaultServer && server !== state.defaultServer && <button className="text-button" onClick={() => setServer(state.defaultServer)}>Use this build’s Mac address</button>}<button className="text-button" disabled={!state || state.busy} onClick={() => mentra.send("wifi", {})}>Set up glasses Wi-Fi ↗</button><p className="fine">Keep the Mac, iPhone, and glasses on the same reachable network.</p></details>
-    {state && <details className="diagnostics" open={state.streamUpdateRequired || undefined}>
+    {state?.liveOnly && <p className="fine">Live to Mac · Say “stop” to save the video and prepare the report.</p>}
+    {state && !state.liveOnly && <details className="diagnostics" open={state.streamUpdateRequired || undefined}>
       <summary>Recording mode <span>{state.captureMode === "device" ? "On glasses" : "Live to Mac"}</span></summary>
       <div className="controls">
         <button disabled={!ready || state.busy || state.captureMode === "device"} onClick={() => mentra.send("captureMode", {mode: "device"})}>Record on glasses</button>
-        <button disabled={!ready || state.busy || state.captureMode === "live"} onClick={() => mentra.send("captureMode", {mode: "live"})}>Live to Mac</button>
+        <button disabled={!ready || state.busy || state.captureMode === "live" || isPhoneRelay(state.server)} onClick={() => mentra.send("captureMode", {mode: "live"})}>Live to Mac</button>
       </div>
-      <p className="fine">Choose Record on glasses while the Mentra streaming update is unavailable.</p>
+      {state.captureMode === "device" && <label><input type="checkbox" checked={state.autoUpload} disabled={!ready || state.busy} onChange={event => mentra.send("autoUpload", {enabled: event.target.checked})}/> Upload and generate report after Stop</label>}
     </details>}
     {state && <details className="diagnostics"><summary>Capture diagnostics</summary><button className="text-button" onClick={copyLogs}>Copy logs</button><span className="fine" role="status">{copied}</span><pre tabIndex={0}>{state.diagnostics.join("\n")}</pre></details>}
     <footer>Immerse the Bay · Training prototype<br/>Use fictional scenarios and consenting volunteers.</footer>

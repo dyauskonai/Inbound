@@ -13,6 +13,7 @@
 node_modules/
 .expo/
 dist/
+app/dist 2/
 web-build/
 coverage/
 *.tsbuildinfo

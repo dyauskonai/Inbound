@@ -1,8 +1,12 @@
 import { MiniappErrorCode, MiniappRequestType, registerMiniapp } from "@mentra/miniapp/background";
 import type { Capture, Channels, Command, Phase, State } from "../shared/channels";
-import { canStartCapture, commandFrom, normalizeSpeech, serverOrigin } from "../shared/commands";
+import { canStartCapture, commandFrom, isPhoneRelay, normalizeSpeech, serverOrigin } from "../shared/commands";
 
 declare const INBOUND_SERVER: string;
+declare const INBOUND_LOCAL_SERVER: string;
+declare const INBOUND_LIVE_ONLY: boolean;
+
+type MacHealth = { ok: boolean; ai_configured?: boolean; live_capture?: boolean };
 
 // The previous build inherited the glasses' camera settings. Use a known
 // capture profile while diagnosing missing Start acknowledgments.
@@ -16,8 +20,10 @@ const rejectedStarts = new Set<string>([
 
 registerMiniapp<Channels>(async (session) => {
   const state: State = {
-    phase: "ready", server: INBOUND_SERVER, defaultServer: INBOUND_SERVER, online: false, aiConfigured: false,
-    captureMode: "live", streamUpdateRequired: false,
+    phase: "ready", server: INBOUND_LIVE_ONLY ? INBOUND_LOCAL_SERVER : INBOUND_SERVER,
+    defaultServer: INBOUND_LIVE_ONLY ? INBOUND_LOCAL_SERVER : INBOUND_SERVER,
+    localServer: INBOUND_LOCAL_SERVER, liveOnly: INBOUND_LIVE_ONLY, online: false, aiConfigured: false,
+    captureMode: INBOUND_LIVE_ONLY ? "live" : "device", autoUpload: true, streamUpdateRequired: false,
     camera: false, connected: false, wifi: false, battery: null,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
     message: "Say “start recording” or connect to the Mac below.", error: "", capture: null, busy: false, stopPending: false, diagnostics: [],
@@ -41,6 +47,7 @@ registerMiniapp<Channels>(async (session) => {
   let pendingSnapTimes: number[] = [];
   let captureSync = Promise.resolve();
   let journalWrite = Promise.resolve();
+  let preferredMode: State["captureMode"] | null = null;
   const snapshot = () => ({ ...state, diagnostics: [...state.diagnostics] });
   const publish = () => session.ui.send("state", snapshot());
   function diagnostic(event: string, fields: Record<string, string | number | boolean | undefined> = {}) {
@@ -71,16 +78,18 @@ registerMiniapp<Channels>(async (session) => {
     const code = issue?.code ?? "";
     const message = issue?.message ?? "";
     return /(?:update|upgrade)[_ -]required|firmware[_ -](?:too[_ -]old|unsupported)|outdated[_ -]firmware/i.test(code)
+      || (code === "CAMERA_ERROR" && /submitRequestList:401:.*Function not implemented.*streaming request/i.test(message))
       || (/\b(?:updat(?:e|ed|ing)|upgrad(?:e|ed|ing)|outdated)\b/i.test(message)
         && /\b(?:glasses|firmware|software|stream(?:ing)?)\b/i.test(message));
   }
 
   function setCaptureMode(mode: State["captureMode"]) {
     state.captureMode = mode;
+    preferredMode = mode;
     return session.storage.set("captureMode", mode);
   }
 
-  async function api<T>(path: string, body?: unknown, method = "GET", base = state.server): Promise<T> {
+  async function api<T>(path: string, body?: unknown, method = "GET", base = state.server, timeoutMs = 12000): Promise<T> {
     if (!base) throw new Error("Enter the Mac server address first.");
     let timer: ReturnType<typeof setTimeout> | undefined;
     const checkingUpload = method === "GET" && path.startsWith("/api/sessions/");
@@ -96,7 +105,7 @@ registerMiniapp<Channels>(async (session) => {
       const response = method === "PUT" ? await request : await Promise.race([
         request,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("The Mac server did not respond. Check the address and Wi-Fi.")), 12000);
+          timer = setTimeout(() => reject(new Error("The Mac server did not respond. Check the address and Wi-Fi.")), timeoutMs);
         }),
       ]);
       state.online = true;
@@ -111,6 +120,38 @@ registerMiniapp<Channels>(async (session) => {
       throw error;
     }
     finally { clearTimeout(timer); }
+  }
+
+  async function selectServer(address: string, allowFallback = false) {
+    const probe = async (candidate: string) => {
+      const health = await api<MacHealth>("/api/health", undefined, "GET", candidate, 3000);
+      if (health.ok !== true) throw new Error("The address did not return an Inbound health check.");
+      return health;
+    };
+    const fallback = state.liveOnly ? state.localServer : INBOUND_SERVER;
+    const addresses = allowFallback ? [...new Set([address, state.localServer, fallback].filter(Boolean))] : [address];
+    for (const candidate of addresses) {
+      let health: MacHealth;
+      try {
+        if (state.liveOnly && isPhoneRelay(candidate)) throw new Error("Use the Mac’s local Wi-Fi address for Live to Mac.");
+        health = await probe(candidate);
+        if (state.liveOnly && !health.live_capture) throw new Error("Live video is disabled on the Mac server.");
+      }
+      catch (error) {
+        if (!allowFallback) throw error;
+        continue;
+      }
+      if (candidate !== address) diagnostic("mac.using_current_address", { connection: isPhoneRelay(candidate) ? "relay" : "local" });
+      if (candidate !== state.server) {
+        state.server = candidate;
+        void session.storage.set("server", candidate).catch(problem);
+      }
+      state.aiConfigured = !!health.ai_configured;
+      state.captureMode = state.liveOnly || (preferredMode === "live" && !isPhoneRelay(candidate) && health.live_capture) ? "live" : "device";
+      diagnostic("mac.connected", { connection: isPhoneRelay(candidate) ? "relay" : "local", captureMode: state.captureMode });
+      return;
+    }
+    throw new Error("The iPhone could not reach Inbound. Check the Mac and your Wi-Fi connection.");
   }
 
   function syncCapture(capture: Capture) {
@@ -147,30 +188,22 @@ registerMiniapp<Channels>(async (session) => {
       state.capture = previous;
       state.phase = previousPhase;
       if (!journalRequested) return;
-      if (previous) await save().catch(problem);
-      else await session.storage.delete("capture").catch(problem);
+      if (previous) void save().catch(problem);
+      else {
+        journalWrite = journalWrite.then(() => session.storage.delete("capture")).catch(problem);
+      }
     };
     try {
-      if (state.server !== INBOUND_SERVER && INBOUND_SERVER && /^http:\/\/\d+(\.\d+){3}:8000$/.test(state.server)) {
-        try {
-          const health = await api<{ok: boolean}>("/api/health");
-          if (health.ok !== true) throw new Error("The saved address is not an Inbound server.");
-        } catch (savedAddressError) {
-          const health = await api<{ok: boolean}>("/api/health", undefined, "GET", INBOUND_SERVER);
-          if (health.ok !== true) throw savedAddressError;
-          diagnostic("mac.using_current_address");
-          state.server = INBOUND_SERVER;
-          void session.storage.set("server", state.server).catch(problem);
-        }
-      }
+      await selectServer(state.server, true);
       const result = await api<{id: string; live_capture?: boolean}>("/api/sessions", {
         title: `Glasses recording · ${new Date().toLocaleTimeString()}`, source: "glasses",
+        auto_report: state.captureMode === "device",
       }, "POST");
       if (!result.id) throw new Error("The Mac address did not return an Inbound session.");
       state.capture = { id: result.id, startedAt: Date.now(), bookmarks: [], phase: "starting", server: state.server };
       journalRequested = true;
       diagnostic("capture.journal_writing", { session: result.id });
-      await save();
+      void save().catch(problem);
       if (queuedStop) {
         diagnostic("camera.start_cancelled", { session: result.id });
         await restorePreviousCapture();
@@ -178,7 +211,8 @@ registerMiniapp<Channels>(async (session) => {
         return;
       }
       const capture = state.capture;
-      if (result.live_capture && state.captureMode === "live") {
+      if (state.liveOnly && !result.live_capture) throw new Error("The Mac did not enable live recording for this session.");
+      if (result.live_capture && state.captureMode === "live" && !isPhoneRelay(capture.server)) {
         if (!await startLive(capture)) {
           await restorePreviousCapture();
           state.message = "Start cancelled before the camera was turned on.";
@@ -186,6 +220,7 @@ registerMiniapp<Channels>(async (session) => {
         return;
       }
       cameraRequestedAt = Date.now();
+      capture.startedAt = cameraRequestedAt;
       diagnostic("camera.start_requested", { session: capture.id, connected: state.connected, wifi: state.wifi, ...recordingOptions });
       state.message = "Starting the glasses camera…";
       publish();
@@ -196,23 +231,35 @@ registerMiniapp<Channels>(async (session) => {
       state.phase = "recording";
       diagnostic("camera.started", { session: capture.id, recording: recording.recordingId, elapsedMs: Date.now() - cameraRequestedAt });
       state.message = "Say “snap” to mark a moment, then “stop recording” to finish.";
+      applyPendingSnaps();
       void save().catch(problem);
       syncWhileRecording(capture);
     } catch (error) {
       // A start timeout can leave the camera running. Never silently start a
       // second recording or throw away the saved recovery journal.
       const code = (error as {code?: string})?.code;
-      if (cameraRequestedAt === undefined || (code && rejectedStarts.has(code))) {
+      const alreadyRecording = /^already_recording$/i.test(code ?? "") || /recording is already in progress/i.test((error as {message?: string})?.message ?? "");
+      if (alreadyRecording) {
+        await restorePreviousCapture();
+        diagnostic("camera.start_blocked", { code });
+        state.message = "Mentra is still tracking an earlier recording. If the camera light is off, fully quit and reopen the Mentra app before retrying.";
+      } else if (cameraRequestedAt === undefined || (code && rejectedStarts.has(code))) {
         await restorePreviousCapture();
         state.message = "Could not start the recording. Check the error below and try again.";
       } else if (!state.capture?.recordingId) {
         state.phase = "start_unconfirmed";
+        applyPendingSnaps();
         diagnostic("camera.start_unconfirmed", { session: state.capture?.id, code, elapsedMs: Date.now() - cameraRequestedAt, stopRequested: state.stopPending });
         state.message = `Mentra did not confirm Start. ${checkRecordingLight} You can attach the saved clip on the Mac.`;
         void save().catch(problem);
       }
       throw error;
     }
+  }
+
+  function applyPendingSnaps() {
+    for (const at of pendingSnapTimes) snap(at);
+    pendingSnapTimes = [];
   }
 
   async function startLive(capture: Capture): Promise<boolean> {
@@ -257,9 +304,9 @@ registerMiniapp<Channels>(async (session) => {
         state.capture = null;
         state.phase = "ready";
         state.streamUpdateRequired = true;
-        state.message = "Mentra requires a glasses update for live video. On-glasses recording is selected for your next attempt.";
+        state.message = state.liveOnly ? "Mentra blocked live video. Check the glasses’ streaming support in Mentra." : "The glasses rejected live streaming. On-glasses recording is selected for your next attempt.";
         state.voiceCommand = "";
-        await setCaptureMode("device");
+        if (!state.liveOnly) await setCaptureMode("device");
         await session.storage.delete("capture");
       });
     });
@@ -290,28 +337,60 @@ registerMiniapp<Channels>(async (session) => {
     if (!capture?.recordingId || !["recording", "stopping"].includes(state.phase)) return;
     state.phase = "stopping";
     const requestedAt = Date.now();
-    diagnostic("camera.stop_requested", { session: capture.id, recording: capture.recordingId, wifi: state.wifi });
-    state.message = "Stopping the glasses and requesting the video upload…";
+    // The phone's LAN connection can work even when the glasses cannot reach
+    // the Mac over Wi-Fi. Video uploads originate on the glasses.
+    const uploadServer = isPhoneRelay(INBOUND_SERVER) ? INBOUND_SERVER : capture.server;
+    const autoUpload = state.autoUpload;
+    const galleryMessage = "Recording saved on the glasses. In Mentra, sync it from Camera, then use Attach recording on the Mac.";
+    diagnostic("camera.stop_requested", { session: capture.id, recording: capture.recordingId, wifi: state.wifi, upload: autoUpload ? isPhoneRelay(uploadServer) ? "relay" : "local" : "gallery" });
+    state.message = autoUpload ? "Stopping the glasses and requesting the video upload…" : "Stopping the glasses and saving the clip to the gallery…";
     publish();
     stopWarning = setTimeout(() => {
-      state.message = `Waiting for Mentra to confirm Stop and upload. ${checkRecordingLight}`;
+      state.message = `Waiting for Mentra to confirm Stop. ${checkRecordingLight}`;
       diagnostic("camera.stop_still_waiting", { session: capture.id });
       publish();
     }, 5000);
     // A stalled journal write must not hold up the camera stop request.
     void save().catch(problem);
     try {
-      await session.camera.stopVideoRecording(capture.recordingId, {
-        uploadUrl: `${capture.server}/api/sessions/${capture.id}/video`,
-      });
+      if (autoUpload) {
+        // Wait briefly for the last Snap write before the server can start the report.
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([captureSync, new Promise<void>(resolve => { deadline = setTimeout(resolve, 1500); })]);
+        } finally { clearTimeout(deadline); }
+      }
+      await session.camera.stopVideoRecording(capture.recordingId, autoUpload ? {
+        uploadUrl: `${uploadServer}/api/sessions/${capture.id}/video`,
+      } : undefined);
     } catch (error) {
-      const code = (error as {code?: string})?.code;
-      if (code !== "RECORDING_NOT_OWNED" && code !== "media_error") {
+      const {code, message} = (error as {code?: string; message?: string}) ?? {};
+      const uploadFailed = code === "media_error" || /\b(?:video|media) upload (?:error|failed)\b/i.test(message ?? "");
+      if (autoUpload && uploadFailed) {
+        // Mentra can retain ownership after a failed upload. Ask it to stop
+        // without a URL so it can save locally and release the recording ID.
+        diagnostic("camera.stop_saving_locally", { session: capture.id, code });
+        state.message = "Upload failed. Asking Mentra to finish saving on the glasses…";
+        publish();
+        try {
+          await session.camera.stopVideoRecording(capture.recordingId);
+          state.phase = "waiting_upload";
+          state.message = "The glasses could not reach the Mac’s upload address. The clip may be in Mentra’s Camera gallery.";
+          void save().catch(problem);
+          return;
+        } catch (saveError) {
+          state.phase = "stopping";
+          state.message = "The glasses could not reach the Mac’s upload address. If the camera light is off, fully quit and reopen Mentra before the next take.";
+          void save().catch(problem);
+          throw saveError;
+        }
+      }
+      if (code !== "RECORDING_NOT_OWNED" && !uploadFailed) {
         state.message = `Mentra did not confirm Stop. You can retry Stop. ${checkRecordingLight}`;
         throw error;
       }
-      state.phase = code === "RECORDING_NOT_OWNED" ? "stopping" : "waiting_upload";
-      state.message = code === "media_error"
+      state.phase = uploadFailed ? "waiting_upload" : "stopping";
+      state.message = uploadFailed
         ? "The glasses reported an upload error. Look for the saved recording in Mentra’s gallery and attach it on the Mac."
         : `Mentra lost control of this recording. ${checkRecordingLight} If the clip is already saved, attach it on the Mac.`;
       void save().catch(problem);
@@ -321,7 +400,7 @@ registerMiniapp<Channels>(async (session) => {
     }
     state.phase = "waiting_upload";
     diagnostic("camera.stop_acknowledged", { session: capture.id, elapsedMs: Date.now() - requestedAt });
-    state.message = "Waiting for the glasses to upload. Keep the glasses, phone, and Mac on the same network.";
+    state.message = autoUpload ? "Waiting for the glasses to upload. Keep the glasses connected to Wi-Fi." : galleryMessage;
     void save().catch(problem);
   }
 
@@ -337,8 +416,7 @@ registerMiniapp<Channels>(async (session) => {
     const result = await api<{has_video: boolean; live_started_at?: number}>(`/api/sessions/${capture.id}/live/stop`, {}, "POST", capture.server);
     if (result.has_video && result.live_started_at) {
       capture.startedAt = result.live_started_at;
-      for (const at of pendingSnapTimes) snap(at);
-      pendingSnapTimes = [];
+      applyPendingSnaps();
     }
     state.phase = result.has_video ? "waiting_upload" : "start_unconfirmed";
     state.message = result.has_video
@@ -374,8 +452,7 @@ registerMiniapp<Channels>(async (session) => {
           state.message = "Video is reaching the Mac. Say “snap” or “stop”.";
           diagnostic("live.mac_recording", { session: capture.id });
           void save().catch(problem);
-          for (const at of pendingSnapTimes) snap(at);
-          pendingSnapTimes = [];
+          applyPendingSnaps();
         } else if (result.live_state === "failed") {
           state.phase = "start_unconfirmed";
           state.message = "No video reached the Mac. Check glasses Wi-Fi and allow incoming video on the Mac.";
@@ -388,8 +465,7 @@ registerMiniapp<Channels>(async (session) => {
       if (capture.live && (state.phase === "recording" || state.phase === "starting") && result.has_video) {
         if (result.live_started_at) {
           capture.startedAt = result.live_started_at;
-          for (const at of pendingSnapTimes) snap(at);
-          pendingSnapTimes = [];
+          applyPendingSnaps();
         }
         state.phase = "waiting_upload";
         diagnostic("live.publisher_ended", { session: capture.id });
@@ -483,6 +559,12 @@ registerMiniapp<Channels>(async (session) => {
       stopPublisher(state.capture);
       return feedback("Stop sent to the glasses. Your video is already on the Mac.");
     }
+    if (hydrated && command === "snap" && state.phase === "starting" && state.capture) {
+      if (pendingSnapTimes.length >= 40) return ignore("snap_limit", "This recording already has 40 requested snaps.");
+      pendingSnapTimes.push(Date.now());
+      diagnostic("snap.waiting_for_video", { session: state.capture.id });
+      return feedback("Snap requested. Waiting for the glasses camera.");
+    }
     if (!hydrated || state.busy) return ignore("busy", `Heard “${command}”. Wait for the current action to finish.`);
     if (command === "start" && state.phase === "waiting_upload" && state.capture?.live) {
       diagnostic("command.accepted", { command, source });
@@ -505,12 +587,6 @@ registerMiniapp<Channels>(async (session) => {
           : "Heard “start”. Finish the current capture first.";
       return ignore("capture_in_progress", message);
     }
-    if (command === "snap" && state.phase === "starting" && state.capture?.live) {
-      if (pendingSnapTimes.length >= 40) return ignore("snap_limit", "This recording already has 40 requested snaps.");
-      pendingSnapTimes.push(Date.now());
-      diagnostic("snap.waiting_for_video", { session: state.capture.id });
-      return feedback("Snap requested. Waiting for the first video from the glasses.");
-    }
     if (command === "snap" && state.phase !== "recording") return ignore("no_recording", "Heard “snap”. Start a recording first.");
     if (command === "stop" && !state.capture?.recordingId && !state.capture?.live) {
       return ignore("missing_recording_id", state.phase === "start_unconfirmed"
@@ -530,20 +606,23 @@ registerMiniapp<Channels>(async (session) => {
   session.ui.onOpen(publish);
   session.ui.on("command", ({command}) => { void dispatch(command); });
   session.ui.on("captureMode", ({mode}) => { void run(async () => {
+    if (state.liveOnly) return;
     if (!canStartCapture(state.phase) || !["live", "device"].includes(mode)) return;
+    if (mode === "live" && isPhoneRelay(state.server)) throw new Error("Live to Mac needs the Mac’s local Wi-Fi address. The phone relay supports Record on glasses.");
     state.streamUpdateRequired = false;
-    state.message = mode === "live" ? "Ready to send video directly to the Mac." : "Ready to record on the glasses and upload after Stop.";
+    state.message = mode === "live" ? "Ready to send video directly to the Mac." : "Ready to record on the glasses.";
     await setCaptureMode(mode);
+  }); });
+  session.ui.on("autoUpload", ({enabled}) => { void run(async () => {
+    if (!canStartCapture(state.phase) || typeof enabled !== "boolean") return;
+    state.autoUpload = enabled;
+    await session.storage.set("autoUpload", enabled ? "on" : "off");
   }); });
   session.ui.on("connect", ({server}) => { void run(async () => {
     if (state.capture && !canStartCapture(state.phase)) throw new Error("Finish the current session before changing the Mac address.");
     const address = serverOrigin(server);
-    const health = await api<{ok: boolean; ai_configured: boolean}>("/api/health", undefined, "GET", address);
-    if (health.ok !== true) throw new Error("The Mac address did not return an Inbound health check.");
-    state.server = address;
-    await session.storage.set("server", address);
-    state.aiConfigured = health.ai_configured;
-    state.message = "Mac connected. Say “start recording” or tap Start.";
+    await selectServer(address);
+    state.message = "Mac connected. Say “start” to record.";
   }); });
   session.ui.on("retry", () => { void run(async () => {
     if (state.phase === "stopping" && state.capture) {
@@ -676,7 +755,7 @@ registerMiniapp<Channels>(async (session) => {
     else if (command) {
       void dispatch(command, "voice");
       return;
-    } else state.voiceCommand = "Say a command on its own, such as “start recording”.";
+    } else state.voiceCommand = "Say a command by itself, such as “Inbound start”.";
     publish();
   }
 
@@ -706,13 +785,13 @@ registerMiniapp<Channels>(async (session) => {
         resetSpeech();
         // A quiet transcript can be a missing endpoint. Active audio without
         // a silence event can also be a deliberate pause mid-sentence.
-        if (command && (!speechActive || silentSince)) {
+        if (command && (!speechActive || silentSince || /^in\s?bound\b/.test(phrase))) {
           lastFallback = { command, at: Date.now() };
           diagnostic("speech.command_after_pause", { command, endpoint });
           void dispatch(command, "voice");
         } else {
           diagnostic("speech.command_unresolved", { command: command ?? "none", endpoint, speechActive });
-          state.voiceCommand = "Say a command on its own, such as “start recording”.";
+          state.voiceCommand = "Say a command by itself, such as “Inbound start”.";
           publish();
         }
       };
@@ -778,11 +857,16 @@ registerMiniapp<Channels>(async (session) => {
   });
 
   try {
-    state.server = await session.storage.get("server") || INBOUND_SERVER;
-    if (await session.storage.get("captureMode") === "device") state.captureMode = "device";
+    const savedServer = await session.storage.get("server");
+    state.server = savedServer && !isPhoneRelay(savedServer) ? savedServer : state.localServer || INBOUND_SERVER;
+    const savedMode = await session.storage.get("captureMode");
+    if (savedMode === "device" || savedMode === "live") preferredMode = savedMode;
+    state.captureMode = state.liveOnly || (preferredMode === "live" && !isPhoneRelay(state.server)) ? "live" : "device";
+    state.autoUpload = await session.storage.get("autoUpload") !== "off";
     const journal = await session.storage.get("capture");
     if (journal) {
       state.capture = JSON.parse(journal) as Capture;
+      if (isPhoneRelay(state.capture.server) && isPhoneRelay(INBOUND_SERVER)) state.capture.server = INBOUND_SERVER;
       state.phase = state.capture.phase === "starting" && !state.capture.recordingId && !state.capture.live ? "start_unconfirmed" : state.capture.phase;
       state.message = state.phase === "start_unconfirmed"
         ? `Start was unconfirmed in the previous session. ${checkRecordingLight}`
