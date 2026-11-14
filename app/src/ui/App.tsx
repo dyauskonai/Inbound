@@ -1,16 +1,13 @@
 import { useEffect, useState } from "react";
+import clsx from "clsx";
+import { ChevronDown, ClipboardCopy, Laptop, Settings2, Video, Volume2, Wifi } from "lucide-react";
 import type { Command, State } from "../shared/channels";
+import { ActionBar, Banner, Card, DeliveredCard, Eyebrow, HeardPanel, Header, PhotoStrip, StatusHero, VitalsGrid } from "./parts";
 
-const time = (seconds: number) => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
-const photoStatus = { taking: "Taking…", uploading: "Sending…", saved: "On the Mac", failed: "Failed", from_video: "From the video" };
-const vitalLabels = { bp: "BP", hr: "Heart rate", spo2: "SpO₂", rr: "Resp. rate" };
-const vitalStatus = { heard: "Heard", conflict: "Asked to repeat", confirmed: "✓ Confirmed", updated: "✓ Updated", unconfirmed: "Not confirmed" };
-const videoStatus = { starting: "Starting video on the glasses…", recording: "● Video recording on the glasses", stopping: "Stopping video…", uploading: "Glasses uploading video over Wi-Fi…", failed: "Video unavailable" };
+// Voice first: the phone is a glanceable status screen with big, glove-friendly backups.
 export function App() {
   const [state, setState] = useState<State | null>(null);
-  const [server, setServer] = useState("");
   const [error, setError] = useState("");
-  const [copied, setCopied] = useState("");
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const off = mentra.on("state", setState);
@@ -18,10 +15,28 @@ export function App() {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => { off(); clearInterval(timer); };
   }, []);
-  const savedAddress = state?.server ?? "";
-  useEffect(() => setServer(savedAddress), [savedAddress]);
   const recording = state?.phase === "recording";
   const send = (command: Command) => mentra.send("command", {command});
+  const problem = error || state?.error;
+  return <main className="mx-auto max-w-md space-y-3.5 px-4 pt-[max(1rem,env(safe-area-inset-top))] pb-44">
+    <Header state={state} />
+    {problem && <Banner>{problem}</Banner>}
+    <StatusHero state={state} now={now} />
+    {state && recording && <VitalsGrid vitals={state.vitals} live />}
+    {state && !recording && state.delivered && <DeliveredCard delivered={state.delivered} onOpen={() => mentra.send("report", {})} />}
+    {state && <HeardPanel state={state} />}
+    {state && recording && state.capture && <PhotoStrip photos={state.capture.photos} />}
+    {state && !recording && state.vitals.length > 0 && <VitalsGrid vitals={state.vitals} live={false} />}
+    {state && <Setup state={state} />}
+    <footer className="px-2 pt-2 text-center text-xs leading-relaxed text-slate-500">Immerse the Bay · Training prototype<br />Use fictional scenarios and consenting volunteers.</footer>
+    <ActionBar state={state} onCommand={send} />
+  </main>;
+}
+
+function Setup({ state }: { state: State }) {
+  const [server, setServer] = useState(state.server);
+  const [copied, setCopied] = useState("");
+  useEffect(() => setServer(state.server), [state.server]);
   const copyLogs = async () => {
     try {
       await mentra.request("copyDiagnostics", {}, {timeout: 5000});
@@ -30,34 +45,52 @@ export function App() {
       setCopied("Select and copy the logs below.");
     }
   };
-  return <main>
-    <header><span className="brand">inbound<span>↘</span></span><span className="badge">CAPTURE</span></header>
-    <p className="eyebrow">FROM THE FIELD. WITH CONTEXT.</p>
-    <h1>Stay present.<br/><em>Keep the details.</em></h1>
-    <div className="connection"><span className={state?.connected && state.camera ? "dot online" : "dot"}/>{state?.connected && state.camera ? "Camera glasses connected" : "Connect Mentra Live in Mentra"}<span>{state?.battery == null ? "" : `${state.battery}%`}</span></div>
-    <section className={`capture ${recording ? "recording" : ""}`}>
-      <div className="capture-label">{recording ? "● RECORDING" : state ? "READY" : "CONNECTING"}</div>
-      <div className="clock">{recording && state?.capture ? time(Math.max(0, (now - state.capture.startedAt)/1000)) : "Ready when you are."}</div>
-      <p>{state?.message || "Connecting to the Mentra app…"}</p>
-      {recording && !state.audio && now - (state.capture?.startedAt ?? now) > 5000 && <small>No mic audio yet. Transcript lines from the phone will still reach the Mac.</small>}
-      {recording && state.capture?.video && <small>{videoStatus[state.capture.video.state]}{state.capture.video.state === "failed" && state.capture.video.detail ? `. ${state.capture.video.detail}` : ""}</small>}
-      {state && !recording && <button className="primary" disabled={!state.server} onClick={() => send("start")}>● Start recording</button>}
-      {state && !recording && <label className="fine"><input type="checkbox" checked={state.videoEnabled} onChange={event => mentra.send("video", {enabled: event.target.checked})}/> Also record video on the glasses {state.videoEnabled && !state.wifi && "· the glasses need Wi-Fi to upload it"}</label>}
-      {recording && <div className="controls"><button className="primary" onClick={() => send("snap")}>＋ Snap photo</button><button onClick={() => send("stop")}>■ Stop</button></div>}
-      {!!state?.pending && <small>{state.pending} upload{state.pending === 1 ? "" : "s"} waiting · {Math.ceil(state.pendingBytes / 1024)} KB</small>}
-      {state?.delivered && !recording && <small role="status">Last capture: {state.delivered.progress}{state.delivered.video === "ready" ? " Video on the dashboard." : state.delivered.video === "uploading" ? " Video uploading from the glasses…" : ""}</small>}
-      <div className="voice">{state?.voice || "Loading voice controls"}</div>
-      {!recording && state?.voice === "Voice commands ready" && <small>The phone listens for “start” on its own. Nothing is recorded or sent until you start.</small>}
-      {state?.heard && <small>{recording ? state.heardFinal ? "Heard" : "Listening" : "Heard on the phone, not sent"}: “{state.heard}”</small>}
-      {state?.voiceCommand && <small role="status">{state.voiceCommand}</small>}
-    </section>
-    <div className="commands"><span><b>“Start”</b>Record</span><span><b>“Snap”</b>Take a photo</span><span><b>“Stop”</b>Send report</span></div>
-    {(error || state?.error) && <p className="error" role="alert">{error || state?.error}</p>}
-    {!!state?.vitals.length && <section className="moments"><div className="section-head"><h2>Vitals</h2><span>{state.vitals.length}</span></div>{state.vitals.map(vital => <div key={vital.kind} className="moment"><span>{vitalLabels[vital.kind]} {(vital.status === "conflict" || vital.status === "unconfirmed") && vital.candidates ? vital.candidates.join(" or ") : vital.value}{vital.kind === "spo2" ? "%" : ""}</span><span>{vitalStatus[vital.status]}</span></div>)}<p className="fine">Change a vital right after saying it, and the glasses ask you to repeat it. To change a logged vital later, say it again, like “heart rate 120”.</p></section>}
-    {state?.capture && <section className="moments"><div className="section-head"><h2>Photos</h2><span>{state.capture.photos.length}</span></div>{state.capture.photos.map(photo => <div key={photo.seq} className="moment"><span>↗ Photo {photo.seq} · {photoStatus[photo.status]}</span><time>{time(photo.seconds)}</time></div>)}<p className="fine">Photos, audio, and transcript lines appear on the Mac dashboard as they arrive.</p></section>}
-    {(state?.capture || state?.delivered) && <button className="text-button" onClick={() => mentra.send("report", {})}>Open on the Mac dashboard ↗</button>}
-    <details open={!state?.online}><summary>Connection settings <span>{state?.online ? "Mac connected" : "Set up"}</span></summary><label htmlFor="server">Mac server address</label><input id="server" type="url" value={server} onChange={event=>setServer(event.target.value)} placeholder="http://192.168.1.20:8000" autoCapitalize="none" autoCorrect="off"/><button disabled={!state || state.busy} onClick={() => mentra.send("connect", {server})}>Connect to Mac</button>{state?.defaultServer && server !== state.defaultServer && <button className="text-button" onClick={() => setServer(state.defaultServer)}>Use this build’s Mac address</button>}<p className="fine">The phone and Mac must reach each other. Audio and photos need only Bluetooth from the glasses to the phone. {state?.videoUploadBase ? "The glasses’ video uploads over the internet through the server’s secure tunnel, so their Wi-Fi only needs internet" : "The glasses’ video uploads over their own Wi-Fi, so they must be on a network that reaches the server"}: {state?.wifi ? `connected${state.glassesNetwork ? ` (${state.glassesNetwork})` : ""}.` : "not connected."}</p><button className="text-button" disabled={!state || state.busy} onClick={() => mentra.send("wifi", {})}>Set up glasses Wi-Fi ↗</button><button disabled={!state || state.busy || recording} onClick={() => mentra.send("checkUpload", {})}>Test video upload</button><button disabled={!state || state.busy || recording} onClick={() => mentra.send("checkSpeaker", {})}>Test glasses speaker</button>{state?.uploadCheck && <p className="fine" role="status">{state.uploadCheck}</p>}</details>
-    {state && <details className="diagnostics"><summary>Capture diagnostics</summary><button className="text-button" onClick={copyLogs}>Copy logs</button><span className="fine" role="status">{copied}</span><pre tabIndex={0}>{state.diagnostics.join("\n")}</pre></details>}
-    <footer>Immerse the Bay · Training prototype<br/>Use fictional scenarios and consenting volunteers.</footer>
-  </main>;
+  const blocked = state.busy || state.phase === "recording";
+  const secondary = "h-14 w-full rounded-2xl bg-slate-100 px-4 text-[15px] font-semibold ring-1 ring-slate-200 transition active:scale-[0.99] disabled:opacity-40 dark:bg-white/5 dark:ring-white/10";
+  return <details className="group" open={!state.online}>
+    <summary className="flex h-14 cursor-pointer list-none items-center gap-2 rounded-2xl px-2 text-[15px] font-semibold text-slate-600 dark:text-slate-300 [&::-webkit-details-marker]:hidden">
+      <Settings2 className="size-5" />Setup &amp; checks
+      <span className={clsx("ml-auto text-sm font-medium", state.online ? "text-emerald-700 dark:text-emerald-300" : "text-amber-700 dark:text-amber-300")}>{state.online ? "Connected" : "Needs setup"}</span>
+      <ChevronDown className="size-5 transition group-open:rotate-180" />
+    </summary>
+    <div className="mt-2 space-y-3">
+      <Card className="space-y-3">
+        <Eyebrow icon={Laptop}>Inbound server</Eyebrow>
+        <input aria-label="Server address" type="url" value={server} onChange={event => setServer(event.target.value)} placeholder="http://192.168.1.20:8000" autoCapitalize="none" autoCorrect="off"
+          className="h-14 w-full rounded-2xl bg-slate-50 px-4 font-mono text-[15px] ring-1 ring-slate-300 outline-none focus:ring-2 focus:ring-emerald-500 dark:bg-black/30 dark:ring-white/15" />
+        <button disabled={blocked} onClick={() => mentra.send("connect", {server})} className={secondary}>Connect</button>
+        {state.defaultServer && server !== state.defaultServer && <button className="text-sm font-semibold text-emerald-700 dark:text-emerald-300" onClick={() => setServer(state.defaultServer)}>Use this build’s address</button>}
+        <p className="text-sm leading-snug text-slate-500 dark:text-slate-400">The phone and the server must reach each other. Audio, photos, and vitals go from the phone to the server.</p>
+      </Card>
+      <Card className="space-y-3">
+        <Eyebrow icon={Video}>Glasses video</Eyebrow>
+        <button role="switch" aria-checked={state.videoEnabled} disabled={blocked} onClick={() => mentra.send("video", {enabled: !state.videoEnabled})} className="flex w-full items-center gap-3 text-left disabled:opacity-40">
+          <span className="flex-1 text-base font-semibold">Record video on the glasses</span>
+          <span className={clsx("relative h-8 w-14 rounded-full transition", state.videoEnabled ? "bg-emerald-500" : "bg-slate-300 dark:bg-white/15")}>
+            <span className={clsx("absolute top-1 size-6 rounded-full bg-white shadow transition-all", state.videoEnabled ? "left-7" : "left-1")} />
+          </span>
+        </button>
+        <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400"><Wifi className="size-4" />{state.wifi ? `Glasses Wi-Fi: ${state.glassesNetwork || "connected"}` : "Glasses Wi-Fi: not connected"}</div>
+        <p className="text-sm leading-snug text-slate-500 dark:text-slate-400">{state.videoUploadBase ? "Video uploads over the internet through the server’s secure tunnel, so the glasses’ Wi-Fi only needs internet." : "Video uploads over the glasses’ own Wi-Fi to the server."}</p>
+        <div className="grid grid-cols-2 gap-2">
+          <button disabled={state.busy} onClick={() => mentra.send("wifi", {})} className={secondary}>Set up Wi-Fi</button>
+          <button disabled={blocked} onClick={() => mentra.send("checkUpload", {})} className={secondary}>Test upload</button>
+        </div>
+        {state.uploadCheck && <p role="status" className="text-sm font-medium leading-snug">{state.uploadCheck}</p>}
+      </Card>
+      <Card className="space-y-3">
+        <Eyebrow icon={Volume2}>Glasses speaker</Eyebrow>
+        <p className="text-sm leading-snug text-slate-500 dark:text-slate-400">The glasses ask you to repeat a vital when two numbers conflict, and read back what they log.</p>
+        <button disabled={blocked} onClick={() => mentra.send("checkSpeaker", {})} className={secondary}>Test glasses speaker</button>
+      </Card>
+      <Card className="space-y-3">
+        <Eyebrow icon={ClipboardCopy}>Diagnostics</Eyebrow>
+        <div className="flex items-center gap-3">
+          <button onClick={copyLogs} className={clsx(secondary, "w-auto")}>Copy logs</button>
+          <span role="status" className="text-sm text-slate-500 dark:text-slate-400">{copied}</span>
+        </div>
+        <pre tabIndex={0} className="max-h-56 overflow-auto rounded-2xl bg-slate-50 p-3 text-[11px] leading-relaxed text-slate-600 ring-1 ring-slate-200 dark:bg-black/30 dark:text-slate-400 dark:ring-white/10">{state.diagnostics.join("\n")}</pre>
+      </Card>
+    </div>
+  </details>;
 }

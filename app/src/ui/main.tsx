@@ -10,7 +10,6 @@ import {createRoot} from "react-dom/client"
 import {MentraProvider} from "@mentra/miniapp/ui"
 import "../shared/channels"
 import {App} from "./App"
-import "./styles.css"
 
 const root = document.getElementById("root")
 if (!root) {

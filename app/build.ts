@@ -31,6 +31,7 @@
 import {rm} from "fs/promises"
 import {networkInterfaces} from "node:os"
 import {reactSingletonPlugin} from "@mentra/miniapp-cli/build-helpers"
+import tailwind from "bun-plugin-tailwind"
 
 const distDir = "./dist"
 
@@ -77,7 +78,7 @@ const uiResult = await Bun.build({
   entrypoints: ["./src/ui/index.html"],
   outdir: `${distDir}/ui`,
   target: "browser",
-  plugins: [reactSingletonPlugin(import.meta.url)],
+  plugins: [reactSingletonPlugin(import.meta.url), tailwind],
   minify: true,
   define,
 })
