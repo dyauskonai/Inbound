@@ -151,7 +151,7 @@ function refs(ids) {
     .map((id) => {
       const item = selected.evidence.find((evidence) => evidence.id === id);
       if (!item) return "";
-      const label = isPhoto(item) ? "Photo" : item.kind === "image" ? "Frame" : item.source === "phone" ? "Said" : "Audio";
+      const label = isPhoto(item) ? "Photo" : item.kind === "image" ? "Frame" : item.kind === "vital" ? "Vital" : item.source === "phone" ? "Said" : "Audio";
       return `<button class="source-ref" data-source="${escapeHtml(id)}" title="${item.kind === "image" ? "Image" : "Transcript interval"}">${label} ${time(item.start)}</button>`;
     })
     .join("");
@@ -163,22 +163,40 @@ function handoffCard(card) {
     text === null || text === undefined || text === ""
       ? '<span class="not-reported">Not reported</span>'
       : escapeHtml(text);
+  // Vitals the medic repeated when the glasses asked are confirmed; the rest are as reported.
+  const confirmed = new Set(card.confirmed_fields || []);
+  const unconfirmed = new Set(card.unconfirmed_fields || []);
   const rows = [
-    ["BP", card.blood_pressure],
-    ["Heart rate", card.heart_rate],
-    ["SpO₂", card.spo2],
-    ["Resp. rate", card.respiratory_rate],
-    ["Age", card.patient_age],
-    ["Sex", card.patient_sex],
-    ["Allergies", card.allergies],
-    ["ETA", card.eta_minutes === null ? null : `${card.eta_minutes} min`],
+    ["BP", "blood_pressure", card.blood_pressure],
+    ["Heart rate", "heart_rate", card.heart_rate],
+    ["SpO₂", "spo2", card.spo2],
+    ["Resp. rate", "respiratory_rate", card.respiratory_rate],
+    ["Age", "patient_age", card.patient_age],
+    ["Sex", "patient_sex", card.patient_sex],
+    ["Allergies", "allergies", card.allergies],
+    ["ETA", "eta_minutes", card.eta_minutes === null ? null : `${card.eta_minutes} min`],
   ];
   return `<section class="handoff"><h2>Handoff card · medic's report</h2>
-    <dl>${rows.map(([label, text]) => `<div><dt>${label}</dt><dd>${value(text)}</dd></div>`).join("")}</dl>
+    <dl>${rows.map(([label, field, text]) => `<div class="${confirmed.has(field) ? "confirmed" : unconfirmed.has(field) ? "unconfirmed" : ""}"><dt>${label}${confirmed.has(field) ? ' <span title="The medic repeated this value when the glasses asked">✓ confirmed</span>' : ""}</dt><dd>${value(text)}</dd></div>`).join("")}</dl>
     <p><b>Injuries</b> ${card.injuries.length ? card.injuries.map(escapeHtml).join("; ") : value(null)}</p>
     <p><b>Mechanism</b> ${value(card.mechanism)}</p>
     ${card.missing_fields.length ? `<p class="missing-fields">Missing: ${card.missing_fields.map((field) => escapeHtml(field.replaceAll("_", " "))).join(", ")}</p>` : ""}
     <p>${refs(card.evidence_ids)}</p></section>`;
+}
+
+const vitalLabels = { bp: "BP", hr: "Heart rate", spo2: "SpO₂", rr: "Resp. rate" };
+const vitalStatus = { heard: "Heard", conflict: "Asked to repeat", confirmed: "✓ Confirmed", unconfirmed: "Not confirmed" };
+
+// Before the report is written, the ER sees each vital as the phone logs it.
+function liveVitals(vitals) {
+  const latest = new Map(vitals.map((vital) => [vital.kind, vital]));
+  return `<section class="handoff"><h2>Vitals heard so far</h2><dl>${[...latest.values()]
+    .map((vital) => {
+      // Until the medic repeats it, both values stay on screen.
+      const shown = ["conflict", "unconfirmed"].includes(vital.status) && vital.candidates.length ? vital.candidates.join(" or ") : vital.value;
+      return `<div class="${vital.status === "confirmed" ? "confirmed" : vital.status === "heard" ? "" : "unconfirmed"}"><dt>${vitalLabels[vital.kind]} · ${vitalStatus[vital.status]}</dt><dd>${escapeHtml(shown)}${vital.kind === "spo2" ? "%" : ""}</dd></div>`;
+    })
+    .join("")}</dl></section>`;
 }
 
 function render(session) {
@@ -219,6 +237,7 @@ function render(session) {
       <section><div class="uncertainties"><h2>Unclear or missing information</h2><ul>${report.uncertainties.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div></section>`;
   } else
     $("report").innerHTML =
+      (session.vitals?.length ? liveVitals(session.vitals) : "") +
       '<div class="empty-report">The report will appear here after processing. Your recording and marked moments are saved locally.</div>';
   // Photos show up as they arrive, before the report is processed.
   const snaps = session.evidence.some(isPhoto)

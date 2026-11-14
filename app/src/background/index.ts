@@ -1,6 +1,7 @@
 import { MiniappRequestType, registerMiniapp } from "@mentra/miniapp/background";
-import type { Capture, CaptureVideo, Channels, Command, Photo, State } from "../shared/channels";
+import type { Capture, CaptureVideo, Channels, Command, Photo, State, Vital } from "../shared/channels";
 import { findCommands, isPhoneRelay, serverOrigin, speechWords } from "../shared/commands";
+import { findVitals, spokenValue, vitalNames, type VitalKind } from "../shared/vitals";
 
 declare const INBOUND_SERVER: string;
 declare const INBOUND_LOCAL_SERVER: string;
@@ -40,6 +41,13 @@ const VIDEO_UPLOAD_TIMEOUT_MS = 15 * 60 * 1000;
 const SETTLE_MS = 350;
 const REPEAT_MS = 1500;
 const finished = new Set(["complete", "awaiting_key", "failed", "interrupted"]);
+// Two different values for one vital this close together are a correction ("190 over 60…
+// no, 90 over 60"), so the glasses ask the medic to say it again and log the answer.
+const CORRECTION_WINDOW_MS = 45000;
+const REPEAT_WAIT_MS = 20000;
+// The glasses' microphone hears their own speaker. Vitals heard while they talk, and just
+// after, are their own read-back.
+const ECHO_TAIL_MS = 2000;
 
 registerMiniapp<Channels>(async (session) => {
   const state: State = {
@@ -47,7 +55,7 @@ registerMiniapp<Channels>(async (session) => {
     online: false, aiConfigured: false, camera: false, connected: false, wifi: false, glassesNetwork: "", glassesIp: "", videoUploadBase: "", uploadCheck: "", videoEnabled: true, battery: null, audio: false,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
     message: "Say “start” to begin. Nothing is recorded or sent until then.", error: "",
-    capture: null, delivered: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
+    capture: null, vitals: [], delivered: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
   };
   let hydrated = false;
   let closed = false;
@@ -57,6 +65,11 @@ registerMiniapp<Channels>(async (session) => {
   let videoStarting: Promise<void> | null = null;
   let warmTimer: ReturnType<typeof setTimeout> | undefined;
   let checking = false;
+  const lastVitals = new Map<VitalKind, { value: string; at: number }>();
+  type Repeat = { capture: Capture; kind: VitalKind; candidates: string[]; asks: number; timer?: ReturnType<typeof setTimeout> };
+  let repeat: Repeat | null = null;
+  const repeatQueue: Repeat[] = [];
+  let speakingUntil = 0;
   let journalWrite = Promise.resolve();
   let audioChunks: string[] = [];
   let audioChars = 0;
@@ -228,7 +241,7 @@ registerMiniapp<Channels>(async (session) => {
 
   function start() {
     const capture: Capture = {
-      id: crypto.randomUUID(), server: state.server, startedAt: Date.now(), audioSeq: 0, noteSeq: 0, photos: [],
+      id: crypto.randomUUID(), server: state.server, startedAt: Date.now(), audioSeq: 0, noteSeq: 0, photos: [], vitalSeq: 0,
       uploadToken: (crypto.randomUUID() + crypto.randomUUID()).replace(/-/g, ""),
     };
     // The session ID is made here, so recording starts instantly and the
@@ -239,6 +252,8 @@ registerMiniapp<Channels>(async (session) => {
     });
     resetAudio();
     streamAudio(true);
+    lastVitals.clear();
+    state.vitals = [];
     state.capture = capture;
     state.phase = "recording";
     state.audio = false;
@@ -538,6 +553,7 @@ registerMiniapp<Channels>(async (session) => {
     if (!capture) return;
     flushAudio(capture);
     streamAudio(false);
+    endRepeats();
     if (state.heard && !state.heardFinal) note(capture, state.heard);
     const seconds = elapsed(capture);
     state.capture = null;
@@ -566,6 +582,112 @@ registerMiniapp<Channels>(async (session) => {
         publish();
       },
     });
+  }
+
+  // Speak through the glasses (the phone's audio route). Listening for vitals pauses meanwhile.
+  async function say(text: string) {
+    speakingUntil = Number.POSITIVE_INFINITY;
+    try {
+      await session.speaker.speak(text, { processing: "preferLocal" });
+    } catch (error) {
+      diagnostic("speech.say_failed", { code: (error as { code?: string })?.code });
+    } finally {
+      speakingUntil = Date.now() + ECHO_TAIL_MS;
+    }
+  }
+
+  function logVital(capture: Capture, kind: VitalKind, value: string, status: Vital["status"], candidates: string[] = []) {
+    const seq = ++capture.vitalSeq;
+    enqueue({
+      capture, path: `/api/sessions/${capture.id}/vitals`, label: `vital ${seq}`, contentType: "application/json",
+      body: JSON.stringify({ seq, kind, value, status, seconds: elapsed(capture), candidates }),
+    });
+    // Kind and status only: diagnostics leave out clinical values, as they do transcripts.
+    diagnostic("vital.logged", { session: capture.id, kind, status });
+    if (state.capture === capture) {
+      state.vitals = [...state.vitals.filter(vital => vital.kind !== kind), { kind, value, status, ...(candidates.length ? { candidates } : {}) }];
+      publish();
+    }
+  }
+
+  function heardVitals(capture: Capture, text: string) {
+    if (Date.now() < speakingUntil) return;
+    const live = capture === state.capture;
+    for (const reading of findVitals(text, repeat?.capture === capture ? repeat.kind : undefined)) {
+      if (repeat?.capture === capture && reading.kind === repeat.kind) {
+        confirmRepeat(reading.value);
+        continue;
+      }
+      const last = lastVitals.get(reading.kind);
+      lastVitals.set(reading.kind, { value: reading.value, at: Date.now() });
+      if (live && last && last.value !== reading.value && Date.now() - last.at < CORRECTION_WINDOW_MS) {
+        askToRepeat(capture, reading.kind, [last.value, reading.value]);
+      } else logVital(capture, reading.kind, reading.value, "heard");
+    }
+  }
+
+  function askToRepeat(capture: Capture, kind: VitalKind, candidates: string[]) {
+    logVital(capture, kind, candidates.at(-1)!, "conflict", candidates);
+    const request: Repeat = { capture, kind, candidates, asks: 0 };
+    if (repeat) repeatQueue.push(request);
+    else {
+      repeat = request;
+      void prompt(request);
+    }
+  }
+
+  async function prompt(request: Repeat) {
+    request.asks++;
+    state.voiceCommand = `Asking the medic to repeat the ${vitalNames[request.kind]}. Heard ${request.candidates.join(", then ")}.`;
+    publish();
+    await say(`Can you repeat the ${vitalNames[request.kind]}?`);
+    if (repeat !== request) return;
+    request.timer = setTimeout(() => {
+      if (repeat !== request) return;
+      // Ask once more, then leave it for the ER to check.
+      if (request.asks < 2) void prompt(request);
+      else {
+        settleRepeat("no answer");
+        nextRepeat();
+      }
+    }, REPEAT_WAIT_MS);
+  }
+
+  function confirmRepeat(value: string) {
+    const request = repeat!;
+    clearTimeout(request.timer);
+    repeat = null;
+    lastVitals.set(request.kind, { value, at: Date.now() });
+    logVital(request.capture, request.kind, value, "confirmed", request.candidates);
+    const name = vitalNames[request.kind];
+    state.voiceCommand = `Logged the ${name} as ${value}.`;
+    publish();
+    void say(`${name[0].toUpperCase()}${name.slice(1)} ${spokenValue(request.kind, value)}, logged.`).then(nextRepeat);
+  }
+
+  function settleRepeat(reason: string) {
+    const request = repeat;
+    if (!request) return;
+    clearTimeout(request.timer);
+    repeat = null;
+    logVital(request.capture, request.kind, request.candidates.at(-1)!, "unconfirmed", request.candidates);
+    diagnostic("vital.unconfirmed", { session: request.capture.id, kind: request.kind, reason });
+  }
+
+  function nextRepeat() {
+    const request = repeatQueue.shift();
+    if (!request || request.capture !== state.capture) return;
+    repeat = request;
+    void prompt(request);
+  }
+
+  // Stop ends any open question: what was never repeated stays unconfirmed for the ER.
+  function endRepeats() {
+    settleRepeat("capture stopped");
+    for (const request of repeatQueue.splice(0)) {
+      repeat = request;
+      settleRepeat("capture stopped");
+    }
   }
 
   function note(capture: Capture, text: string) {
@@ -683,7 +805,10 @@ registerMiniapp<Channels>(async (session) => {
     if (data.isFinal) {
       // The sentence that said "start" or "stop" belongs to that capture too.
       const target = capture ?? state.capture;
-      if (target) note(target, text);
+      if (target) {
+        note(target, text);
+        heardVitals(target, text);
+      }
       resetSpeech();
     }
     publish();

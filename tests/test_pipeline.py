@@ -376,3 +376,60 @@ def test_video_upload_check_is_kept_off_the_dashboard(client, video):
     result = client.get(f"/api/sessions/{sid}").json()
     assert result["video"]["state"] == "ready" and result["video"]["bytes"] > 0
     assert sid not in [item["id"] for item in client.get("/api/sessions").json()]
+
+
+def test_confirmed_vitals_decide_the_handoff_card(client, monkeypatch):
+    import uuid
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    seen = {}
+
+    def report(directory, evidence):
+        seen["evidence"] = evidence
+        from server.models import GeneratedReport
+        result = GeneratedReport(
+            title="Handoff", summary=[{"text": "BP reported.", "evidence_ids": ["note_1"]}], sections=[], timeline=[], uncertainties=[], snap_captions=[],
+            # The model read the first, misheard value.
+            handoff={"patient_age": None, "patient_sex": None, "blood_pressure": "190/60", "heart_rate": "110", "spo2": None,
+                     "respiratory_rate": None, "injuries": [], "mechanism": None, "allergies": None, "eta_minutes": None,
+                     "missing_fields": ["blood_pressure", "spo2", "respiratory_rate"], "evidence_ids": ["note_1"]})
+        return validate_evidence(result, evidence)
+    monkeypatch.setattr(ai, "generate_report", report)
+    sid = str(uuid.uuid4())
+    path = f"/api/sessions/{sid}"
+    client.post("/api/sessions", json={"id": sid, "source": "glasses", "auto_report": True})
+    client.post(f"{path}/notes", json={"seq": 1, "seconds": 1, "text": "bp one ninety over sixty correction ninety over sixty"})
+    vitals = [
+        {"seq": 1, "kind": "bp", "value": "190/60", "status": "heard", "seconds": 1},
+        {"seq": 2, "kind": "bp", "value": "90/60", "status": "conflict", "seconds": 3, "candidates": ["190/60", "90/60"]},
+        {"seq": 3, "kind": "bp", "value": "90/60", "status": "confirmed", "seconds": 8, "candidates": ["190/60", "90/60"]},
+        # The read-back's echo of the same value doesn't undo the confirmation.
+        {"seq": 4, "kind": "bp", "value": "90/60", "status": "heard", "seconds": 10},
+        {"seq": 5, "kind": "spo2", "value": "92", "status": "heard", "seconds": 12},
+        {"seq": 6, "kind": "spo2", "value": "98", "status": "conflict", "seconds": 13, "candidates": ["92", "98"]},
+        {"seq": 7, "kind": "spo2", "value": "98", "status": "unconfirmed", "seconds": 40, "candidates": ["92", "98"]},
+    ]
+    for vital in vitals + vitals[:1]:
+        assert client.post(f"{path}/vitals", json=vital).status_code == 200
+    assert client.post(f"{path}/vitals", json={**vitals[0], "seq": 9, "value": "high"}).status_code == 422
+    assert len(client.get(path).json()["vitals"]) == 7
+    client.post(f"{path}/finish", json={"notes": 1, "seconds": 45})
+    result = finished(client, sid)
+    assert result["status"] == "complete", result["error"]
+    texts = {item["id"]: item["text"] for item in seen["evidence"] if item["kind"] == "vital"}
+    assert texts["vital_3"].startswith("Asked to repeat the blood pressure after hearing 190/60 then 90/60, the medic said 90/60.")
+    card = result["report"]["handoff"]
+    assert card["blood_pressure"] == "90/60" and card["confirmed_fields"] == ["blood_pressure"]
+    assert card["spo2"] == "92% or 98% (unconfirmed)" and card["unconfirmed_fields"] == ["spo2"]
+    assert card["missing_fields"] == ["respiratory_rate"]
+    assert "vital_3" in card["evidence_ids"] and "vital_7" in card["evidence_ids"]
+    assert result["report"]["uncertainties"][0].startswith("The oxygen saturation is unconfirmed: the medic gave 92% and 98%")
+
+
+def test_a_later_new_reading_is_left_to_the_report(client, monkeypatch):
+    from server.processing import apply_vitals
+    report = {"uncertainties": [], "handoff": {"blood_pressure": "100/70", "missing_fields": [], "evidence_ids": []}}
+    apply_vitals(report, [
+        {"seq": 1, "kind": "bp", "value": "90/60", "status": "confirmed", "seconds": 8, "candidates": ["190/60", "90/60"]},
+        {"seq": 2, "kind": "bp", "value": "100/70", "status": "heard", "seconds": 600, "candidates": []},
+    ])
+    assert report["handoff"]["blood_pressure"] == "100/70" and report["handoff"]["confirmed_fields"] == []

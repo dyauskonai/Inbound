@@ -49,6 +49,16 @@ class VideoState(BaseModel):
     detail: str | None = Field(default=None, max_length=300)
 
 
+class VitalInput(BaseModel):
+    """A critical vital the phone heard, and whether the medic confirmed it by repeating it."""
+    seq: int = Field(ge=1, le=100_000)
+    kind: Literal["bp", "hr", "spo2", "rr"]
+    value: str = Field(pattern=r"^\d{1,3}(/\d{1,3})?$")
+    status: Literal["heard", "conflict", "confirmed", "unconfirmed"]
+    seconds: float = Field(ge=0, le=7200, allow_inf_nan=False)
+    candidates: list[str] = Field(default_factory=list, max_length=6)
+
+
 class PhotoLink(BaseModel):
     url: str = Field(min_length=8, max_length=8_000_000)
 

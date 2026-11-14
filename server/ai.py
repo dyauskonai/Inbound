@@ -37,6 +37,11 @@ Describe images conservatively as sampled visible observations, distinct from re
 Only a subset of video frames is supplied; do not claim continuous visual review.
 The medic controls capture by saying "start", "stop", "snap", "snapshot", or "screenshot", often
 mid-sentence. Leave those control words out of the report, but keep the rest of each sentence.
+Evidence with kind "vital" records critical vitals Inbound heard. When the medic gave two different
+values close together, Inbound's glasses asked aloud to repeat it ("Can you repeat the blood pressure?")
+and logged the answer ("Blood pressure 90 over 60, logged."). Those prompts appear in the audio but are
+not the medic's words. A confirmed vital is the medic's final value: use it, and mention the earlier
+value as a correction. An unconfirmed vital must stay unconfirmed in the report.
 Transcript entries with "source": "phone" come from the phone's on-device recognizer. It is less
 accurate for clinical values, but each photo was taken the moment it heard the medic say "snap".
 Where the audio transcript has a similar word instead (for example "splint" or "snapped") and the

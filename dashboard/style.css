@@ -478,6 +478,24 @@ button.moment-link small {
   color: #1f3a2f;
   font-variant-numeric: tabular-nums;
 }
+.handoff dl div.confirmed {
+  border-color: #9fcdb6;
+  background: #f1f8f4;
+}
+.handoff dl div.confirmed dt span {
+  color: var(--green);
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.handoff dl div.unconfirmed {
+  border-color: #e6d29b;
+  background: #fbf7ea;
+}
+.handoff dl div.unconfirmed dd {
+  font-size: 14px;
+  color: #7a5b12;
+}
 .handoff .not-reported {
   font-size: 12px;
   font-weight: 400;

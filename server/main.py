@@ -23,7 +23,7 @@ from pydantic import ValidationError
 
 from .auth import AccessControl, TunnelGuard
 from . import media
-from .models import AudioPart, CaptureInput, FinishInput, NoteInput, PhotoLink, SessionInput, VideoState
+from .models import AudioPart, CaptureInput, FinishInput, NoteInput, PhotoLink, SessionInput, VideoState, VitalInput
 from .processing import Processor
 from .store import Store
 
@@ -310,6 +310,15 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
     def waiting_frames(session: dict) -> int:
         taken = {photo["seq"] for photo in session.get("photos", [])}
         return sum(frame["seq"] not in taken for frame in session.get("video_frames", []))
+
+    @app.post("/api/sessions/{session_id}/vitals")
+    async def vital(session_id: str, body: VitalInput):
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = phone_session(session_id)
+            vitals = session.get("vitals", [])
+            if all(item["seq"] != body.seq for item in vitals):
+                record_upload(session, vitals=sorted([*vitals, body.model_dump()], key=lambda item: item["seq"]))
+        return {"ok": True}
 
     @app.post("/api/sessions/{session_id}/finish")
     async def finish(session_id: str, body: FinishInput):

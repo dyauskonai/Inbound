@@ -49,6 +49,8 @@ async function connect({ journal = null as string | null, video = false, failVid
   let uploadUnreachable = false;
   let tunnelUrl: string | null = null;
   let uploadTimesOut = false;
+  let holdSpeech = false;
+  const heldSpeech: (() => void)[] = [];
   let serverVideo: object | undefined;
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = ((callback: () => void, interval: number) => {
@@ -112,6 +114,10 @@ async function connect({ journal = null as string | null, video = false, failVid
         } else if (failVideoStart) reply(undefined, { code: "ERR_UNEXPECTED", message: "Start timed out waiting for glasses response." });
         else reply({ recordingId: "camera-1" });
         break;
+      case Request.SPEAK:
+        if (holdSpeech) heldSpeech.push(() => reply({ completed: true }));
+        else reply({ completed: true });
+        break;
       case Request.BLOB_OPEN_READ:
         reply({ handle: "photo-handle", meta: {} });
         break;
@@ -174,6 +180,10 @@ async function connect({ journal = null as string | null, video = false, failVid
     cloudDown: () => { cloudDown++; },
     glassesCannotReachServer: () => { uploadUnreachable = true; },
     serverTunnel: (url: string) => { tunnelUrl = url; },
+    spoken: () => requests.filter(request => request.type === Request.SPEAK).map(request => request.text),
+    vitalPosts: () => calls.filter(call => call.path.endsWith("/vitals")).map(call => call.body as { kind: string; value: string; status: string; candidates: string[] }),
+    holdSpeech: () => { holdSpeech = true; },
+    finishSpeech: () => heldSpeech.shift()?.(),
     uploadTimesOut: () => { uploadTimesOut = true; },
     serverHasVideo: (video: object) => { serverVideo = video; },
     glassesAt: (ip: string) => event("glasses_wifi", { connected: true, ssid: "Test Wi-Fi", localIp: ip }),
@@ -242,7 +252,8 @@ test("snap takes a photo and uploads it to the Mac; stop sends audio, transcript
   app.voice("that's all, stop", true);
   expect(app.state.phase).toBe("ready");
   await app.settle();
-  expect(app.posts()).toEqual(["/api/sessions", "/photos", "/notes", "/audio", "/notes", "/finish"]);
+  // "BP is 190 over 90" in the snap sentence is logged as a vital too.
+  expect(app.posts()).toEqual(["/api/sessions", "/photos", "/notes", "/vitals", "/audio", "/notes", "/finish"]);
   const audio = app.calls.find(call => call.path.endsWith("/audio"))!.body as { seq: number; chunks: string[]; sample_rate: number };
   expect(audio.seq).toBe(1);
   expect(audio.chunks).toHaveLength(2);
@@ -591,4 +602,66 @@ test("a video upload test that never finishes points at the glasses' Wi-Fi", asy
   await app.settle(3300);
   expect(app.state.uploadCheck).toContain("✗ The glasses did not finish uploading. Their Wi-Fi (Test Wi-Fi · 10.16.95.18) may need a sign-in page");
   expect(app.state.uploadCheck).toContain("phone hotspot");
+});
+
+// The glasses' echo is ignored for this long after they finish speaking.
+const AFTER_SPEECH = 2100;
+
+test("a vital changed right after it was said makes the glasses ask for it again, and the answer is logged", async () => {
+  const app = await connect();
+  app.button("start");
+  app.voice("BP one ninety over sixty, no, ninety over sixty", true);
+  await app.settle();
+  expect(app.spoken()).toEqual(["Can you repeat the blood pressure?"]);
+  expect(app.state.vitals).toEqual([{ kind: "bp", value: "90/60", status: "conflict", candidates: ["190/60", "90/60"] }]);
+  await app.settle(AFTER_SPEECH);
+  app.voice("blood pressure ninety over sixty", true);
+  await app.settle();
+  expect(app.spoken()).toEqual(["Can you repeat the blood pressure?", "Blood pressure 90 over 60, logged."]);
+  expect(app.vitalPosts().map(vital => `${vital.status} ${vital.value}`)).toEqual(["heard 190/60", "conflict 90/60", "confirmed 90/60"]);
+  expect(app.vitalPosts()[2].candidates).toEqual(["190/60", "90/60"]);
+  expect(app.state.vitals[0]).toMatchObject({ value: "90/60", status: "confirmed" });
+  // Its own read-back is not a new reading.
+  app.voice("blood pressure ninety over sixty logged", true);
+  await app.settle();
+  expect(app.vitalPosts()).toHaveLength(3);
+});
+
+test("what the glasses hear while they speak is ignored, and a heart rate answer can be just the number", async () => {
+  const app = await connect();
+  app.holdSpeech();
+  app.button("start");
+  app.voice("heart rate one ten. sorry, heart rate one twenty", true);
+  await app.settle();
+  // The question is still playing: the microphone hears it, not an answer.
+  app.voice("can you repeat the heart rate one ten", true);
+  await app.settle();
+  expect(app.vitalPosts().map(vital => vital.status)).toEqual(["heard", "conflict"]);
+  app.finishSpeech();
+  await app.settle(AFTER_SPEECH);
+  app.voice("one twenty", true);
+  await app.settle();
+  expect(app.vitalPosts().at(-1)).toMatchObject({ kind: "hr", value: "120", status: "confirmed" });
+});
+
+test("the same value twice is not a correction", async () => {
+  const app = await connect();
+  app.button("start");
+  app.voice("BP one twenty over eighty", true);
+  app.voice("pressure is one twenty over eighty, sats ninety eight percent", true);
+  await app.settle();
+  expect(app.spoken()).toEqual([]);
+  expect(app.vitalPosts().map(vital => `${vital.kind} ${vital.status}`)).toEqual(["bp heard", "bp heard", "spo2 heard"]);
+});
+
+test("stopping before the medic repeats it leaves the vital unconfirmed for the ER", async () => {
+  const app = await connect();
+  app.button("start");
+  app.voice("sats ninety two, no, ninety eight", true);
+  await app.settle();
+  app.button("stop");
+  await app.settle();
+  expect(app.vitalPosts().map(vital => vital.status)).toEqual(["heard", "conflict", "unconfirmed"]);
+  expect(app.vitalPosts().at(-1)!.candidates).toEqual(["92", "98"]);
+  expect(app.posts().at(-1)).toBe("/finish");
 });

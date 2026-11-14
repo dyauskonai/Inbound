@@ -45,12 +45,12 @@ async def device(token: str, path: str, request: Request):
     if not path:
         return HTMLResponse("<body style='font:18px system-ui;padding:30px'><h1>Inbound is connected</h1><p>Use the Inbound MiniApp to record. Your full report appears in Inbound on the Mac.</p></body>", headers={"Referrer-Policy": "no-referrer"})
     allowed = (path == "api/health" and request.method == "GET") or (path == "api/sessions" and request.method == "POST")
-    match = re.fullmatch(r"api/sessions/([a-f0-9-]{36})(/(capture|video|process|report.json|audio|photos|notes|finish|video-state))?", path)
+    match = re.fullmatch(r"api/sessions/([a-f0-9-]{36})(/(capture|video|process|report.json|audio|photos|notes|vitals|finish|video-state))?", path)
     relay_session = match and match[1] in config.get("sessions", [])
     local_upload = match and not relay_session and match[3] == "video" and request.method == "POST"
     if relay_session:
         methods = {None: "GET", "capture": "PUT", "video": "POST", "process": "POST", "report.json": "GET",
-                   "audio": "POST", "photos": "POST", "notes": "POST", "finish": "POST", "video-state": "POST"}
+                   "audio": "POST", "photos": "POST", "notes": "POST", "finish": "POST", "video-state": "POST", "vitals": "POST"}
         allowed = request.method == methods[match[3]]
     if not allowed and not local_upload:
         raise HTTPException(404)

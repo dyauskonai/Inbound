@@ -66,6 +66,12 @@ This is still a prototype. Before real patient data, it needs per-user accounts,
 
 Say **start**, **snap** (also "snapshot" or "screenshot"), or **stop** anywhere in a sentence. For example, "BP 190 over 90, snap the left forearm" takes a photo, and "okay that's everything, stop" ends the capture. Inbound acts on partial transcripts, so it doesn't wait for a pause. A command word that ends a partial transcript waits 350 ms in case it becomes "started" or "stopped". A negated command such as "don't stop" is ignored. Each occurrence fires once, so two snaps in one sentence take two photos. The words stay in the transcript, and the report leaves them out.
 
+## Vitals read-back
+
+During a capture, Inbound listens for blood pressure, heart rate, SpO₂, and respiratory rate, in digits or words ("BP one ninety over sixty", "sats ninety eight percent"). If the medic gives a vital two different values within 45 seconds ("BP 190 over 60… no, 90 over 60", or "sats 92, no, 98"), the glasses ask aloud, "Can you repeat the blood pressure?" The next value said for that vital is logged as confirmed, and the glasses read it back ("Blood pressure 90 over 60, logged."). With no answer, they ask once more after 20 seconds, then leave it unconfirmed. Stopping the capture also leaves an open question unconfirmed.
+
+While the glasses speak, and for 2 seconds after, Inbound ignores what the microphone hears, so it doesn't log its own read-back. Confirmed vitals set the handoff card's values and show "✓ confirmed". Unconfirmed vitals show both values and are flagged in the report's uncertainties. The dashboard shows vitals live during a capture, with both values on screen until the medic repeats one. Speech goes to the phone's audio output, which is the glasses' speaker when they are connected.
+
 ## Test on Mentra Live
 
 1. Start the Mac server and the MiniApp development server as shown above. Scan the QR from the current terminal and open Inbound inside Mentra. Allow microphone and local-network access. In Mentra's **Speech** settings, select **English**.

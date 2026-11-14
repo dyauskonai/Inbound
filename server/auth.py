@@ -18,7 +18,7 @@ DEVICE_ROUTES = [
     ("POST", re.compile(r"/api/sessions")),
     ("GET", re.compile(SESSION)),
     # The glasses upload their video themselves, with the token the MiniApp gives them.
-    ("POST", re.compile(SESSION + r"/(?:audio|photos|notes|finish|video|video-state)")),
+    ("POST", re.compile(SESSION + r"/(?:audio|photos|notes|vitals|finish|video|video-state)")),
 ]
 
 
