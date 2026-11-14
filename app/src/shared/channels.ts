@@ -32,6 +32,8 @@ export interface State {
   connected: boolean;
   /** Glasses on Wi-Fi: needed only to upload their video. */
   wifi: boolean;
+  /** The glasses' Wi-Fi name and address, to compare with the server's network. */
+  glassesNetwork: string;
   videoEnabled: boolean;
   battery: number | null;
   audio: boolean;

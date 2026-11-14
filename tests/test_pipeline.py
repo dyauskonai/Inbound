@@ -290,6 +290,22 @@ def test_glasses_video_fills_refused_snaps_and_shows_in_the_video_tab(client, vi
     assert not result["has_video"] and result["media"] == "audio"
 
 
+def test_video_attached_after_the_report_adds_its_stills(client, video, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    sid, path = phone_capture(client)
+    client.post(f"{path}/video-state", json={"state": "recording", "offset": 0.5})
+    client.post(f"{path}/finish", json={"video_frames": [{"seq": 3, "seconds": 2}]})
+    # The glasses could not reach the server, so the report is written without the still.
+    client.post(f"{path}/video-state", json={"state": "failed", "detail": "Upload failed"})
+    assert all(photo["seq"] != 3 for photo in finished(client, sid)["photos"])
+    # Later someone exports the clip from the Mentra gallery and attaches it on the dashboard.
+    with video.open("rb") as data:
+        assert client.post(f"{path}/video", files={"video": ("gallery.mp4", data, "video/mp4")}).status_code == 200
+    result = finished(client, sid)
+    assert result["video"]["state"] == "ready"
+    assert "snap_photo-3" in [item["id"] for item in result["evidence"]]
+
+
 def test_report_does_not_wait_forever_for_a_video(client, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     sid, path = phone_capture(client)

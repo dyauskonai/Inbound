@@ -41,7 +41,7 @@ const finished = new Set(["complete", "awaiting_key", "failed", "interrupted"]);
 registerMiniapp<Channels>(async (session) => {
   const state: State = {
     phase: "ready", server: INBOUND_SERVER, defaultServer: INBOUND_SERVER,
-    online: false, aiConfigured: false, camera: false, connected: false, wifi: false, videoEnabled: true, battery: null, audio: false,
+    online: false, aiConfigured: false, camera: false, connected: false, wifi: false, glassesNetwork: "", videoEnabled: true, battery: null, audio: false,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
     message: "Say “start” to begin. Nothing is recorded or sent until then.", error: "",
     capture: null, delivered: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
@@ -444,7 +444,11 @@ registerMiniapp<Channels>(async (session) => {
       // saves to the gallery and frees the camera.
       if (uploadFailed) await releaseVideo(video.recordingId);
       video.state = "failed";
-      video.detail = uploadFailed ? "The glasses could not upload the video to the server over their Wi-Fi. It is saved in the Mentra gallery." : message || "The glasses did not confirm the video stopped.";
+      // "failed to connect to /10.16.99.52 (port 8001) from /10.16.95.18": the glasses' network can't reach the server.
+      const route = /failed to connect to \/([\d.]+).*? from \/([\d.]+)/.exec(message ?? "");
+      video.detail = !uploadFailed ? message || "The glasses did not confirm the video stopped."
+        : route ? `The glasses (${route[2]}) could not reach the server (${route[1]}) over Wi-Fi, so they are on a different network from it. Put the glasses on the server's Wi-Fi, or use one phone hotspot for the glasses, phone, and laptop. The video is saved in the Mentra gallery; you can attach it on the dashboard.`
+        : "The glasses could not upload the video to the server over their Wi-Fi. It is saved in the Mentra gallery; you can attach it on the dashboard.";
       diagnostic("video.stop_failed", { session: capture.id, code, uploadFailed, error: (message ?? "").replace(/https?:\/\/\S+/g, "[address]").slice(0, 160) });
     }
     videoState(capture, video);
@@ -667,8 +671,10 @@ registerMiniapp<Channels>(async (session) => {
   });
   session.glasses.onBattery((data) => { state.battery = data.level; publish(); });
   session.glasses.onWifi((data) => {
-    if (state.wifi !== data.connected) diagnostic("glasses.wifi", { connected: data.connected });
+    const network = data.connected ? [data.ssid, data.localIp].filter(Boolean).join(" · ") : "";
+    if (state.wifi !== data.connected || state.glassesNetwork !== network) diagnostic("glasses.wifi", { connected: data.connected, ssid: data.ssid, ip: data.localIp });
     state.wifi = data.connected;
+    state.glassesNetwork = network;
     publish();
   });
   session.on("ready", () => {

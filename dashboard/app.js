@@ -126,6 +126,7 @@ function renderVideo(session, snaps) {
   if (ready && full.getAttribute("src") !== mediaUrl(video.file)) full.src = mediaUrl(video.file);
   if (!ready) full.removeAttribute("src");
   full.hidden = !ready;
+  $("attach-glasses-video").hidden = ready || session.source !== "glasses" || !session.capture_finished;
   $("video-badge").textContent = ready
     ? `· ${time(video.duration || 0)}`
     : video?.state === "failed" ? "· unavailable" : video?.state === "recording" ? "· recording" : video ? "· uploading" : "";
@@ -427,6 +428,22 @@ $("retry").onclick = async () => {
     showError(error);
   } finally {
     $("retry").disabled = false;
+  }
+};
+$("glasses-video-file").onchange = async () => {
+  const file = $("glasses-video-file").files[0];
+  if (!file) return;
+  const data = new FormData();
+  data.append("video", file);
+  $("attach-glasses-status").textContent = "Uploading the video…";
+  try {
+    await api(`/api/sessions/${selectedId}/video`, { method: "POST", body: data });
+    $("attach-glasses-status").textContent = "Video attached.";
+    await refresh();
+  } catch (error) {
+    $("attach-glasses-status").textContent = error.message;
+  } finally {
+    $("glasses-video-file").value = "";
   }
 };
 $("print").onclick = () => window.print();

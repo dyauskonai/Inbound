@@ -46,6 +46,7 @@ async function connect({ journal = null as string | null, video = false, failVid
     ...(staleRecording ? [["videoRecording", staleRecording] as [string, string]] : []),
   ]);
   let cloudDown = 0;
+  let uploadUnreachable = false;
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = ((callback: () => void, interval: number) => {
     if (interval === 1000) tick = callback;
@@ -96,6 +97,10 @@ async function connect({ journal = null as string | null, video = false, failVid
         else answer();
         break;
       }
+      case Request.VIDEO_RECORDING_STOP:
+        if (uploadUnreachable && payload.uploadUrl) reply(undefined, { code: "ERR_UNEXPECTED", message: "Video upload error: failed to connect to /192.0.2.1 (port 8000) from /10.16.95.18 (port 38510) after 10000ms" });
+        else reply();
+        break;
       case Request.VIDEO_RECORDING_START:
         if (alreadyRecording > 0) {
           alreadyRecording--;
@@ -163,6 +168,7 @@ async function connect({ journal = null as string | null, video = false, failVid
     busyNextPhoto: () => { busyNext++; },
     glassesWifi: (connected: boolean) => event("glasses_wifi", { connected }),
     cloudDown: () => { cloudDown++; },
+    glassesCannotReachServer: () => { uploadUnreachable = true; },
     toggleVideo: (enabled: boolean) => event("_ui", { type: "UI_MESSAGE", channel: "video", payload: { enabled } }),
     reject: (endpoint: string, status: number) => rejected.set(endpoint, status),
     photoReply: (value: object | null) => { photoReply = value; },
@@ -502,4 +508,18 @@ test("if Mentra still holds an old recording, the app says to reopen Mentra and 
   expect(app.state.capture!.video?.state).toBe("failed");
   expect(app.state.capture!.video?.detail).toContain("Fully quit and reopen the Mentra app");
   expect(app.state.capture!.photos[0].status).toBe("saved");
+});
+
+test("when the glasses can't reach the server, the app says why and where the video is", async () => {
+  const app = await connect({ video: true });
+  app.glassesCannotReachServer();
+  app.button("start");
+  await app.settle();
+  app.button("stop");
+  await app.settle();
+  expect(app.videoStates()).toEqual(["recording", "failed"]);
+  const detail = app.calls.filter(call => call.path.endsWith("/video-state")).at(-1)!.body as { state: string; detail: string };
+  expect(detail.state).toBe("failed");
+  expect(detail.detail).toContain("The glasses (10.16.95.18) could not reach the server (192.0.2.1)");
+  expect(detail.detail).toContain("attach it on the dashboard");
 });

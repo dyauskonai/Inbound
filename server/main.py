@@ -383,8 +383,13 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
                                "duration": info["duration"], "has_audio": info["has_audio"], "detail": None}
                     store.update(session_id, video=details, video_hash=checksum)
                     log.info("Inbound glasses video saved session=%s bytes=%d duration=%.2f", session_id, size, info["duration"])
-                    await asyncio.to_thread(attach_frames, session_id)
-                    if store.get(session_id)["status"] == "waiting_video":
+                    added = await asyncio.to_thread(attach_frames, session_id)
+                    status = store.get(session_id)["status"]
+                    # A video attached later from the Mentra gallery brings stills the report lacks.
+                    if added and status in {"complete", "awaiting_key", "failed", "interrupted"}:
+                        store.update(session_id, status="uploaded", progress="Video attached. Writing the report again with its stills.")
+                        status = "uploaded"
+                    if status in {"waiting_video", "uploaded"}:
                         processor.submit(session_id)
                     return {"success": True, "requestId": session_id, "statusUrl": f"/api/sessions/{session_id}"}
                 temporary.replace(directory / "original")

@@ -92,6 +92,14 @@
         <section id="video-view" class="video-view" role="tabpanel" hidden>
           <video id="full-video" controls playsinline preload="metadata" hidden></video>
           <p id="video-status" class="muted small"></p>
+          <div id="attach-glasses-video" hidden>
+            <label class="file-label"
+              >If the glasses couldn’t upload it, export the video from the Mentra gallery
+              (for example, AirDrop it to this Mac) and attach it here. Each snap’s still is
+              then taken from it.<input type="file" id="glasses-video-file" accept="video/*"
+            /></label>
+            <p id="attach-glasses-status" class="muted small" role="status"></p>
+          </div>
           <div class="panel-heading"><h2>Photo moments</h2></div>
           <div id="video-moments"></div>
         </section>
