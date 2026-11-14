@@ -27,7 +27,7 @@ afterEach(() => {
 
 interface Call { method: string; path: string; body: unknown; auth?: string }
 
-async function connect({ journal = null as string | null, video = false, failVideoStart = false } = {}) {
+async function connect({ journal = null as string | null, video = false, failVideoStart = false, alreadyRecording = 0, staleRecording = "" } = {}) {
   let state!: State;
   let tick: (() => void) | undefined;
   let offline = 0;
@@ -40,7 +40,12 @@ async function connect({ journal = null as string | null, video = false, failVid
   const rejected = new Map<string, number>();
   const calls: Call[] = [];
   const requests: { type: string; [key: string]: unknown }[] = [];
-  const storage = new Map<string, string>([["video", video ? "on" : "off"], ...(journal ? [["capture", journal] as [string, string]] : [])]);
+  const storage = new Map<string, string>([
+    ["video", video ? "on" : "off"],
+    ...(journal ? [["capture", journal] as [string, string]] : []),
+    ...(staleRecording ? [["videoRecording", staleRecording] as [string, string]] : []),
+  ]);
+  let cloudDown = 0;
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = ((callback: () => void, interval: number) => {
     if (interval === 1000) tick = callback;
@@ -81,7 +86,10 @@ async function connect({ journal = null as string | null, video = false, failVid
         break;
       case Request.PHOTO: {
         const answer = () => photoReply ? reply(photoReply) : reply(undefined, { code: "camera_busy", message: "Camera is busy" });
-        if (busyNext > 0) {
+        if (cloudDown > 0 && payload.delivery !== "local") {
+          cloudDown--;
+          reply(undefined, { code: "PHOTO_REQUEST_FAILED", message: "Could not reach Mentra cloud" });
+        } else if (busyNext > 0) {
           busyNext--;
           reply(undefined, { code: "camera_busy", message: "Camera is busy" });
         } else if (holdPhotos) heldPhotos.push(answer);
@@ -89,7 +97,10 @@ async function connect({ journal = null as string | null, video = false, failVid
         break;
       }
       case Request.VIDEO_RECORDING_START:
-        if (failVideoStart) reply(undefined, { code: "ERR_UNEXPECTED", message: "Start timed out waiting for glasses response." });
+        if (alreadyRecording > 0) {
+          alreadyRecording--;
+          reply(undefined, { code: "ALREADY_RECORDING", message: "A video recording is already in progress" });
+        } else if (failVideoStart) reply(undefined, { code: "ERR_UNEXPECTED", message: "Start timed out waiting for glasses response." });
         else reply({ recordingId: "camera-1" });
         break;
       case Request.BLOB_OPEN_READ:
@@ -150,6 +161,8 @@ async function connect({ journal = null as string | null, video = false, failVid
     holdPhotos: () => { holdPhotos = true; },
     releasePhoto: () => heldPhotos.shift()?.(),
     busyNextPhoto: () => { busyNext++; },
+    glassesWifi: (connected: boolean) => event("glasses_wifi", { connected }),
+    cloudDown: () => { cloudDown++; },
     toggleVideo: (enabled: boolean) => event("_ui", { type: "UI_MESSAGE", channel: "video", payload: { enabled } }),
     reject: (endpoint: string, status: number) => rejected.set(endpoint, status),
     photoReply: (value: object | null) => { photoReply = value; },
@@ -452,4 +465,41 @@ test("a snap the camera is too busy for is retried once the previous photo is do
   await app.settle();
   expect(app.state.capture!.photos.map(photo => photo.status)).toEqual(["saved", "saved"]);
   expect(app.state.error).toBe("");
+});
+
+test("with glasses Wi-Fi, photos skip the slow Bluetooth-only path, falling back if Mentra's cloud is unreachable", async () => {
+  const app = await connect();
+  app.glassesWifi(true);
+  app.button("start");
+  app.button("snap");
+  await app.settle();
+  const first = app.requests.filter(request => request.type === Request.PHOTO);
+  expect(first).toHaveLength(1);
+  expect(first[0]).toMatchObject({ transferMethod: "auto", compress: "medium" });
+  expect(first[0].delivery).toBeUndefined();
+  app.cloudDown();
+  app.button("snap");
+  await app.settle();
+  const photos = app.requests.filter(request => request.type === Request.PHOTO);
+  expect(photos.map(request => request.delivery)).toEqual([undefined, undefined, "local"]);
+  expect(app.state.capture!.photos.map(photo => photo.status)).toEqual(["saved", "saved"]);
+});
+
+test("a video recording Mentra never released is stopped, and the new one starts", async () => {
+  const app = await connect({ video: true, alreadyRecording: 1, staleRecording: "camera-old" });
+  app.button("start");
+  await app.settle();
+  expect(app.requests.find(request => request.type === Request.VIDEO_RECORDING_STOP)).toMatchObject({ recordingId: "camera-old" });
+  expect(app.state.capture!.video).toMatchObject({ state: "recording", recordingId: "camera-1" });
+  expect(app.storage.get("videoRecording")).toBe("camera-1");
+});
+
+test("if Mentra still holds an old recording, the app says to reopen Mentra and photos still work", async () => {
+  const app = await connect({ video: true, alreadyRecording: 2, staleRecording: "camera-old" });
+  app.button("start");
+  app.button("snap");
+  await app.settle();
+  expect(app.state.capture!.video?.state).toBe("failed");
+  expect(app.state.capture!.video?.detail).toContain("Fully quit and reopen the Mentra app");
+  expect(app.state.capture!.photos[0].status).toBe("saved");
 });

@@ -311,11 +311,15 @@ registerMiniapp<Channels>(async (session) => {
 
   async function takePhoto(capture: Capture, photo: Photo, previous: Promise<void>) {
     const requestedAt = Date.now();
-    // Newer Mentra hosts keep the photo on the phone (`delivery: "local"`);
-    // older ones return a short-lived URL instead. Handle both.
+    // The glasses hold the camera until a photo has fully reached the phone, so transfer
+    // speed decides how soon the next snap can fire. A photo kept on the phone
+    // (`delivery: "local"`) always crosses Bluetooth, about 20 s each on Mentra Live.
+    // With Wi-Fi, the standard path has the glasses upload it to Mentra's cloud in
+    // seconds and falls back to Bluetooth itself; the phone then downloads it.
+    let local = !state.wifi;
     const request = () => session.sendRequest<PhotoResult>({
-      type: MiniappRequestType.PHOTO, size: "medium", mode: "photo", transferMethod: "auto",
-      sound: true, saveToGallery: false, delivery: "local",
+      type: MiniappRequestType.PHOTO, size: "medium", mode: "photo", transferMethod: "auto", compress: "medium",
+      sound: true, saveToGallery: false, ...(local ? { delivery: "local" } : {}),
     }, { timeoutMs: PHOTO_TIMEOUT_MS });
     try {
       let result: PhotoResult;
@@ -323,10 +327,18 @@ registerMiniapp<Channels>(async (session) => {
         result = await request();
       } catch (error) {
         const { code, message } = (error as { code?: string; message?: string }) ?? {};
-        if (!/busy/i.test(`${code} ${message}`)) throw error;
-        // The previous photo still holds the camera. Take this one as soon as it's done.
-        diagnostic("photo.camera_busy", { session: capture.id, number: photo.seq });
-        await previous;
+        if (/busy/i.test(`${code} ${message}`)) {
+          // The previous photo is still on its way to the phone. Take this one as soon as it arrives.
+          diagnostic("photo.camera_busy", { session: capture.id, number: photo.seq });
+          if (state.capture === capture) state.message = `Photo ${photo.seq} is next. The glasses are still sending the previous photo.`;
+          publish();
+          await previous;
+        } else if (local) throw error;
+        else {
+          // Mentra's cloud was unreachable. Bring the photo over Bluetooth instead.
+          diagnostic("photo.cloud_unavailable", { session: capture.id, number: photo.seq, code });
+          local = true;
+        }
         result = await request();
       }
       let bytes: Uint8Array | null = null;
@@ -337,7 +349,7 @@ registerMiniapp<Channels>(async (session) => {
       const url = [result?.photoUrl, result?.url].find(item => item && /^(?:https?|data):/.test(item));
       if (!bytes?.length && !url) throw new Error("The glasses did not return the photo.");
       photo.status = "uploading";
-      diagnostic("photo.taken", { session: capture.id, number: photo.seq, elapsedMs: Date.now() - requestedAt, bytes: bytes?.length ?? 0, via: bytes?.length ? "phone" : "link" });
+      diagnostic("photo.taken", { session: capture.id, number: photo.seq, elapsedMs: Date.now() - requestedAt, bytes: bytes?.length ?? 0, transfer: local ? "bluetooth" : "wifi" });
       if (state.capture === capture) state.message = `Photo ${photo.seq} taken. Sending it to the Mac.`;
       enqueue({
         capture, label: `photo ${photo.seq}`,
@@ -366,9 +378,19 @@ registerMiniapp<Channels>(async (session) => {
     const video: CaptureVideo = { state: "starting" };
     capture.video = video;
     diagnostic("video.start_requested", { session: capture.id, wifi: state.wifi });
-    const started = session.sendRequest<{ recordingId?: string }>({ type: MiniappRequestType.VIDEO_RECORDING_START, ...videoOptions }, { timeoutMs: VIDEO_START_TIMEOUT_MS })
+    const request = () => session.sendRequest<{ recordingId?: string }>({ type: MiniappRequestType.VIDEO_RECORDING_START, ...videoOptions }, { timeoutMs: VIDEO_START_TIMEOUT_MS });
+    const started = request()
+      .catch(async (error: { code?: string }) => {
+        // A recording Mentra never released (say, after a failed upload) blocks every new one.
+        const stale = await session.storage.get("videoRecording").catch(() => null);
+        if (error?.code !== "ALREADY_RECORDING" || !stale) throw error;
+        diagnostic("video.releasing_previous", { session: capture.id });
+        await releaseVideo(stale);
+        return request();
+      })
       .then((result) => {
         if (!result?.recordingId) throw new Error("The glasses did not return a recording ID.");
+        void session.storage.set("videoRecording", result.recordingId).catch(() => {});
         video.recordingId = result.recordingId;
         video.state = "recording";
         video.offset = elapsed(capture);
@@ -379,13 +401,26 @@ registerMiniapp<Channels>(async (session) => {
       })
       .catch((error: { code?: string; message?: string }) => {
         video.state = "failed";
-        video.detail = `The glasses did not start video. ${error?.message ?? ""} If the recording light is on, press the glasses' button to stop it.`.trim();
+        video.detail = error?.code === "ALREADY_RECORDING"
+          ? "Mentra still thinks an earlier video is recording. Fully quit and reopen the Mentra app to record video again. Photos and audio work meanwhile."
+          : `The glasses did not start video. ${error?.message ?? ""} If the recording light is on, press the glasses' button to stop it.`.trim();
         diagnostic("video.start_failed", { session: capture.id, code: error?.code });
         videoState(capture, video);
         keepCameraWarm(capture);
       });
     // Snaps said while the camera starts wait to see whether video is recording.
     videoStarting = started;
+  }
+
+  async function releaseVideo(recordingId: string) {
+    try {
+      await session.camera.stopVideoRecording(recordingId);
+    } catch (error) {
+      diagnostic("video.release_failed", { code: (error as { code?: string })?.code });
+      return false;
+    }
+    await session.storage.delete("videoRecording").catch(() => {});
+    return true;
   }
 
   async function stopVideo(capture: Capture) {
@@ -400,16 +435,17 @@ registerMiniapp<Channels>(async (session) => {
         ...(INBOUND_TOKEN ? { uploadAuthToken: INBOUND_TOKEN } : {}),
       });
       video.state = "uploading";
+      void session.storage.delete("videoRecording").catch(() => {});
       diagnostic("video.stopped", { session: capture.id, wifi: state.wifi });
     } catch (error) {
       const { code, message } = (error as { code?: string; message?: string }) ?? {};
       const uploadFailed = code === "media_error" || /upload/i.test(message ?? "");
       // Mentra can keep the recording after a failed upload. Stop it without a URL so it
       // saves to the gallery and frees the camera.
-      if (uploadFailed) await session.camera.stopVideoRecording(video.recordingId).catch(() => {});
+      if (uploadFailed) await releaseVideo(video.recordingId);
       video.state = "failed";
-      video.detail = uploadFailed ? "The glasses could not upload the video. It is saved in the Mentra gallery." : message || "The glasses did not confirm the video stopped.";
-      diagnostic("video.stop_failed", { session: capture.id, code, uploadFailed });
+      video.detail = uploadFailed ? "The glasses could not upload the video to the server over their Wi-Fi. It is saved in the Mentra gallery." : message || "The glasses did not confirm the video stopped.";
+      diagnostic("video.stop_failed", { session: capture.id, code, uploadFailed, error: (message ?? "").replace(/https?:\/\/\S+/g, "[address]").slice(0, 160) });
     }
     videoState(capture, video);
   }
