@@ -2,6 +2,7 @@ import math
 import re
 import shutil
 import subprocess
+import wave
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -82,11 +83,43 @@ def prepare(directory: Path, bookmarks: list[dict], *, glasses=False) -> tuple[d
     return info, sorted(evidence, key=lambda item: item["start"])
 
 
-def audio_chunks(directory: Path, duration: float):
+def prepare_phone(directory: Path, session: dict) -> tuple[dict, list[dict]]:
+    """Join the phone's audio parts into one WAV and index its photos as evidence."""
+    parts = sorted(session.get("audio_parts", {}).items(), key=lambda item: int(item[0]))
+    rate = parts[0][1]["rate"] if parts else 16000
+    written = 0
+    if parts:
+        with wave.open(str(directory / "recording.wav"), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(rate)
+            for seq, part in parts:
+                if part["rate"] != rate:
+                    continue
+                # Keep audio aligned with photo times when the mic stream paused.
+                offset = int(part["at"] * rate) * 2
+                if offset - written > rate * 2:
+                    output.writeframes(bytes(offset - written))
+                    written = offset
+                data = (directory / f"audio-{int(seq):06d}.pcm").read_bytes()
+                output.writeframes(data)
+                written += len(data)
+    duration = written / (rate * 2)
+    photos = session.get("photos", [])
+    if not duration:
+        duration = max([session.get("capture_seconds") or 0, *(photo["seconds"] for photo in photos)])
+    evidence = [{"id": photo["id"], "kind": "image", "start": photo["seconds"], "end": photo["seconds"],
+                 "label": f"Photo {photo['seq']}, taken when the phone heard the medic say snap", "file": photo["file"]}
+                for photo in photos]
+    info = {"duration": round(duration, 2) or None, "has_audio": written > 0, "media": "audio" if written else None}
+    return info, sorted(evidence, key=lambda item: item["start"])
+
+
+def audio_chunks(directory: Path, duration: float, source: str = "original"):
     # Accurate chunk boundaries are retained even when the STT provider returns text only.
     for index, start in enumerate(range(0, math.ceil(duration), 30)):
         path = directory / f"audio_{index}.wav"
         end = min(duration, start + 30)
-        ffmpeg("-ss", start, "-i", directory / "original", "-t", end - start,
+        ffmpeg("-ss", start, "-i", directory / source, "-t", end - start,
                "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", path)
         yield path, start, end

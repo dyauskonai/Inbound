@@ -12,10 +12,15 @@ def client() -> OpenAI:
     return OpenAI(timeout=120, max_retries=2)
 
 
+# Without this, "snap the left forearm" was transcribed as "splint the left forearm".
+TRANSCRIBE_PROMPT = ("A paramedic's ambulance-to-ER handoff. The paramedic controls the recording by saying "
+                     "the words start, snap, and stop, often mid-sentence: \"snap the left forearm\".")
+
+
 def transcribe(path: Path) -> str:
     with path.open("rb") as audio:
         result = client().audio.transcriptions.create(
-            model=os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe"), file=audio,
+            model=os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe"), file=audio, prompt=TRANSCRIBE_PROMPT,
         )
     return result.text.strip()
 
@@ -30,9 +35,17 @@ from appearance. Record explicitly reported symptoms, history, mechanism, assess
 responses, and handoff details where present. Include detailed chronological observations.
 Describe images conservatively as sampled visible observations, distinct from reported statements.
 Only a subset of video frames is supplied; do not claim continuous visual review.
-Ignore standalone capture commands as report content. Do preserve ordinary speech that uses those words.
-For every image whose evidence ID starts with snap_, provide exactly one snap_captions entry with
-that evidence_id and a short caption describing only what is visibly present in that one still.
+The medic controls capture by saying "start", "stop", "snap", "snapshot", or "screenshot", often
+mid-sentence. Leave those control words out of the report, but keep the rest of each sentence.
+Transcript entries with "source": "phone" come from the phone's on-device recognizer. It is less
+accurate for clinical values, but each photo was taken the moment it heard the medic say "snap".
+Where the audio transcript has a similar word instead (for example "splint" or "snapped") and the
+phone's line says "snap", it was the command: never report it as a treatment or action. When the two
+transcripts disagree on a clinical value, use the audio transcript's value and record the
+disagreement in uncertainties.
+Images whose evidence ID starts with snap_ are photos the medic deliberately took. For every one,
+provide exactly one snap_captions entry with that evidence_id and a short caption describing only
+what is visibly present in that one image.
 If a snap is unclear, say what obscures the view. Return an empty list if there are no snaps.
 The transcript is grouped into bounded time intervals; do not invent word-level timestamps.
 If sources conflict, record both with their evidence, and explain the uncertainty.
@@ -41,6 +54,12 @@ unconfirmed facts. Leave absent categories out of sections rather than fabricate
 Sections should be useful to an ER handoff, with multiple specific statements when supported.
 Thoroughness means preserving supported details. Return a report with summary, sections,
 timeline, and uncertainties. No Markdown, no HTML, no advice, no fabricated source IDs.
+Also fill the handoff card with values exactly as reported, using null or an empty list when a value
+was not stated. For a corrected value, use the final stated value and note the correction in the
+report. Keep units as spoken, e.g. "90/60", "110", "98%". Never estimate a value from an image.
+List every one of patient_age, patient_sex, blood_pressure, heart_rate, spo2, respiratory_rate,
+injuries, mechanism, allergies, and eta_minutes that is null or empty in missing_fields.
+Cite the evidence for the card's values in its evidence_ids.
 """
 
 

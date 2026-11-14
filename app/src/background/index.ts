@@ -1,514 +1,359 @@
-import { MiniappErrorCode, MiniappRequestType, registerMiniapp } from "@mentra/miniapp/background";
-import type { Capture, Channels, Command, Phase, State } from "../shared/channels";
-import { canStartCapture, commandFrom, isPhoneRelay, normalizeSpeech, serverOrigin } from "../shared/commands";
+import { MiniappRequestType, registerMiniapp } from "@mentra/miniapp/background";
+import type { Capture, Channels, Command, Photo, State } from "../shared/channels";
+import { findCommands, isPhoneRelay, serverOrigin, speechWords } from "../shared/commands";
 
 declare const INBOUND_SERVER: string;
 declare const INBOUND_LOCAL_SERVER: string;
-declare const INBOUND_LIVE_ONLY: boolean;
+// Set when the build targets an internet server; that server refuses requests without it.
+declare const INBOUND_TOKEN: string;
 
-type MacHealth = { ok: boolean; ai_configured?: boolean; live_capture?: boolean };
+type MacHealth = { ok: boolean; ai_configured?: boolean };
+type PhotoResult = { photoUrl?: string; key?: string; url?: string; mimeType?: string };
+interface Job {
+  capture: Capture;
+  path: string;
+  body: string | Uint8Array;
+  contentType: string;
+  label: string;
+  bytes: number;
+  tries: number;
+  done?: (ok: boolean) => void;
+}
 
-// The previous build inherited the glasses' camera settings. Use a known
-// capture profile while diagnosing missing Start acknowledgments.
-const recordingOptions = { width: 1280, height: 720, fps: 30, save: true, sound: false };
-const checkRecordingLight = "If the recording light is on, press the glasses’ action button once to stop and save the clip.";
-const awaitingVideo: Phase[] = ["starting", "start_unconfirmed", "stopping", "waiting_upload"];
-const rejectedStarts = new Set<string>([
-  MiniappErrorCode.PERMISSION_NOT_DECLARED, MiniappErrorCode.NOT_IMPLEMENTED,
-  "GLASSES_NOT_CONNECTED", "ALREADY_RECORDING", "already_recording", "battery_low", "service_unavailable", "missing_request_id",
-]);
+// Everything reaches the Mac through the phone. Glasses-to-Mac Wi-Fi uploads
+// never arrived on the demo network, so v1 sends mic audio, transcript lines,
+// and photos as small idempotent requests that retry until the Mac has them.
+const AUDIO_FLUSH_MS = 4000;
+const AUDIO_FLUSH_CHARS = 256 * 1024;
+const OUTBOX_LIMIT = 48 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 20000;
+const PHOTO_TIMEOUT_MS = 30000;
+// A command word at the end of a partial transcript can still grow ("stop" → "stopped").
+const SETTLE_MS = 350;
+const REPEAT_MS = 1500;
+const finished = new Set(["complete", "awaiting_key", "failed", "interrupted"]);
 
 registerMiniapp<Channels>(async (session) => {
   const state: State = {
-    phase: "ready", server: INBOUND_SERVER,
-    defaultServer: INBOUND_SERVER,
-    localServer: INBOUND_LOCAL_SERVER, liveOnly: false, online: false, aiConfigured: false,
-    captureMode: "device", autoUpload: true, streamUpdateRequired: false,
-    camera: false, connected: false, wifi: false, battery: null,
+    phase: "ready", server: INBOUND_SERVER, defaultServer: INBOUND_SERVER,
+    online: false, aiConfigured: false, camera: false, connected: false, battery: null, audio: false,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
-    message: "Say “start recording” or connect to the Mac below.", error: "", capture: null, busy: false, stopPending: false, diagnostics: [],
+    message: "Say “start” to begin. Say “snap” for a photo and “stop” to send the report.", error: "",
+    capture: null, delivered: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
   };
-  let polling = false;
   let hydrated = false;
-  let queuedStop: "voice" | "button" | null = null;
-  let stopWarning: ReturnType<typeof setTimeout> | undefined;
-  let publisherStop: Promise<void> | null = null;
-  let pendingSpeech = "";
-  let commandCandidateSeen = false;
-  let speechActive = false;
-  let silentSince = 0;
-  let finishTimer: ReturnType<typeof setTimeout> | undefined;
-  let utterance = 0;
-  let finishingUtterance = -1;
-  let finishSupported = true;
-  let lastFallback: { command: Command; at: number } | null = null;
-  let glassesModel: string | undefined;
-  let lastUploadStatus = "";
-  let pendingSnapTimes: number[] = [];
-  let captureSync = Promise.resolve();
+  let closed = false;
+  let photoChain = Promise.resolve();
   let journalWrite = Promise.resolve();
+  let audioChunks: string[] = [];
+  let audioChars = 0;
+  let audioAt = 0;
+  let audioBatchStarted = 0;
+  let audioRate = 16000;
+  let audioFormat: string | undefined;
+  let words: string[] = [];
+  let fired = new Map<Command, number>();
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastVoice: { command: Command; at: number } | null = null;
+  let lastFinal = { text: "", at: 0 };
+  let lastStatusCheck = 0;
+  const sent = new WeakMap<Capture, number>();
+  const outbox: Job[] = [];
+  let pumping = false;
+
   const snapshot = () => ({ ...state, diagnostics: [...state.diagnostics] });
   const publish = () => session.ui.send("state", snapshot());
+  const elapsed = (capture: Capture) => Math.max(0, Math.round((Date.now() - capture.startedAt) / 10) / 100);
+  const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
   function diagnostic(event: string, fields: Record<string, string | number | boolean | undefined> = {}) {
-    const detail = JSON.stringify({ phase: state.phase, ...fields });
-    const entry = `${new Date().toISOString()} ${event} ${detail}`;
+    const entry = `${new Date().toISOString()} ${event} ${JSON.stringify({ phase: state.phase, ...fields })}`;
     state.diagnostics.push(entry);
-    if (state.diagnostics.length > 80) state.diagnostics.shift();
+    if (state.diagnostics.length > 120) state.diagnostics.shift();
     console.info(`[Inbound glasses] ${entry}`);
   }
-  diagnostic("app.loaded", { sdk: "3.4.0", directCapture: true, width: recordingOptions.width, height: recordingOptions.height, fps: recordingOptions.fps });
-  function save() {
-    const capture = state.capture;
-    if (!capture) return journalWrite;
-    capture.phase = state.phase;
-    const snapshot = JSON.stringify(capture);
-    const written = journalWrite.then(() => session.storage.set("capture", snapshot));
-    journalWrite = written.catch(() => {});
-    return written;
-  }
+  diagnostic("app.loaded", { sdk: "3.4.0", transport: "phone" });
   const problem = (error: unknown, stage = "capture") => {
-    state.error = error instanceof Error ? error.message : String((error as {message?: string})?.message || error);
-    diagnostic("operation.failed", { stage, code: (error as {code?: string})?.code, error: state.error.replace(/(?:https?|rtmp):\/\/\S+/g, "[server address]").slice(0, 180) });
+    state.error = error instanceof Error ? error.message : String((error as { message?: string })?.message || error);
+    diagnostic("operation.failed", { stage, code: (error as { code?: string })?.code, error: state.error.replace(/https?:\/\/\S+/g, "[address]").slice(0, 180) });
     publish();
   };
 
-  function needsStreamingUpdate(error: unknown) {
-    const issue = error as { code?: string; message?: string } | null;
-    const code = issue?.code ?? "";
-    const message = issue?.message ?? "";
-    return /(?:update|upgrade)[_ -]required|firmware[_ -](?:too[_ -]old|unsupported)|outdated[_ -]firmware/i.test(code)
-      || (code === "CAMERA_ERROR" && /submitRequestList:401:.*Function not implemented.*streaming request/i.test(message))
-      || (/\b(?:updat(?:e|ed|ing)|upgrad(?:e|ed|ing)|outdated)\b/i.test(message)
-        && /\b(?:glasses|firmware|software|stream(?:ing)?)\b/i.test(message));
-  }
-
-  function setCaptureMode(mode: State["captureMode"]) {
-    state.captureMode = mode;
-    return session.storage.set("captureMode", mode);
-  }
-
-  async function api<T>(path: string, body?: unknown, method = "GET", base = state.server, timeoutMs = 12000): Promise<T> {
-    if (!base) throw new Error("Enter the Mac server address first.");
+  function withTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const checkingUpload = method === "GET" && path.startsWith("/api/sessions/");
-    if (!checkingUpload) diagnostic("mac.request", { method, path });
+    // Mentra's background fetch doesn't honor AbortSignal, so race a deadline.
+    return Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })])
+      .finally(() => clearTimeout(timer));
+  }
+
+  async function request<T>(base: string, path: string, method = "GET", body?: string | Uint8Array, contentType = "application/json", timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
+    if (!base) throw new Error("Enter the Mac server address first.");
     try {
-      const request = fetch(base + path, {
-        method,
-        headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      // Mentra's background fetch doesn't honor AbortSignal. For capture metadata,
-      // wait for the native request to settle so successive writes stay ordered.
-      const response = method === "PUT" ? await request : await Promise.race([
-        request,
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("The Mac server did not respond. Check the address and Wi-Fi.")), timeoutMs);
-        }),
-      ]);
+      const response = await withTimeout(fetch(base + path, {
+        // Mentra's fetch sends typed-array bodies as binary.
+        method, body: body as BodyInit | undefined, headers: {
+          ...(body === undefined ? {} : { "Content-Type": contentType }),
+          ...(INBOUND_TOKEN ? { Authorization: `Bearer ${INBOUND_TOKEN}` } : {}),
+        },
+      }), timeoutMs, "The Inbound server did not respond. Check the address and the phone's connection.");
       state.online = true;
-      if (!checkingUpload || !response.ok) diagnostic("mac.response", { method, path, status: response.status });
       const data = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(typeof data?.detail === "string" ? data.detail : `Mac server returned ${response.status}`);
+      if (response.status === 401 || response.status === 403) {
+        throw Object.assign(new Error("The Inbound server refused this phone. Rebuild the MiniApp with the server's access token."), { status: response.status });
+      }
+      if (!response.ok) {
+        throw Object.assign(new Error(typeof data?.detail === "string" ? data.detail : `Inbound server returned ${response.status}`), { status: response.status });
+      }
       if (data === null) throw new Error("The Mac address did not return an Inbound response.");
       return data as T;
     } catch (error) {
-      state.online = false;
-      if (!checkingUpload) diagnostic("mac.request_failed", { method, path });
+      if (!(error as { status?: number }).status) state.online = false;
       throw error;
     }
-    finally { clearTimeout(timer); }
   }
 
   async function selectServer(address: string, allowFallback = false) {
-    const probe = async (candidate: string) => {
-      const health = await api<MacHealth>("/api/health", undefined, "GET", candidate, 3000);
-      if (health.ok !== true) throw new Error("The address did not return an Inbound health check.");
-      return health;
-    };
-    const fallback = INBOUND_SERVER;
-    const addresses = allowFallback ? [...new Set([address, state.localServer, fallback].filter(Boolean))] : [address];
-    for (const candidate of addresses) {
-      let health: MacHealth;
+    const candidates = allowFallback ? [...new Set([address, INBOUND_LOCAL_SERVER, INBOUND_SERVER].filter(Boolean))] : [address];
+    for (const candidate of candidates) {
       try {
-        if (state.liveOnly && isPhoneRelay(candidate)) throw new Error("Use the Mac’s local Wi-Fi address for Live to Mac.");
-        health = await probe(candidate);
-        if (state.liveOnly && !health.live_capture) throw new Error("Live video is disabled on the Mac server.");
-      }
-      catch (error) {
+        const health = await request<MacHealth>(candidate, "/api/health", "GET", undefined, undefined, 3000);
+        if (health.ok !== true) throw new Error("The address did not return an Inbound health check.");
+        state.aiConfigured = !!health.ai_configured;
+      } catch (error) {
         if (!allowFallback) throw error;
         continue;
       }
-      if (candidate !== address) diagnostic("mac.using_current_address", { connection: isPhoneRelay(candidate) ? "relay" : "local" });
       if (candidate !== state.server) {
         state.server = candidate;
         void session.storage.set("server", candidate).catch(problem);
+        void session.storage.set("serverBuild", INBOUND_SERVER).catch(() => {});
       }
-      state.aiConfigured = !!health.ai_configured;
-      // The glasses in this demo reject streaming requests. Always use the
-      // recording API, including after an older install saved "live" mode.
-      state.captureMode = "device";
-      diagnostic("mac.connected", { connection: isPhoneRelay(candidate) ? "relay" : "local", captureMode: state.captureMode });
-      return;
+      diagnostic("mac.connected", { connection: isPhoneRelay(candidate) ? "relay" : "local" });
+      return candidate;
     }
-    throw new Error("The iPhone could not reach Inbound. Check the Mac and your Wi-Fi connection.");
+    throw new Error("The phone could not reach Inbound. Check the Mac and your Wi-Fi connection.");
   }
 
-  function syncCapture(capture: Capture) {
-    const synced = captureSync.then(async () => {
-      await api(`/api/sessions/${capture.id}/capture`, {
-        bookmarks: capture.bookmarks,
-        started_at: new Date(capture.startedAt).toISOString(),
-      }, "PUT", capture.server);
-    });
-    captureSync = synced.catch(() => {});
-    return synced;
+  function updatePending() {
+    state.pending = outbox.length;
+    state.pendingBytes = outbox.reduce((total, job) => total + job.bytes, 0);
   }
 
-  function syncWhileRecording(capture: Capture) {
-    void syncCapture(capture).catch((error) => {
-      if (state.capture === capture && state.phase === "recording") problem(error);
-    });
+  function enqueue(job: Omit<Job, "bytes" | "tries">) {
+    outbox.push({ ...job, bytes: job.body.length, tries: 0 });
+    // Keep memory bounded if the Mac stays unreachable: drop the oldest queued audio first.
+    while (outbox.reduce((total, item) => total + item.bytes, 0) > OUTBOX_LIMIT) {
+      const index = outbox.findIndex((item, position) => position > 0 && item.label.startsWith("audio"));
+      if (index < 0) break;
+      diagnostic("upload.dropped", { label: outbox[index].label, reason: "queue_full" });
+      outbox.splice(index, 1)[0].done?.(false);
+    }
+    updatePending();
+    void pump();
   }
 
-  async function start() {
-    if (!session.capabilities?.hasCamera) throw new Error("Connect Mentra Live glasses in the Mentra app first.");
-    if (publisherStop) throw new Error("Wait for the glasses to finish stopping before starting another capture.");
-    const previous = state.capture;
-    const previousPhase = state.phase;
-    state.capture = null;
-    pendingSnapTimes = [];
-    lastUploadStatus = "";
-    state.phase = "starting";
-    state.message = "Connecting to the Mac to save this recording…";
-    publish();
-    let journalRequested = false;
-    let cameraRequestedAt: number | undefined;
-    const restorePreviousCapture = async () => {
-      state.capture = previous;
-      state.phase = previousPhase;
-      if (!journalRequested) return;
-      if (previous) void save().catch(problem);
-      else {
-        journalWrite = journalWrite.then(() => session.storage.delete("capture")).catch(problem);
-      }
-    };
+  async function pump() {
+    if (pumping) return;
+    pumping = true;
     try {
-      await selectServer(state.server, true);
-      const result = await api<{id: string; live_capture?: boolean}>("/api/sessions", {
-        title: `Glasses recording · ${new Date().toLocaleTimeString()}`, source: "glasses",
-        auto_report: state.captureMode === "device",
-      }, "POST");
-      if (!result.id) throw new Error("The Mac address did not return an Inbound session.");
-      state.capture = { id: result.id, startedAt: Date.now(), bookmarks: [], phase: "starting", server: state.server };
-      journalRequested = true;
-      diagnostic("capture.journal_writing", { session: result.id });
-      void save().catch(problem);
-      if (queuedStop) {
-        diagnostic("camera.start_cancelled", { session: result.id });
-        await restorePreviousCapture();
-        state.message = "Start cancelled before the camera was turned on.";
-        return;
-      }
-      const capture = state.capture;
-      if (result.live_capture && state.captureMode === "live" && !isPhoneRelay(capture.server)) {
-        if (!await startLive(capture)) {
-          await restorePreviousCapture();
-          state.message = "Start cancelled before the camera was turned on.";
+      while (outbox.length && !closed) {
+        const job = outbox[0];
+        try {
+          await request(job.capture.server, job.path, "POST", job.body, job.contentType);
+          outbox.shift();
+          sent.set(job.capture, (sent.get(job.capture) ?? 0) + 1);
+          if (job.tries) diagnostic("upload.recovered", { label: job.label, tries: job.tries });
+          if (state.error.startsWith("Waiting for the server") || state.error.startsWith("The Inbound server refused")) state.error = "";
+          job.done?.(true);
+        } catch (error) {
+          const status = (error as { status?: number }).status ?? 0;
+          // The Mac understood and refused this request, or kept failing on it. Don't hold up later uploads.
+          // A refused token keeps everything queued until the access problem is fixed.
+          if ((status >= 400 && status < 500 && ![401, 403, 408, 425, 429].includes(status)) || (status >= 500 && job.tries >= 4)) {
+            outbox.shift();
+            diagnostic("upload.rejected", { label: job.label, status });
+            problem(error, job.label);
+            job.done?.(false);
+          } else {
+            job.tries++;
+            if (job.tries === 1 || job.tries % 10 === 0) diagnostic("upload.retrying", { label: job.label, tries: job.tries, status });
+            state.error = status === 401 || status === 403 ? (error as Error).message
+              : `Waiting for the server. ${outbox.length} upload${outbox.length === 1 ? "" : "s"} will send automatically.`;
+            updatePending();
+            publish();
+            await sleep(Math.min(8000, 500 * 2 ** Math.min(job.tries, 4)));
+          }
         }
-        return;
+        updatePending();
+        publish();
       }
-      cameraRequestedAt = Date.now();
-      capture.startedAt = cameraRequestedAt;
-      diagnostic("camera.start_requested", { session: capture.id, connected: state.connected, wifi: state.wifi, ...recordingOptions });
-      state.message = "Starting the glasses camera…";
-      publish();
-      const recording = await session.camera.startVideoRecording(recordingOptions);
-      if (!recording?.recordingId) throw new Error("The glasses did not return a recording ID.");
-      capture.recordingId = recording.recordingId;
-      capture.cameraReleased = false;
-      capture.startedAt = Date.now();
-      state.phase = "recording";
-      diagnostic("camera.started", { session: capture.id, recording: recording.recordingId, elapsedMs: Date.now() - cameraRequestedAt });
-      state.message = "Say “snap” to mark a moment, then “stop recording” to finish.";
-      applyPendingSnaps();
-      void save().catch(problem);
-      syncWhileRecording(capture);
-    } catch (error) {
-      // A start timeout can leave the camera running. Never silently start a
-      // second recording or throw away the saved recovery journal.
-      const code = (error as {code?: string})?.code;
-      const alreadyRecording = /^already_recording$/i.test(code ?? "") || /recording is already in progress/i.test((error as {message?: string})?.message ?? "");
-      if (alreadyRecording) {
-        await restorePreviousCapture();
-        diagnostic("camera.start_blocked", { code });
-        state.message = "Mentra is still tracking an earlier recording. If the camera light is off, fully quit and reopen the Mentra app before retrying.";
-      } else if (cameraRequestedAt === undefined || (code && rejectedStarts.has(code))) {
-        await restorePreviousCapture();
-        state.message = "Could not start the recording. Check the error below and try again.";
-      } else if (!state.capture?.recordingId) {
-        state.phase = "start_unconfirmed";
-        applyPendingSnaps();
-        diagnostic("camera.start_unconfirmed", { session: state.capture?.id, code, elapsedMs: Date.now() - cameraRequestedAt, stopRequested: state.stopPending });
-        state.message = `Mentra did not confirm Start. ${checkRecordingLight} You can attach the saved clip on the Mac.`;
-        void save().catch(problem);
-      }
-      throw error;
+    } finally {
+      pumping = false;
     }
   }
 
-  function applyPendingSnaps() {
-    for (const at of pendingSnapTimes) snap(at);
-    pendingSnapTimes = [];
+  function save() {
+    const value = state.capture ? JSON.stringify(state.capture) : null;
+    const written = journalWrite.then(() => value ? session.storage.set("capture", value) : session.storage.delete("capture"));
+    journalWrite = written.catch(() => {});
+    return written;
   }
 
-  async function startLive(capture: Capture): Promise<boolean> {
-    const remote = /^https?:\/\/([a-z0-9.-]+)(?::\d+)?$/i.exec(capture.server);
-    if (!remote) throw new Error("Direct glasses capture needs the Mac’s local network address.");
-    const path = `/api/sessions/${capture.id}/live`;
-    const receiver = await api<{port: number; key: string}>(`${path}/start`, {}, "POST", capture.server);
-    capture.live = true;
-    void save().catch(problem);
-    if (queuedStop) {
-      await api(`${path}/stop`, {}, "POST", capture.server);
-      return false;
-    }
-    state.message = "Starting the glasses camera. Waiting for video on your Mac…";
-    diagnostic("live.start_requested", { session: capture.id, port: receiver.port });
-    publish();
-    void session.stream.startStream({
-      direct: `rtmp://${remote[1]}:${receiver.port}/live/${receiver.key}`,
-      video: { width: 1280, height: 720, fps: 30, bitrate: 2000000 }, sound: false, captureAudio: true,
-    }).then((result) => {
-      if (state.capture !== capture || !result?.streamId) return;
-      capture.streamId = result.streamId;
-      diagnostic("live.publisher_acknowledged", { session: capture.id, stream: capture.streamId });
-      void save().catch(problem);
-      publish();
-    }).catch((error) => {
-      if (state.capture !== capture || state.phase !== "starting") return;
-      if (!needsStreamingUpdate(error)) {
-        problem(error, "glasses stream start");
-        return;
-      }
-      void run(async () => {
-        diagnostic("live.update_required", { session: capture.id, code: (error as {code?: string})?.code });
-        const result = await api<{has_video: boolean}>(`${path}/stop`, {}, "POST", capture.server);
-        if (result.has_video) {
-          state.phase = "waiting_upload";
-          state.message = "Video arrived before Mentra reported the update requirement. Preparing the saved clip.";
-          await save();
-          return;
-        }
-        await journalWrite;
-        state.capture = null;
-        state.phase = "ready";
-        state.streamUpdateRequired = true;
-        state.message = state.liveOnly ? "Mentra blocked live video. Check the glasses’ streaming support in Mentra." : "The glasses rejected live streaming. On-glasses recording is selected for your next attempt.";
-        state.voiceCommand = "";
-        if (!state.liveOnly) await setCaptureMode("device");
-        await session.storage.delete("capture");
-      });
+  function resetAudio() {
+    audioChunks = [];
+    audioChars = 0;
+  }
+
+  function flushAudio(capture: Capture) {
+    if (!audioChunks.length) return;
+    const seq = ++capture.audioSeq;
+    const body = JSON.stringify({ seq, at: audioAt, sample_rate: audioRate, format: audioFormat ?? null, chunks: audioChunks });
+    resetAudio();
+    enqueue({ capture, path: `/api/sessions/${capture.id}/audio`, body, contentType: "application/json", label: `audio ${seq}` });
+    void save().catch(() => {});
+  }
+
+  function start() {
+    const capture: Capture = { id: crypto.randomUUID(), server: state.server, startedAt: Date.now(), audioSeq: 0, noteSeq: 0, photos: [] };
+    // The session ID is made here, so recording starts instantly and the
+    // create request simply waits in the queue if the Mac is unreachable.
+    enqueue({
+      capture, path: "/api/sessions", label: "session", contentType: "application/json",
+      body: JSON.stringify({ id: capture.id, title: `Glasses capture · ${new Date().toLocaleTimeString()}`, source: "glasses", auto_report: true }),
     });
-    return true;
+    resetAudio();
+    state.capture = capture;
+    state.phase = "recording";
+    state.audio = false;
+    state.error = "";
+    state.message = "Recording. Say “snap” for a photo, then “stop” to send the report.";
+    diagnostic("capture.started", { session: capture.id, glasses: state.connected });
+    void save().catch(problem);
+    publish();
+    if (!state.online) {
+      void selectServer(state.server, true).then((server) => {
+        if (!sent.get(capture) && server !== capture.server) {
+          capture.server = server;
+          void save().catch(() => {});
+        }
+        publish();
+      }).catch(() => diagnostic("mac.unreachable", { session: capture.id }));
+    }
   }
 
-  function snap(at = Date.now()) {
+  function snap() {
     const capture = state.capture;
     if (!capture) return;
-    if (capture.bookmarks.length >= 40) throw new Error("This session already has 40 marked moments.");
-    const seconds = Math.max(0, (at - capture.startedAt) / 1000);
-    if (seconds > 7190) throw new Error("Finish this recording before the two-hour limit.");
-    const number = capture.bookmarks.length + 1;
-    capture.bookmarks.push({ id: `mark-${number}`, seconds, label: `Snap ${number}` });
-    diagnostic("snap.marked", { session: capture.id, number, seconds: Math.round(seconds * 100) / 100 });
-    state.message = `Snap ${number} marked. The still and clip will appear after upload.`;
-    publish();
-    syncWhileRecording(capture);
-    void save().catch(problem);
-  }
-
-  async function stop() {
-    const capture = state.capture;
-    if (capture?.live) {
-      await stopLive(capture);
+    if (capture.photos.length >= 40) {
+      state.voiceCommand = "This capture already has 40 photos.";
+      publish();
       return;
     }
-    if (!capture?.recordingId || !["recording", "stopping"].includes(state.phase)) return;
-    state.phase = "stopping";
+    const photo: Photo = { seq: capture.photos.length + 1, seconds: elapsed(capture), status: "taking" };
+    capture.photos.push(photo);
+    state.message = `Taking photo ${photo.seq}…`;
+    diagnostic("photo.requested", { session: capture.id, number: photo.seq, seconds: photo.seconds });
+    publish();
+    // One camera request at a time; overlapping requests make the glasses report busy.
+    const taken = photoChain.then(() => takePhoto(capture, photo));
+    photoChain = taken.catch(() => {});
+  }
+
+  async function download(url: string): Promise<Uint8Array | null> {
+    try {
+      const response = await withTimeout(fetch(url), 15000, "Photo download timed out.");
+      return response.ok ? new Uint8Array(await response.arrayBuffer()) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function takePhoto(capture: Capture, photo: Photo) {
     const requestedAt = Date.now();
-    // The phone's LAN connection can work even when the glasses cannot reach
-    // the Mac over Wi-Fi. Video uploads originate on the glasses.
-    const uploadServer = isPhoneRelay(INBOUND_SERVER) ? INBOUND_SERVER : capture.server;
-    const autoUpload = state.autoUpload;
-    const galleryMessage = "Recording saved on the glasses. In Mentra, sync it from Camera, then use Attach recording on the Mac.";
-    diagnostic("camera.stop_requested", { session: capture.id, recording: capture.recordingId, wifi: state.wifi, upload: autoUpload ? isPhoneRelay(uploadServer) ? "relay" : "local" : "gallery" });
-    state.message = autoUpload ? "Stopping the glasses and requesting the video upload…" : "Stopping the glasses and saving the clip to the gallery…";
-    publish();
-    stopWarning = setTimeout(() => {
-      state.message = `Waiting for Mentra to confirm Stop. ${checkRecordingLight}`;
-      diagnostic("camera.stop_still_waiting", { session: capture.id });
-      publish();
-    }, 5000);
-    // A stalled journal write must not hold up the camera stop request.
-    void save().catch(problem);
     try {
-      if (autoUpload) {
-        // Wait briefly for the last Snap write before the server can start the report.
-        let deadline: ReturnType<typeof setTimeout> | undefined;
-        try {
-          await Promise.race([captureSync, new Promise<void>(resolve => { deadline = setTimeout(resolve, 1500); })]);
-        } finally { clearTimeout(deadline); }
-      }
-      await session.camera.stopVideoRecording(capture.recordingId, autoUpload ? {
-        uploadUrl: `${uploadServer}/api/sessions/${capture.id}/video`,
-      } : undefined);
+      // Newer Mentra hosts keep the photo on the phone (`delivery: "local"`);
+      // older ones return a short-lived URL instead. Handle both.
+      const result = await session.sendRequest<PhotoResult>({
+        type: MiniappRequestType.PHOTO, size: "medium", mode: "photo", transferMethod: "auto",
+        sound: true, saveToGallery: false, delivery: "local",
+      }, { timeoutMs: PHOTO_TIMEOUT_MS });
+      let bytes: Uint8Array | null = null;
+      if (result?.key) {
+        bytes = await session.blob.bytes(result.key).catch(() => null);
+        void session.blob.delete(result.key).catch(() => {});
+      } else if (result?.photoUrl?.startsWith("http")) bytes = await download(result.photoUrl);
+      const url = [result?.photoUrl, result?.url].find(item => item && /^(?:https?|data):/.test(item));
+      if (!bytes?.length && !url) throw new Error("The glasses did not return the photo.");
+      photo.status = "uploading";
+      diagnostic("photo.taken", { session: capture.id, number: photo.seq, elapsedMs: Date.now() - requestedAt, bytes: bytes?.length ?? 0, via: bytes?.length ? "phone" : "link" });
+      if (state.capture === capture) state.message = `Photo ${photo.seq} taken. Sending it to the Mac.`;
+      enqueue({
+        capture, label: `photo ${photo.seq}`,
+        path: `/api/sessions/${capture.id}/photos?seq=${photo.seq}&seconds=${photo.seconds}`,
+        // When the phone can't read the image itself, the Mac fetches the link.
+        ...(bytes?.length ? { body: bytes, contentType: result.mimeType || "image/jpeg" } : { body: JSON.stringify({ url }), contentType: "application/json" }),
+        done: (ok) => { photo.status = ok ? "saved" : "failed"; publish(); },
+      });
     } catch (error) {
-      const {code, message} = (error as {code?: string; message?: string}) ?? {};
-      const uploadFailed = code === "media_error" || /\b(?:video|media) upload (?:error|failed)\b/i.test(message ?? "");
-      if (autoUpload && uploadFailed) {
-        // Mentra can retain ownership after a failed upload. Ask it to stop
-        // without a URL so it can save locally and release the recording ID.
-        diagnostic("camera.stop_saving_locally", { session: capture.id, code });
-        state.message = "Upload failed. Asking Mentra to finish saving on the glasses…";
-        publish();
-        try {
-          await session.camera.stopVideoRecording(capture.recordingId);
-          capture.cameraReleased = true;
-          state.phase = "waiting_upload";
-          state.message = "The glasses could not reach the Mac’s upload address. The clip may be in Mentra’s Camera gallery.";
-          void save().catch(problem);
-          return;
-        } catch (saveError) {
-          state.phase = "stopping";
-          state.message = "The glasses could not reach the Mac’s upload address. If the camera light is off, fully quit and reopen Mentra before the next take.";
-          void save().catch(problem);
-          throw saveError;
-        }
-      }
-      if (code !== "RECORDING_NOT_OWNED" && !uploadFailed) {
-        state.message = `Mentra did not confirm Stop. You can retry Stop. ${checkRecordingLight}`;
-        throw error;
-      }
-      state.phase = uploadFailed ? "waiting_upload" : "stopping";
-      state.message = uploadFailed
-        ? "The glasses reported an upload error. Look for the saved recording in Mentra’s gallery and attach it on the Mac."
-        : `Mentra lost control of this recording. ${checkRecordingLight} If the clip is already saved, attach it on the Mac.`;
-      void save().catch(problem);
-      throw error;
-    } finally {
-      clearTimeout(stopWarning);
+      photo.status = "failed";
+      problem(error, `photo ${photo.seq}`);
     }
-    state.phase = "waiting_upload";
-    capture.cameraReleased = true;
-    diagnostic("camera.stop_acknowledged", { session: capture.id, elapsedMs: Date.now() - requestedAt });
-    state.message = autoUpload ? "Waiting for the glasses to upload. Keep the glasses connected to Wi-Fi." : galleryMessage;
-    void save().catch(problem);
   }
 
-  async function stopLive(capture: Capture) {
-    state.phase = "stopping";
-    state.message = "Stopping the glasses and saving the video on your Mac…";
-    diagnostic("live.stop_requested", { session: capture.id, stream: capture.streamId });
-    void save().catch(problem);
-    publish();
-    // Without an ID the Mentra API stops this MiniApp's stream. The Mac can
-    // close and save the file even if the glasses' reply is delayed.
-    stopPublisher(capture);
-    const result = await api<{has_video: boolean; live_started_at?: number}>(`/api/sessions/${capture.id}/live/stop`, {}, "POST", capture.server);
-    if (result.has_video && result.live_started_at) {
-      capture.startedAt = result.live_started_at;
-      applyPendingSnaps();
-    }
-    state.phase = result.has_video ? "waiting_upload" : "start_unconfirmed";
-    state.message = result.has_video
-      ? "Recording saved on the Mac. Preparing the video and snaps. If the camera light stays on, retry Stop glasses."
-      : "No video reached the Mac. Check the glasses’ Wi-Fi connection and try again when the camera is idle.";
-    diagnostic("live.mac_finalized", { session: capture.id, video: result.has_video });
-    await save();
-  }
-
-  function stopPublisher(capture: Capture) {
-    if (publisherStop) return;
-    publisherStop = session.stream.stop(capture.streamId).then(() => {
-      if (state.capture !== capture) return;
-      diagnostic("live.publisher_stopped", { session: capture.id });
-      publish();
-    }).catch((error) => {
-      if (state.capture === capture) problem(error, "glasses stream stop");
-    }).finally(() => { publisherStop = null; });
-  }
-
-  async function poll() {
+  function stop() {
     const capture = state.capture;
-    if (!capture || polling || state.busy || ![...awaitingVideo, "processing", "awaiting_key", ...(capture.live ? ["recording"] : [])].includes(state.phase)) return;
-    polling = true;
+    if (!capture) return;
+    flushAudio(capture);
+    if (state.heard && !state.heardFinal) note(capture, state.heard);
+    const seconds = elapsed(capture);
+    state.capture = null;
+    state.phase = "ready";
+    state.delivered = { id: capture.id, server: capture.server, status: "uploading", progress: "Sending the last audio and photos to the Mac…" };
+    state.message = "Stopped. The report will appear on the Mac dashboard.";
+    diagnostic("capture.stopped", { session: capture.id, seconds, audio: capture.audioSeq, photos: capture.photos.length, notes: capture.noteSeq });
+    void save().catch(problem);
+    publish();
+    // Finish only after the last photo is queued, so the Mac has everything when it starts the report.
+    void photoChain.then(() => finish(capture, seconds));
+  }
+
+  function finish(capture: Capture, seconds: number) {
+    enqueue({
+      capture, path: `/api/sessions/${capture.id}/finish`, label: "finish", contentType: "application/json",
+      body: JSON.stringify({ audio_parts: capture.audioSeq, notes: capture.noteSeq, photos: capture.photos.filter(photo => photo.status !== "failed").length, seconds }),
+      done: (ok) => {
+        if (state.delivered?.id !== capture.id) return;
+        state.delivered = { ...state.delivered, status: ok ? "processing" : "failed", progress: ok ? "Preparing the report on the Mac…" : "The Mac could not finish this capture. Open the dashboard to retry." };
+        publish();
+      },
+    });
+  }
+
+  function note(capture: Capture, text: string) {
+    const seq = ++capture.noteSeq;
+    enqueue({
+      capture, path: `/api/sessions/${capture.id}/notes`, label: `note ${seq}`, contentType: "application/json",
+      body: JSON.stringify({ seq, seconds: elapsed(capture), text: text.slice(0, 2000) }),
+    });
+  }
+
+  async function checkDelivered() {
+    const delivered = state.delivered;
+    if (!delivered || finished.has(delivered.status) || delivered.status === "uploading") return;
+    if (outbox.some(job => job.capture.id === delivered.id)) return;
     try {
-      const result = await api<{has_video: boolean; status: string; progress: string; live_state?: string; live_started_at?: number; error?: string}>(`/api/sessions/${capture.id}`, undefined, "GET", capture.server);
-      if (state.capture !== capture || state.busy) return;
-      if (capture.live && state.phase === "starting") {
-        if (result.live_state === "recording" && result.live_started_at) {
-          capture.startedAt = result.live_started_at;
-          state.phase = "recording";
-          state.error = "";
-          state.message = "Video is reaching the Mac. Say “snap” or “stop”.";
-          diagnostic("live.mac_recording", { session: capture.id });
-          void save().catch(problem);
-          applyPendingSnaps();
-        } else if (result.live_state === "failed") {
-          state.phase = "start_unconfirmed";
-          state.message = "No video reached the Mac. Check glasses Wi-Fi and allow incoming video on the Mac.";
-          state.error = result.error || "Live capture failed.";
-          diagnostic("live.receiver_failed", { session: capture.id });
-          stopPublisher(capture);
-          void save().catch(problem);
-        }
+      const result = await request<{ status: string; progress: string; error?: string }>(delivered.server, `/api/sessions/${delivered.id}`);
+      if (state.delivered?.id !== delivered.id) return;
+      const progress = result.status === "complete" ? "Report ready on the Mac dashboard."
+        : result.status === "awaiting_key" ? "Saved on the Mac. Add the OpenAI key there to generate the report."
+        : result.error || result.progress;
+      if (result.status !== delivered.status || progress !== delivered.progress) {
+        state.delivered = { ...delivered, status: result.status, progress };
+        diagnostic("mac.capture_status", { session: delivered.id, status: result.status });
+        publish();
       }
-      if (capture.live && (state.phase === "recording" || state.phase === "starting") && result.has_video) {
-        if (result.live_started_at) {
-          capture.startedAt = result.live_started_at;
-          applyPendingSnaps();
-        }
-        state.phase = "waiting_upload";
-        diagnostic("live.publisher_ended", { session: capture.id });
-        stopPublisher(capture);
-      } else if (capture.live && state.phase === "recording" && result.live_state === "failed") {
-        state.phase = "start_unconfirmed";
-        state.message = "The Mac could not finish saving this clip. Stop the glasses, then check the capture log.";
-        state.error = result.error || "Live capture failed.";
-        stopPublisher(capture);
-        void save().catch(problem);
-      }
-      if (result.status !== lastUploadStatus) {
-        lastUploadStatus = result.status;
-        diagnostic("mac.capture_status", { session: capture.id, status: result.status, video: result.has_video });
-      }
-      if (result.status === "uploaded" && result.has_video && awaitingVideo.includes(state.phase)) {
-        await run(async () => {
-          await syncCapture(capture);
-          await api(`/api/sessions/${capture.id}/process`, {}, "POST", capture.server);
-          state.phase = "processing";
-          state.message = "Video received. Preparing the report on your Mac…";
-          await save();
-        });
-      } else if (result.status === "complete" || result.status === "awaiting_key" || result.status === "processing") {
-        if (state.phase !== result.status) {
-          state.phase = result.status;
-          state.error = "";
-          void save().catch(problem);
-        }
-        state.message = result.status === "complete" ? "Report ready on your Mac."
-          : result.status === "awaiting_key" ? "Recording and snaps ready. Add the OpenAI key on your Mac to generate the report."
-          : result.progress;
-      } else if (result.status === "failed" || result.status === "interrupted") {
-        state.message = result.progress;
-        state.error = "Processing stopped. Open the Mac dashboard for details and retry.";
-      }
-      publish();
-    } catch (error) {
-      if (state.capture === capture && !state.busy && state.error !== (error as {message?: string})?.message) problem(error, "upload check");
+    } catch {
+      // The status check repeats; uploads report their own connection errors.
     }
-    finally { polling = false; }
   }
 
   async function run(work: () => void | Promise<void>) {
@@ -519,227 +364,142 @@ registerMiniapp<Channels>(async (session) => {
     try { await work(); } catch (error) { problem(error); }
     finally {
       state.busy = false;
-      const stopSource = queuedStop;
-      queuedStop = null;
-      state.stopPending = false;
-      if (stopSource) {
-        if (state.phase === "recording" || (state.capture?.live && state.phase === "starting")) {
-          diagnostic("command.queue_dispatched", { command: "stop", source: stopSource });
-          if (stopSource === "voice") state.voiceCommand = "Voice command accepted: stop";
-          void run(stop);
-        } else {
-          const unconfirmed = state.phase === "start_unconfirmed";
-          diagnostic(unconfirmed ? "command.queue_blocked" : "command.queue_cleared", {
-            command: "stop", source: stopSource, reason: unconfirmed ? "missing_recording_id" : "start_did_not_complete",
-          });
-          state.voiceCommand = unconfirmed ? "Stop could not be sent. Mentra did not provide a recording ID." : "Start ended before the glasses confirmed a recording.";
-        }
-      }
       publish();
     }
   }
+
   function dispatch(command: Command, source: "voice" | "button" = "button") {
-    const voice = source === "voice";
     diagnostic("command.received", { command, source });
     const feedback = (message: string) => {
-      if (voice) state.voiceCommand = message;
+      if (source === "voice") state.voiceCommand = message;
       publish();
     };
-    const ignore = (reason: string, message: string) => {
-      diagnostic("command.ignored", { command, source, reason });
-      feedback(message);
-    };
-    if (command === "stop" && state.busy && (state.phase === "starting" || state.phase === "recording")) {
-      if (!queuedStop || voice) queuedStop = source;
-      state.stopPending = true;
-      diagnostic("command.queued", { command, source });
-      state.voiceCommand = state.capture?.live ? "Stop requested. Closing the Mac’s video receiver." : `Stop requested. Waiting for Mentra to confirm Start. ${checkRecordingLight}`;
-      publish();
-      return;
-    }
-    if (command === "stop" && state.capture?.live && ["processing", "awaiting_key", "complete"].includes(state.phase)) {
-      stopPublisher(state.capture);
-      return feedback("Stop sent to the glasses. Your video is already on the Mac.");
-    }
-    if (hydrated && command === "snap" && state.phase === "starting" && state.capture) {
-      if (pendingSnapTimes.length >= 40) return ignore("snap_limit", "This recording already has 40 requested snaps.");
-      pendingSnapTimes.push(Date.now());
-      diagnostic("snap.waiting_for_video", { session: state.capture.id });
-      return feedback("Snap requested. Waiting for the glasses camera.");
-    }
-    if (!hydrated || state.busy) return ignore("busy", `Heard “${command}”. Wait for the current action to finish.`);
-    if (command === "start" && state.phase === "waiting_upload" && state.capture?.live) {
-      diagnostic("command.accepted", { command, source });
-      feedback("Voice command accepted: start");
-      return run(async () => {
-        const current = state.capture;
-        if (!current) return;
-        const saved = await api<{has_video: boolean}>(`/api/sessions/${current.id}`, undefined, "GET", current.server);
-        if (!saved.has_video) throw new Error("The previous recording is still being saved. Try Start again after it finishes.");
-        await syncCapture(current);
-        await api(`/api/sessions/${current.id}/process`, {}, "POST", current.server);
-        await start();
-      });
-    }
-    if (command === "start" && !canStartCapture(state.phase)) {
-      const message = state.phase === "start_unconfirmed"
-        ? "Heard “start”. Check the recording light before trying again."
-        : state.phase === "waiting_upload"
-          ? "Heard “start”. Tap Start a new capture once the recording light is off."
-          : "Heard “start”. Finish the current capture first.";
-      return ignore("capture_in_progress", message);
-    }
-    if (command === "snap" && state.phase !== "recording") return ignore("no_recording", "Heard “snap”. Start a recording first.");
-    if (command === "stop" && !state.capture?.recordingId && !state.capture?.live) {
-      return ignore("missing_recording_id", state.phase === "start_unconfirmed"
-        ? `Stop could not be sent. ${checkRecordingLight}`
-        : "Heard “stop”. Start a recording first.");
-    }
-    if (command === "stop" && state.phase !== "recording" && state.phase !== "stopping" &&
-        !(state.capture?.live && ["starting", "start_unconfirmed", "waiting_upload"].includes(state.phase))) {
-      return ignore("recording_ended", "Heard “stop”. This recording has already ended.");
+    if (!hydrated) return feedback(`Heard “${command}”. Inbound is still loading.`);
+    if (command === "start") {
+      if (state.capture) return feedback("Heard “start”. Already recording.");
+      start();
+    } else if (command === "snap") {
+      if (!state.capture) return feedback("Heard “snap”. Say “start” first.");
+      snap();
+    } else {
+      if (!state.capture) return feedback("Heard “stop”. Nothing is recording.");
+      stop();
     }
     diagnostic("command.accepted", { command, source });
     feedback(`Voice command accepted: ${command}`);
-    return run(() => command === "start" ? start() : command === "snap" ? snap() : stop());
   }
+
+  // Command words count anywhere in a sentence, as soon as they are heard.
+  // Each occurrence in an utterance fires once, even as partial results repeat it.
+  function scan(final: boolean) {
+    clearTimeout(settleTimer);
+    let waiting = false;
+    for (const hit of findCommands(words)) {
+      if (hit.occurrence <= (fired.get(hit.command) ?? 0)) continue;
+      if (!final && hit.index === words.length - 1) {
+        waiting = true;
+        continue;
+      }
+      fired.set(hit.command, hit.occurrence);
+      // A recognizer can restart an utterance and repeat a word it already gave us.
+      if (hit.occurrence === 1 && lastVoice?.command === hit.command && Date.now() - lastVoice.at < REPEAT_MS) {
+        diagnostic("speech.repeat_ignored", { command: hit.command });
+        continue;
+      }
+      lastVoice = { command: hit.command, at: Date.now() };
+      dispatch(hit.command, "voice");
+    }
+    if (waiting) settleTimer = setTimeout(() => scan(true), SETTLE_MS);
+  }
+
+  function resetSpeech() {
+    clearTimeout(settleTimer);
+    words = [];
+    fired = new Map();
+  }
+
+  session.transcription.forLanguage("en-US", (data) => {
+    const text = data.text ?? "";
+    const next = speechWords(text);
+    if (!next.length) return;
+    if (state.voice === "Waiting for the on-device English speech model") state.voice = "Voice commands ready";
+    if (data.isFinal) {
+      if (text === lastFinal.text && Date.now() - lastFinal.at < REPEAT_MS) return;
+      lastFinal = { text, at: Date.now() };
+    }
+    // A hypothesis that starts differently is a new utterance.
+    if (!words.length || next[0] !== words[0]) fired = new Map();
+    words = next;
+    state.heard = text.slice(0, 180);
+    state.heardFinal = data.isFinal;
+    const hits = findCommands(words).map(hit => hit.command).join(",");
+    if (data.isFinal || hits) diagnostic("speech.transcript", { final: data.isFinal, words: words.length, commands: hits || "none", source: data.source });
+    const capture = state.capture;
+    scan(data.isFinal);
+    if (data.isFinal) {
+      // The sentence that said "start" or "stop" belongs to that capture too.
+      const target = capture ?? state.capture;
+      if (target) note(target, text);
+      resetSpeech();
+    }
+    publish();
+  }, { processing: "localOnly" });
+
+  session.mic.onAudioChunk((chunk) => {
+    const capture = state.capture;
+    if (!capture || !chunk?.data) return;
+    const rate = chunk.sampleRate || 16000;
+    if (audioChunks.length && (rate !== audioRate || chunk.format !== audioFormat)) flushAudio(capture);
+    if (!audioChunks.length) {
+      audioAt = elapsed(capture);
+      audioBatchStarted = Date.now();
+    }
+    audioRate = rate;
+    audioFormat = chunk.format;
+    audioChunks.push(chunk.data);
+    audioChars += chunk.data.length;
+    if (!state.audio) {
+      state.audio = true;
+      diagnostic("audio.flowing", { session: capture.id, rate, format: chunk.format });
+      publish();
+    }
+    if (audioChars >= AUDIO_FLUSH_CHARS) flushAudio(capture);
+  });
+
   session.ui.handle("getState", snapshot);
   session.ui.handle("copyDiagnostics", () => session.system.copyToClipboard(state.diagnostics.join("\n")));
   session.ui.onOpen(publish);
-  session.ui.on("command", ({command}) => { void dispatch(command); });
-  session.ui.on("captureMode", ({mode}) => { void run(async () => {
-    if (!canStartCapture(state.phase) || !["live", "device"].includes(mode)) return;
-    if (mode === "live") throw new Error("Live streaming is unsupported on these glasses. Use on-glasses recording.");
-    state.streamUpdateRequired = false;
-    state.message = "Ready to record on the glasses.";
-    await setCaptureMode(mode);
-  }); });
-  session.ui.on("autoUpload", ({enabled}) => { void run(async () => {
-    if (!canStartCapture(state.phase) || typeof enabled !== "boolean") return;
-    state.autoUpload = true;
-    await session.storage.set("autoUpload", "on");
-  }); });
-  session.ui.on("connect", ({server}) => { void run(async () => {
-    if (state.capture && !canStartCapture(state.phase)) throw new Error("Finish the current session before changing the Mac address.");
-    const address = serverOrigin(server);
-    await selectServer(address);
+  session.ui.on("command", ({ command }) => dispatch(command));
+  session.ui.on("connect", ({ server }) => { void run(async () => {
+    await selectServer(serverOrigin(server));
+    const capture = state.capture;
+    if (capture && !sent.get(capture)) capture.server = state.server;
     state.message = "Mac connected. Say “start” to record.";
   }); });
-  session.ui.on("retry", () => { void run(async () => {
-    if (state.phase === "stopping" && state.capture) {
-      const capture = state.capture;
-      // An upload can succeed after the host's stop request has timed out.
-      // Check the Mac before sending a second stop for the same recording.
-      const current = await api<{has_video: boolean}>(`/api/sessions/${capture.id}`, undefined, "GET", capture.server).catch(() => null);
-      if (current?.has_video) {
-        state.phase = "waiting_upload";
-        state.message = "Video received. Preparing the report on your Mac…";
-        await save();
-      } else await stop();
-    } else if (state.capture && ["waiting_upload", "processing", "awaiting_key"].includes(state.phase)) {
-      const capture = state.capture;
-      const current = await api<{has_video: boolean}>(`/api/sessions/${capture.id}`, undefined, "GET", capture.server);
-      diagnostic("mac.upload_checked", { session: capture.id, video: current.has_video });
-      if (current.has_video) {
-        await syncCapture(capture);
-        await api(`/api/sessions/${capture.id}/process`, {}, "POST", capture.server);
-        state.phase = "processing";
-        state.message = "Retrying report processing…";
-        await save();
-      } else state.message = "No video has arrived. Check glasses Wi-Fi, or import their saved recording into this session on the Mac.";
-    }
-  }); });
-  session.ui.on("recoverCamera", () => { void run(async () => {
-    const capture = state.capture;
-    if (!capture?.recordingId || capture.cameraReleased || !["stopping", "waiting_upload"].includes(state.phase)) return;
-    diagnostic("camera.release_requested", { session: capture.id });
-    try {
-      await session.camera.stopVideoRecording(capture.recordingId);
-      capture.cameraReleased = true;
-      state.phase = "waiting_upload";
-      state.message = "The camera stopped. The saved clip may be in Mentra’s gallery; the Mac did not receive it.";
-      diagnostic("camera.released", { session: capture.id });
-      await save();
-    } catch (error) {
-      state.message = "Mentra still owns the recording. Fully quit Mentra on the iPhone, reopen it, and reconnect the glasses. Check that the recording light is off.";
-      diagnostic("camera.release_failed", { session: capture.id, code: (error as {code?: string})?.code });
-      publish();
-    }
-  }); });
-  session.ui.on("resetAfterRestart", () => { void run(async () => {
-    const capture = state.capture;
-    if (!capture?.recordingId || capture.cameraReleased || !["stopping", "waiting_upload"].includes(state.phase)) return;
-    capture.cameraReleased = true;
-    state.phase = "waiting_upload";
-    state.message = "Mentra restarted and the recording light is off. You can start a new capture; the old clip may still be in Mentra’s gallery.";
-    diagnostic("camera.restart_confirmed", { session: capture.id });
-    await save();
-  }); });
-  session.ui.on("wifi", () => { void run(() => session.glasses.requestWifiSetup("Inbound uploads recordings directly to your Mac over Wi-Fi.")); });
-  session.ui.on("resetUnconfirmedStart", () => { void run(async () => {
-    if (state.phase !== "start_unconfirmed") return;
-    await journalWrite;
-    await session.storage.delete("capture");
-    state.capture = null;
-    state.phase = "ready";
-    state.message = "Ready. Say “start” to record.";
-    state.voiceCommand = "";
-    diagnostic("camera.unconfirmed_reset");
-  }); });
-  session.ui.on("confirmStoppedOnGlasses", () => { void run(async () => {
-    if (state.phase !== "start_unconfirmed" && state.phase !== "stopping") return;
-    state.phase = "waiting_upload";
-    state.voiceCommand = "";
-    state.message = "Open Camera in Mentra and sync the clip. Export it, then choose Attach recording on this session in the Mac dashboard.";
-    diagnostic("camera.stopped_on_glasses", { session: state.capture?.id });
-    await save();
-  }); });
-  session.ui.on("newCapture", () => { void run(async () => {
-    if (state.phase !== "waiting_upload") return;
-    if (state.capture?.recordingId && !state.capture.cameraReleased) throw new Error("Release the previous camera recording or restart Mentra before starting again.");
-    if (publisherStop) throw new Error("Wait for the glasses to finish stopping before starting another capture.");
-    await journalWrite;
-    await session.storage.delete("capture");
-    diagnostic("capture.resumed_in_new_session", { previous: state.capture?.id });
-    state.capture = null;
-    state.phase = "ready";
-    state.message = "Ready for a new capture. You can still attach the previous clip on the Mac.";
-    state.voiceCommand = "";
-  }); });
-  session.ui.on("stopPublisher", () => {
-    if (state.capture?.live) stopPublisher(state.capture);
-  });
   session.ui.on("report", () => {
-    const base = state.capture?.server || state.server;
-    if (base) session.system.openUrl(base + (state.capture ? `/#${state.capture.id}` : "/"));
+    const target = state.capture ?? state.delivered;
+    const base = target?.server || state.server;
+    if (base) session.system.openUrl(base + (target ? `/#${target.id}` : "/"));
   });
   session.glasses.onConnection((data) => {
-    const changed = state.connected !== data.connected || glassesModel !== data.modelName;
+    if (state.connected !== data.connected) diagnostic("glasses.connection", { connected: data.connected, model: data.modelName });
     state.connected = data.connected;
-    glassesModel = data.modelName;
-    if (changed) diagnostic("glasses.connection", { connected: data.connected, model: data.modelName });
     if (!data.connected) resetSpeech();
     publish();
   });
   session.glasses.onBattery((data) => { state.battery = data.level; publish(); });
-  session.glasses.onWifi((data) => {
-    if (state.wifi !== data.connected) diagnostic("glasses.wifi", { connected: data.connected });
-    state.wifi = data.connected;
-    publish();
-  });
   session.on("ready", () => {
     state.camera = !!session.capabilities?.hasCamera;
     diagnostic("mentra.ready", { camera: state.camera });
     publish();
-    // Leave the phone's speech detector subscribed and keep the actual mic
-    // stream continuous so the on-device recognizer sees the trailing silence.
-    for (const [gate, request] of [
+    // Keep the mic stream continuous so quiet command words still reach the recognizer.
+    for (const [gate, apply] of [
       ["loudness", () => session.mic.setLoudnessGateEnabled(false)],
       ["glasses_vad", () => session.mic.setVoiceActivityDetectionEnabled(false)],
     ] as const) {
-      void request().then(() => diagnostic("speech.mic_gate_off", { gate })).catch((error: {code?: string}) => {
+      void apply().then(() => diagnostic("speech.mic_gate_off", { gate })).catch((error: { code?: string }) => {
         diagnostic("speech.mic_gate_unavailable", { gate, code: error?.code });
-      }).finally(publish);
+      });
     }
   });
   session.on("capabilities", (capabilities) => { state.camera = !!capabilities?.hasCamera; publish(); });
@@ -751,157 +511,42 @@ registerMiniapp<Channels>(async (session) => {
   });
   session.transcription.onModelStatus((model) => {
     if (model.state !== "ready") resetSpeech();
-    if (model.language && model.language !== "en-US") {
-      state.voice = "Select English for speech recognition in Mentra’s Speech settings.";
-    } else if (model.state === "ready") state.voice = "Voice commands ready";
+    if (model.language && model.language !== "en-US") state.voice = "Select English for speech recognition in Mentra’s Speech settings.";
+    else if (model.state === "ready") state.voice = "Voice commands ready";
     else if (model.state === "downloading") state.voice = `Downloading English speech model · ${Math.round(model.progress || 0)}%`;
     else state.voice = model.reason || `English speech model ${model.state}`;
     diagnostic("speech.model", { state: model.state, language: model.language });
     publish();
   });
 
-  function resetSpeech() {
-    clearTimeout(finishTimer);
-    finishTimer = undefined;
-    pendingSpeech = "";
-    commandCandidateSeen = false;
-    speechActive = false;
-    silentSince = 0;
-    utterance++;
-  }
-
-  function receiveFinal(text: string) {
-    const phrase = normalizeSpeech(text);
-    const command = commandFrom(text);
-    const duplicate = lastFallback !== null && command === lastFallback.command && Date.now() - lastFallback.at < 1600;
-    lastFallback = null;
-    resetSpeech();
-    state.heard = text.slice(0, 180);
-    state.heardFinal = true;
-    diagnostic("speech.final", { command: command ?? "none", words: phrase ? phrase.split(" ").length : 0 });
-    if (duplicate) diagnostic("speech.final_echo", { command: command ?? undefined });
-    else if (command) {
-      void dispatch(command, "voice");
-      return;
-    } else state.voiceCommand = "Say a command by itself, such as “Inbound start”.";
-    publish();
-  }
-
-  function finishAfterPause() {
-    clearTimeout(finishTimer);
-    finishTimer = undefined;
-    if (!pendingSpeech || !commandCandidateSeen || finishingUtterance === utterance) return;
-    const currentUtterance = utterance;
-    const delay = silentSince ? Math.max(0, 750 - (Date.now() - silentSince)) : 1400;
-    // Mentra may stop sending interim updates without emitting a silence or
-    // final event. Always ask it to settle the latest text after a pause.
-    finishTimer = setTimeout(() => {
-      finishTimer = undefined;
-      const phrase = pendingSpeech;
-      const endpoint = silentSince ? "silence" : "transcript_pause";
-      finishingUtterance = currentUtterance;
-      diagnostic("speech.finish_requested", { command: commandFrom(phrase) ?? "none", endpoint, speechActive });
-      publish();
-      const finish = (finalText: string | null) => {
-        if (currentUtterance !== utterance) return; // A final event or newer speech already arrived.
-        diagnostic("speech.finish_result", { result: finalText === null ? "unavailable" : finalText ? "text" : "empty" });
-        if (finalText) {
-          receiveFinal(finalText);
-          return;
-        }
-        const command = commandFrom(phrase);
-        resetSpeech();
-        // A quiet transcript can be a missing endpoint. Active audio without
-        // a silence event can also be a deliberate pause mid-sentence.
-        if (command && (!speechActive || silentSince || /^in\s?bound\b/.test(phrase))) {
-          lastFallback = { command, at: Date.now() };
-          diagnostic("speech.command_after_pause", { command, endpoint });
-          void dispatch(command, "voice");
-        } else {
-          diagnostic("speech.command_unresolved", { command: command ?? "none", endpoint, speechActive });
-          state.voiceCommand = "Say a command by itself, such as “Inbound start”.";
-          publish();
-        }
-      };
-      if (!finishSupported) {
-        finish(null);
-        return;
-      }
-      // Native finishing can take three seconds. Cap the bridge wait for
-      // older hosts that accept the message but never answer it.
-      void session.sendRequest<string | null>({ type: MiniappRequestType.TRANSCRIPTION_FINISH }, { timeoutMs: 4500 })
-        .then(finish)
-        .catch((error: {code?: string}) => {
-          diagnostic("speech.finish_failed", { code: error?.code });
-          if (error?.code === MiniappErrorCode.NOT_IMPLEMENTED) finishSupported = false;
-          if (error?.code === MiniappErrorCode.NOT_IMPLEMENTED || error?.code === MiniappErrorCode.ACTION_TIMEOUT) finish(null);
-          else {
-            if (currentUtterance === utterance) resetSpeech();
-            publish();
-          }
-        });
-    }, delay);
-  }
-
-  session.transcription.forLanguage("en-US", (data) => {
-    const phrase = normalizeSpeech(data.text);
-    if (!phrase) return;
-    if (state.voice === "Waiting for the on-device English speech model") state.voice = "Voice commands ready";
-    const command = commandFrom(phrase);
-    if (data.isFinal) {
-      receiveFinal(data.text);
-      return;
-    }
-    state.heard = data.text.slice(0, 180);
-    state.heardFinal = false;
-    // A changed hypothesis supersedes any outstanding request to finish it.
-    // Repeated identical partials do not push back the timer.
-    if (phrase !== pendingSpeech) {
-      diagnostic("speech.transcript", { final: false, command: command ?? "none", source: data.source, words: phrase.split(" ").length });
-      lastFallback = null;
-      utterance++;
-      pendingSpeech = phrase;
-      commandCandidateSeen ||= command !== null;
-      finishAfterPause();
-    }
-    publish();
-  }, { processing: "localOnly" });
-  session.mic.onVoiceActivity(({status, silentForMs}) => {
-    if (status) {
-      if (silentSince) resetSpeech();
-      lastFallback = null;
-      speechActive = true;
-      diagnostic("speech.activity", { speaking: true });
-      finishAfterPause();
-      publish();
-      return;
-    }
-    speechActive = false;
-    silentSince = Date.now() - Math.max(0, silentForMs ?? 0);
-    diagnostic("speech.activity", { speaking: false, silentForMs, command: commandFrom(pendingSpeech) ?? "none" });
-    if (finishingUtterance === utterance) utterance++;
-    finishAfterPause();
-    publish();
-  });
-
   try {
     const savedServer = await session.storage.get("server");
-    state.server = savedServer && !isPhoneRelay(savedServer) ? savedServer : INBOUND_SERVER;
-    state.captureMode = "device";
-    state.autoUpload = true;
+    // A new build's server address replaces one saved under a different or older build.
+    const savedBuild = await session.storage.get("serverBuild");
+    state.server = savedServer && !isPhoneRelay(savedServer) && savedBuild === INBOUND_SERVER ? savedServer : INBOUND_SERVER;
     const journal = await session.storage.get("capture");
     if (journal) {
-      state.capture = JSON.parse(journal) as Capture;
-      if (isPhoneRelay(state.capture.server) && isPhoneRelay(INBOUND_SERVER)) state.capture.server = INBOUND_SERVER;
-      state.phase = state.capture.phase === "starting" && !state.capture.recordingId && !state.capture.live ? "start_unconfirmed" : state.capture.phase;
-      state.message = state.phase === "start_unconfirmed"
-        ? `Start was unconfirmed in the previous session. ${checkRecordingLight}`
-        : "Recovered the previous session. Check the glasses before continuing.";
+      // The MiniApp closed mid-capture. Queued uploads were lost with it; ask
+      // the Mac to build the report from what already arrived.
+      const capture = JSON.parse(journal) as Capture;
+      state.delivered = { id: capture.id, server: capture.server, status: "uploading", progress: "Finishing the previous capture…" };
+      finish(capture, elapsed(capture));
+      await session.storage.delete("capture");
+      diagnostic("capture.recovered", { session: capture.id });
     }
   } catch (error) { problem(error); }
   hydrated = true;
-  diagnostic("capture.ready", { savedCapture: !!state.capture, addressChanged: state.server !== INBOUND_SERVER });
+  diagnostic("capture.ready", { addressChanged: state.server !== INBOUND_SERVER });
   publish();
-  const pollTimer = setInterval(() => { void poll(); }, 1000);
-  session.on("disconnect", () => { resetSpeech(); clearTimeout(stopWarning); clearInterval(pollTimer); });
+  void selectServer(state.server, true).then(publish).catch(() => publish());
+
+  const ticker = setInterval(() => {
+    const capture = state.capture;
+    if (capture && audioChunks.length && Date.now() - audioBatchStarted >= AUDIO_FLUSH_MS) flushAudio(capture);
+    if (Date.now() - lastStatusCheck >= 2000) {
+      lastStatusCheck = Date.now();
+      void checkDelivered();
+    }
+  }, 1000);
+  session.on("disconnect", () => { closed = true; resetSpeech(); clearInterval(ticker); });
 });

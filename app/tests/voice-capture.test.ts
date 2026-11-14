@@ -1,73 +1,58 @@
-import { afterEach, expect, mock, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { MiniappRequestType as Request, MiniappResponseType as ResponseType } from "@mentra/miniapp/background";
 import type { State } from "../src/shared/channels";
+import { commandFrom, findCommands, speechWords } from "../src/shared/commands";
 
 const SERVER = "http://192.0.2.1:8000";
+const PHOTO = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9]);
 const host = globalThis as typeof globalThis & {
   INBOUND_SERVER: string;
   INBOUND_LOCAL_SERVER: string;
-  INBOUND_LIVE_ONLY: boolean;
+  INBOUND_TOKEN: string;
   __dispatch: (module: string, method: string, args: string) => void;
   __mentraInitCallback: (id: string) => void;
   __mentraDeliverBridgeRaw: (message: string) => void;
   __mentraBackgroundSession?: { disconnect: () => void };
 };
 host.INBOUND_SERVER = SERVER;
+host.INBOUND_LOCAL_SERVER = SERVER;
+host.INBOUND_TOKEN = "";
 await import("../src/background/index");
 
+const originalFetch = globalThis.fetch;
 afterEach(() => {
   host.__mentraBackgroundSession?.disconnect();
-  mock.restore();
+  globalThis.fetch = originalFetch;
 });
 
-async function connect(savedAddress: string | null = null, live = false, buildAddress = SERVER, liveOnly = false) {
-  host.INBOUND_SERVER = buildAddress;
-  host.INBOUND_LOCAL_SERVER = buildAddress.startsWith("http://") ? buildAddress : "";
-  host.INBOUND_LIVE_ONLY = liveOnly;
-  let state: State;
-  let finishPoll: (() => void) | undefined;
-  let finishStart: (() => void) | undefined;
-  let rejectStart: (() => void) | undefined;
-  let finishText: string | null = null;
-  let finishUnsupported = false;
-  let failStop = false;
-  let failUploadAndLocalStop = false;
-  let uploadStatus = "created";
-  let liveState = "waiting";
-  let streamStartError: {code: string; message: string} | undefined;
-  let liveStartedAt: number | undefined;
-  let releaseCreate: (() => void) | undefined;
-  let holdCreate = false;
-  let releaseCaptureSync: (() => void) | undefined;
-  let holdCaptureSync = false;
-  let sessionCount = 0;
-  const requests: { type: string; recordingId?: string; uploadUrl?: string }[] = [];
-  const savedMarks: string[][] = [];
-  const processedMarks: string[][] = [];
-  const storage = new Map<string, string>();
-  if (live && buildAddress === SERVER) {
-    storage.set("captureMode", "live");
-    storage.set("autoUpload", "off");
-  }
-  // The app uses one interval to check for an upload. Run it on demand.
+interface Call { method: string; path: string; body: unknown; auth?: string }
+
+async function connect({ journal = null as string | null } = {}) {
+  let state!: State;
+  let tick: (() => void) | undefined;
+  let offline = 0;
+  let refuseToken = false;
+  let macStatus = "processing";
+  let photoReply: object | null = { photoUrl: "https://photos.example/1.jpg", mimeType: "image/jpeg" };
+  const rejected = new Map<string, number>();
+  const calls: Call[] = [];
+  const requests: { type: string; [key: string]: unknown }[] = [];
+  const storage = new Map<string, string>(journal ? [["capture", journal]] : []);
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = ((callback: () => void, interval: number) => {
-    if (interval === 1000) finishPoll = callback;
+    if (interval === 1000) tick = callback;
     return originalSetInterval(() => {}, 60_000);
   }) as typeof setInterval;
 
-  function deliver(payload: object, requestId?: string) {
-    host.__mentraDeliverBridgeRaw(JSON.stringify({ payload, requestId }));
-  }
-  function event(streamType: string, data: object, transcriptionRoute?: "forceLocal") {
+  const deliver = (payload: object, requestId?: string) => host.__mentraDeliverBridgeRaw(JSON.stringify({ payload, requestId }));
+  const event = (streamType: string, data: object, transcriptionRoute?: "forceLocal") =>
     deliver({ type: ResponseType.EVENT, streamType, data, transcriptionRoute });
-  }
 
   host.__dispatch = (_module, _method, args) => {
     const [raw] = JSON.parse(args);
     const { payload, requestId } = JSON.parse(raw);
     requests.push(payload);
-    const reply = (data?: object | string, error?: object) =>
+    const reply = (data?: unknown, error?: object) =>
       queueMicrotask(() => deliver({ type: ResponseType.REQUEST_RESULT, ok: !error, data, error }, requestId));
     switch (payload.type) {
       case Request.CONNECT:
@@ -81,415 +66,260 @@ async function connect(savedAddress: string | null = null, live = false, buildAd
         });
         break;
       case Request.STORAGE_GET:
-        reply({ value: payload.key === "server" ? savedAddress : storage.get(payload.key) ?? null });
+        reply({ value: storage.get(payload.key) ?? null });
         break;
       case Request.STORAGE_SET:
         storage.set(payload.key, payload.value);
         reply();
         break;
-      case Request.VIDEO_RECORDING_START:
-        finishStart = () => reply({ recordingId: `camera-${sessionCount}` });
-        rejectStart = () => reply(undefined, { code: "ERR_UNEXPECTED", message: "Start timed out waiting for glasses response." });
-        break;
       case Request.STORAGE_DELETE:
         storage.delete(payload.key);
         reply();
         break;
-      case Request.VIDEO_RECORDING_STOP:
-        if (failUploadAndLocalStop) {
-          const uploading = !!payload.uploadUrl;
-          if (!uploading) failUploadAndLocalStop = false;
-          reply(undefined, uploading
-            ? { code: "ERR_UNEXPECTED", message: "Video upload error: failed to connect to Mac" }
-            : { code: "ERR_UNEXPECTED", message: "Video recording command failed." });
-        } else if (failStop) {
-          failStop = false;
-          reply(undefined, { code: "BLE_SEND_FAILED", message: "Glasses disconnected" });
-        } else reply();
+      case Request.PHOTO:
+        if (photoReply) reply(photoReply);
+        else reply(undefined, { code: "camera_busy", message: "Camera is busy" });
         break;
-      case Request.TRANSCRIPTION_FINISH:
-        if (finishUnsupported) reply(undefined, { code: "NOT_IMPLEMENTED", message: "Missing finish support" });
-        else {
-          if (finishText) queueMicrotask(() => event("transcription:en-US", { text: finishText, isFinal: true, source: "local" }, "forceLocal"));
-          if (finishText === null) reply();
-          else reply(finishText);
-        }
+      case Request.BLOB_OPEN_READ:
+        reply({ handle: "photo-handle", meta: {} });
         break;
-      case Request.MIC_SET_LOUDNESS_GATE_ENABLED:
-      case Request.MIC_SET_VAD_ENABLED:
-        reply();
-        break;
-      case Request.STREAM_START:
-        if (streamStartError) reply(undefined, streamStartError);
-        // Otherwise deliberately omit the glasses acknowledgment.
-        break;
-      case Request.STREAM_STOP:
-        reply();
+      case Request.BLOB_READ:
+        reply({ base64: Buffer.from(PHOTO).toString("base64"), done: true });
         break;
       case "UI_SEND":
         if (payload.channel === "state") state = payload.payload;
         break;
+      default:
+        if (requestId) reply();
     }
   };
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
-    if (!url.startsWith(buildAddress)) throw new Error("Cannot reach the old address");
-    if (url.endsWith("/api/health")) return Response.json({ ok: true, live_capture: live });
-    if (url.endsWith("/api/sessions")) {
-      if (holdCreate) await new Promise<void>((resolve) => { releaseCreate = resolve; });
-      return Response.json({ id: `session-${++sessionCount}`, live_capture: live }, { status: 201 });
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    if (url.startsWith("https://photos.example/")) return new Response(PHOTO);
+    const path = url.slice(SERVER.length);
+    const method = init?.method ?? "GET";
+    const raw = init?.body;
+    const body = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (offline > 0 && method === "POST") {
+      offline--;
+      throw new TypeError("Network request failed");
     }
-    if (url.endsWith("/live/start")) return Response.json({ port: 1935, key: "capture-key" });
-    if (url.endsWith("/live/stop")) {
-      if (!liveStartedAt) return Response.json({ has_video: false });
-      uploadStatus = "uploaded";
-      return Response.json({ has_video: true, live_started_at: liveStartedAt });
-    }
-    if (url.endsWith("/capture")) {
-      const marks = JSON.parse(String(init?.body)).bookmarks.map((book: { id: string }) => book.id);
-      if (holdCaptureSync) {
-        holdCaptureSync = false;
-        await new Promise<void>((resolve) => { releaseCaptureSync = resolve; });
-      }
-      savedMarks.push(marks);
-      return Response.json({});
-    }
-    if (url.endsWith("/process")) {
-      processedMarks.push(savedMarks.at(-1) ?? []);
-      uploadStatus = "awaiting_key";
-      return Response.json({ status: "processing" });
-    }
-    return Response.json({ has_video: uploadStatus !== "created", status: uploadStatus, live_state: liveState, live_started_at: liveStartedAt });
+    const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+    calls.push({ method, path, body, auth });
+    if (refuseToken) return Response.json({ detail: "Sign in to Inbound." }, { status: 401 });
+    const status = rejected.get(path.replace(/\?.*$/, "").split("/").at(-1)!);
+    if (status) return Response.json({ detail: "Refused" }, { status });
+    if (path === "/api/health") return Response.json({ ok: true, ai_configured: true });
+    if (path === "/api/sessions") return Response.json({ id: (body as { id: string }).id }, { status: 201 });
+    if (method === "GET") return Response.json({ status: macStatus, progress: "Transcribing 0–30 seconds" });
+    return Response.json({ ok: true });
   }) as typeof fetch;
-  const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
   host.__mentraInitCallback("test");
-  try {
-    await settle();
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  globalThis.setInterval = originalSetInterval;
+  const settle = async (ms = 0) => {
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  };
+  await settle();
   return {
     get state() { return state; },
-    requests, savedMarks, processedMarks, settle,
+    calls, requests, storage, settle,
+    posts: () => calls.filter(call => call.method === "POST").map(call => call.path.replace(/^\/api\/sessions\/[^/]+/, "").replace(/\?.*$/, "") || "/api/sessions"),
     voice: (text: string, isFinal = true) => event("transcription:en-US", { text, isFinal, source: "local" }, "forceLocal"),
-    activity: (status: boolean, silentForMs = 0) => event("vad", { status, silentForMs }),
-    finishWith: (text: string | null) => { finishText = text; },
-    omitFinishSupport: () => { finishUnsupported = true; },
+    audio: (data: string, sampleRate = 16000) => event("audio_chunk", { data, sampleRate, format: "pcm16" }),
     button: (command: string) => event("_ui", { type: "UI_MESSAGE", channel: "command", payload: { command } }),
-    reset: () => event("_ui", { type: "UI_MESSAGE", channel: "resetUnconfirmedStart", payload: {} }),
-    stoppedOnGlasses: () => event("_ui", { type: "UI_MESSAGE", channel: "confirmStoppedOnGlasses", payload: {} }),
-    confirmStart: () => finishStart?.(),
-    rejectStart: () => rejectStart?.(),
-    failNextStop: () => { failStop = true; },
-    failUploadAndLocalStop: () => { failUploadAndLocalStop = true; },
-    recoverCamera: () => event("_ui", { type: "UI_MESSAGE", channel: "recoverCamera", payload: {} }),
-    newCapture: () => event("_ui", { type: "UI_MESSAGE", channel: "newCapture", payload: {} }),
-    holdNextSync: () => { holdCaptureSync = true; },
-    releaseSync: () => releaseCaptureSync?.(),
-    holdCreate: () => { holdCreate = true; },
-    releaseCreate: () => releaseCreate?.(),
-    upload: () => { uploadStatus = "uploaded"; },
-    receiveLiveVideo: () => { liveStartedAt = Date.now() - 500; liveState = "recording"; },
-    requireStreamingUpdate: () => {
-      streamStartError = { code: "STREAM_FIRMWARE_UPDATE_REQUIRED", message: "Update your glasses to turn on video streaming." };
-    },
-    rejectStreamingRequest: () => {
-      streamStartError = { code: "CAMERA_ERROR", message: "CAMERA_ERROR (3): submitRequestList:401: Camera 0: Got error Function not implemented (-38) after trying to set streaming request" };
-    },
-    poll: () => finishPoll?.(),
-    close: () => { globalThis.fetch = originalFetch; },
+    tick: () => tick?.(),
+    goOffline: (requests: number) => { offline = requests; },
+    refuseToken: (value: boolean) => { refuseToken = value; },
+    reject: (endpoint: string, status: number) => rejected.set(endpoint, status),
+    photoReply: (value: object | null) => { photoReply = value; },
+    macStatus: (value: string) => { macStatus = value; },
   };
 }
 
-test("a fresh relay URL overrides an expired one and uses device recording on a live-enabled Mac", async () => {
-  const token = "a".repeat(64);
-  const stale = `https://expired.example/device/${token}`;
-  const current = `https://current.example/device/${token}`;
-  const app = await connect(stale, true, current);
-  try {
-    expect(app.state.server).toBe(current);
-    expect(app.state.captureMode).toBe("device");
-    expect(app.state.autoUpload).toBe(true);
-    app.voice("start");
-    await app.settle();
-    expect(app.requests.some(({ type }) => type === Request.VIDEO_RECORDING_START)).toBe(true);
-    expect(app.requests.some(({ type }) => type === Request.STREAM_START)).toBe(false);
-    app.confirmStart();
-    await app.settle();
-    app.voice("stop");
-    await app.settle();
-    expect(app.requests.find(({ type }) => type === Request.VIDEO_RECORDING_STOP)?.uploadUrl)
-      .toBe(`${current}/api/sessions/session-1/video`);
-  } finally { app.close(); }
+test("command words are found anywhere in a sentence", () => {
+  expect(commandFrom("Okay, start the handoff now.")).toBe("start");
+  expect(commandFrom("Please take a screenshot of the wound")).toBe("snap");
+  expect(commandFrom("That's everything, stop.")).toBe("stop");
+  expect(commandFrom("don't stop compressions")).toBeNull();
+  expect(commandFrom("the patient started shaking")).toBeNull();
+  expect(findCommands(speechWords("snap the arm then snap the leg and stop")).map(hit => `${hit.command}${hit.occurrence}`))
+    .toEqual(["snap1", "snap2", "stop1"]);
 });
 
-test("only finalized command phrases act, consecutive snaps persist, and a failed stop can be repeated", async () => {
+test("start inside a sentence begins recording from a partial result, with no network wait", async () => {
   const app = await connect();
-  try {
-    expect(app.state.voice).toBe("Voice commands ready");
-    app.activity(true);
-    app.voice("Start", false);
-    app.activity(false, 300);
-    expect(app.requests.filter(({ type }) => type === Request.TRANSCRIPTION_FINISH)).toHaveLength(0);
-    expect(app.state.phase).toBe("ready");
-    app.voice("Start the next step");
-    expect(app.state.phase).toBe("ready");
-
-    app.holdNextSync();
-    app.voice(" Inbound, START recording! ");
-    await app.settle();
-    app.confirmStart();
-    await app.settle();
-    expect(app.state.phase).toBe("recording");
-
-    app.voice("Snap", false);
-    expect(app.state.capture?.bookmarks).toHaveLength(0);
-    app.voice("Snap.");
-    await app.settle();
-    app.voice("Snap!");
-    await app.settle();
-    expect(app.state.capture?.bookmarks).toHaveLength(2);
-    expect(app.savedMarks).toEqual([]);
-    app.voice("Stop", false);
-    app.voice("Stop to check the equipment");
-    expect(app.state.phase).toBe("recording");
-
-    app.failNextStop();
-    app.voice("Inbound stop recording");
-    await app.settle();
-    expect(app.requests.filter(({ type }) => type === Request.VIDEO_RECORDING_STOP)).toHaveLength(0);
-    app.releaseSync();
-    await app.settle();
-    expect(app.state.phase).toBe("stopping");
-    expect(app.state.error).toBe("Glasses disconnected");
-    app.voice("Stop");
-    await app.settle();
-    expect(app.state.phase).toBe("waiting_upload");
-    const stops = app.requests.filter(({ type }) => type === Request.VIDEO_RECORDING_STOP);
-    expect(stops).toHaveLength(2);
-    expect(stops[1]).toMatchObject({ recordingId: "camera-1", uploadUrl: `${SERVER}/api/sessions/session-1/video` });
-    app.upload();
-    app.poll();
-    await app.settle();
-    expect(app.processedMarks).toEqual([["mark-1", "mark-2"]]);
-  } finally { app.close(); }
+  app.voice("okay start the handoff", false);
+  expect(app.state.phase).toBe("recording");
+  expect(app.state.voiceCommand).toBe("Voice command accepted: start");
+  await app.settle();
+  const create = app.calls.find(call => call.path === "/api/sessions")!;
+  expect((create.body as { id: string }).id).toBe(app.state.capture!.id);
+  // Later partials and the final repeat the same word; it fires once.
+  app.voice("okay start the handoff patient is", false);
+  app.voice("okay start the handoff patient is 45", true);
+  await app.settle();
+  expect(app.state.phase).toBe("recording");
+  expect(app.calls.filter(call => call.path === "/api/sessions")).toHaveLength(1);
 });
 
-test("a saved live mode cannot revive unsupported streaming on a new install", async () => {
-  const app = await connect(null, true);
-  try {
-    expect(app.state.captureMode).toBe("device");
-    expect(app.state.autoUpload).toBe(true);
-    app.voice("Start");
-    await app.settle();
-    expect(app.requests.filter(({ type }) => type === Request.VIDEO_RECORDING_START)).toHaveLength(1);
-    expect(app.requests.filter(({ type }) => type === Request.STREAM_START)).toHaveLength(0);
-    app.confirmStart();
-    await app.settle();
-    expect(app.state.phase).toBe("recording");
-    app.voice("Stop");
-    await app.settle();
-    expect(app.requests.find(({ type }) => type === Request.VIDEO_RECORDING_STOP)?.uploadUrl)
-      .toBe(`${SERVER}/api/sessions/session-1/video`);
-  } finally { app.close(); }
-});
-
-test("failed upload retains the recording ID until the camera can be released", async () => {
+test("a command word at the end of a partial waits briefly in case the word grows", async () => {
   const app = await connect();
-  try {
-    app.voice("Start");
-    await app.settle();
-    app.confirmStart();
-    await app.settle();
-    app.failUploadAndLocalStop();
-    app.voice("Stop");
-    await app.settle();
-    expect(app.state.phase).toBe("stopping");
-    expect(app.state.capture?.recordingId).toBe("camera-1");
-    expect(app.state.capture?.cameraReleased).toBe(false);
-    app.stoppedOnGlasses();
-    await app.settle();
-    app.newCapture();
-    await app.settle();
-    expect(app.state.capture?.recordingId).toBe("camera-1");
-    app.recoverCamera();
-    await app.settle();
-    expect(app.state.phase).toBe("waiting_upload");
-    expect(app.state.capture?.cameraReleased).toBe(true);
-    app.newCapture();
-    await app.settle();
-    expect(app.state.phase).toBe("ready");
-  } finally { app.close(); }
+  app.voice("the patient start", false);
+  expect(app.state.phase).toBe("ready");
+  app.voice("the patient started", false);
+  await app.settle(400);
+  expect(app.state.phase).toBe("ready");
+  app.voice("now start", false);
+  await app.settle(400);
+  expect(app.state.phase).toBe("recording");
 });
 
-test("iPhone silence finalizes a command and a stale local Mac address recovers before capture", async () => {
-  const app = await connect("http://192.0.2.2:8000");
-  try {
-    app.finishWith("Start the recording.");
-    app.voice("Start", false);
-    app.activity(false, 300);
-    await Bun.sleep(500);
-    expect(app.state.phase).toBe("starting");
-    expect(app.state.server).toBe(SERVER);
-    app.confirmStart();
-    await app.settle();
-    expect(app.state.phase).toBe("recording");
-
-    app.finishWith(null);
-    app.activity(true);
-    app.voice("Snap", false);
-    app.activity(false, 300);
-    await Bun.sleep(500);
-    expect(app.state.capture?.bookmarks).toHaveLength(1);
-    app.voice("Snap.");
-    expect(app.state.capture?.bookmarks).toHaveLength(1);
-    app.voice("Snap.");
-    expect(app.state.capture?.bookmarks).toHaveLength(2);
-
-    app.activity(true);
-    app.voice("Stop", false);
-    app.activity(false, 300);
-    app.activity(true);
-    app.voice("Stop to check the equipment");
-    await Bun.sleep(500);
-    expect(app.state.phase).toBe("recording");
-
-    app.omitFinishSupport();
-    app.activity(true);
-    app.voice("Stop", false);
-    app.activity(false, 300);
-    await Bun.sleep(500);
-    expect(app.state.phase).toBe("waiting_upload");
-    expect(app.requests.filter(({ type }) => type === Request.VIDEO_RECORDING_STOP)).toHaveLength(1);
-    expect(app.state.diagnostics.join("\n")).toContain("mac.using_current_address");
-    expect(app.state.diagnostics.join("\n")).toContain("speech.command_after_pause");
-    expect(app.state.diagnostics.join("\n")).not.toContain("Stop to check the equipment");
-  } finally { app.close(); }
+test("snap takes a photo and uploads it to the Mac; stop sends audio, transcript, and finish in order", async () => {
+  const app = await connect();
+  app.button("start");
+  await app.settle();
+  const id = app.state.capture!.id;
+  app.audio(Buffer.alloc(3200).toString("base64"));
+  app.audio(Buffer.alloc(3200).toString("base64"));
+  app.voice("bp is 190 over 90 snap the left forearm", false);
+  await app.settle();
+  const photo = app.requests.find(request => request.type === Request.PHOTO)!;
+  expect(photo.delivery).toBe("local");
+  expect(app.state.capture!.photos[0].status).toBe("saved");
+  const upload = app.calls.find(call => call.path.startsWith(`/api/sessions/${id}/photos`))!;
+  expect(upload.path).toContain("seq=1");
+  expect([...(upload.body as Uint8Array)]).toEqual([...PHOTO]);
+  app.voice("bp is 190 over 90 snap the left forearm", true);
+  app.voice("that's all, stop", true);
+  expect(app.state.phase).toBe("ready");
+  await app.settle();
+  expect(app.posts()).toEqual(["/api/sessions", "/photos", "/notes", "/audio", "/notes", "/finish"]);
+  const audio = app.calls.find(call => call.path.endsWith("/audio"))!.body as { seq: number; chunks: string[]; sample_rate: number };
+  expect(audio.seq).toBe(1);
+  expect(audio.chunks).toHaveLength(2);
+  expect(audio.sample_rate).toBe(16000);
+  const finish = app.calls.find(call => call.path.endsWith("/finish"))!.body as { audio_parts: number; photos: number; notes: number };
+  expect(finish).toMatchObject({ audio_parts: 1, photos: 1, notes: 2 });
+  expect(app.storage.has("capture")).toBe(false);
 });
 
-test("a revised interim triggers finalization with neither a silence event nor a final transcript", async () => {
+test("two snaps in one sentence take two photos, and finish waits for the last photo", async () => {
   const app = await connect();
-  try {
-    app.finishWith("Start recording.");
-    app.voice("Start", false);
-    await Bun.sleep(100);
-    app.voice("Start rec", false);
-    await Bun.sleep(1450);
-    expect(app.state.phase).toBe("starting");
-    expect(app.requests.filter(({ type }) => type === Request.VIDEO_RECORDING_START)).toHaveLength(1);
-    expect(app.state.diagnostics.join("\n")).toContain('"endpoint":"transcript_pause"');
-    app.confirmStart();
-    await app.settle();
-
-    app.finishWith(null);
-    app.voice("Snap", false);
-    await Bun.sleep(1450);
-    expect(app.state.capture?.bookmarks).toHaveLength(1);
-    app.voice("Snap.");
-    expect(app.state.capture?.bookmarks).toHaveLength(1);
-
-    // A revised transcript must not fall back to its earlier command word.
-    app.voice("Stop", false);
-    app.voice("Stop for a second", false);
-    await Bun.sleep(1450);
-    expect(app.state.phase).toBe("recording");
-    expect(app.requests.filter(({ type }) => type === Request.VIDEO_RECORDING_STOP)).toHaveLength(0);
-  } finally { app.close(); }
-}, 7500);
-
-test("a camera timeout stays visible and can be reset once the glasses are idle", async () => {
-  const app = await connect();
-  try {
-    app.voice("Start recording");
-    await app.settle();
-    app.rejectStart();
-    await app.settle();
-    expect(app.state.phase).toBe("start_unconfirmed");
-    expect(app.state.capture?.recordingId).toBeUndefined();
-    expect(app.state.diagnostics.join("\n")).toContain("camera.start_unconfirmed");
-    app.reset();
-    await app.settle();
-    app.voice("Start");
-    await app.settle();
-    app.confirmStart();
-    await app.settle();
-    expect(app.state.phase).toBe("recording");
-  } finally { app.close(); }
+  app.button("start");
+  app.voice("snap the arm then snap the leg and stop", true);
+  await app.settle();
+  expect(app.requests.filter(request => request.type === Request.PHOTO)).toHaveLength(2);
+  expect(app.posts()).toEqual(["/api/sessions", "/notes", "/photos", "/photos", "/finish"]);
 });
 
-test("stop before the start is sent cancels the camera request", async () => {
+test("photos are read from the phone when the host keeps them local", async () => {
   const app = await connect();
-  try {
-    app.holdCreate();
-    app.voice("Start");
-    await app.settle();
-    app.button("stop");
-    expect(app.state.stopPending).toBe(true);
-    app.releaseCreate();
-    await app.settle();
-    expect(app.state.phase).toBe("ready");
-    expect(app.requests.some(({ type }) => type === Request.VIDEO_RECORDING_START)).toBe(false);
-  } finally { app.close(); }
+  app.photoReply({ key: "photo/123", mimeType: "image/jpeg", url: "/.mentra/files/123.jpg" });
+  app.button("start");
+  app.button("snap");
+  await app.settle();
+  const upload = app.calls.find(call => call.path.includes("/photos"))!;
+  expect([...(upload.body as Uint8Array)]).toEqual([...PHOTO]);
+  expect(app.requests.some(request => request.type === Request.BLOB_DELETE && request.key === "photo/123")).toBe(true);
 });
 
-test("queued stop after a Start timeout keeps the session available for a saved clip", async () => {
+test("a failed photo is reported and leaves the recording running", async () => {
   const app = await connect();
-  try {
-    app.omitFinishSupport();
-    app.voice("Start", false);
-    app.activity(false, 750);
-    await app.settle();
-    expect(app.state.phase).toBe("starting");
-    expect(app.requests.find(({ type }) => type === Request.VIDEO_RECORDING_START)).toMatchObject({ width: 1280, height: 720, fps: 30, sound: false, save: true });
-    app.voice("Stop", false);
-    app.activity(false, 750);
-    await app.settle();
-    expect(app.state.stopPending).toBe(true);
-    expect(app.requests.filter(({ type }) => type === Request.TRANSCRIPTION_FINISH)).toHaveLength(1);
-    app.rejectStart();
-    await app.settle();
-    expect(app.state.phase).toBe("start_unconfirmed");
-    expect(app.state.stopPending).toBe(false);
-    expect(app.state.voiceCommand).toContain("Stop could not be sent");
-    expect(app.state.diagnostics.join("\n")).toContain("command.queue_blocked");
-    expect(app.requests.some(({ type }) => type === Request.VIDEO_RECORDING_STOP)).toBe(false);
-    app.stoppedOnGlasses();
-    await app.settle();
-    expect(app.state.phase).toBe("waiting_upload");
-    expect(app.state.capture?.id).toBe("session-1");
-    app.upload();
-    app.poll();
-    await app.settle();
-    expect(app.state.phase).toBe("processing");
-  } finally { app.close(); }
+  app.photoReply(null);
+  app.button("start");
+  app.voice("snap", true);
+  await app.settle();
+  expect(app.state.phase).toBe("recording");
+  expect(app.state.capture!.photos[0].status).toBe("failed");
+  expect(app.state.error).toBe("Camera is busy");
 });
 
-test("stop during start uses the confirmed camera ID, and a missing key permits a new capture", async () => {
+test("uploads wait and retry while the Mac is unreachable, then arrive in order", async () => {
   const app = await connect();
+  app.goOffline(2);
+  app.button("start");
+  app.voice("first line", true);
+  await app.settle();
+  expect(app.state.phase).toBe("recording");
+  expect(app.state.pending).toBe(2);
+  expect(app.state.error).toContain("Waiting for the server");
+  await app.settle(1100);
+  expect(app.state.pending).toBe(2);
+  await app.settle(2100);
+  expect(app.state.pending).toBe(0);
+  expect(app.state.error).toBe("");
+  expect(app.posts()).toEqual(["/api/sessions", "/notes"]);
+});
+
+test("a request the Mac refuses is dropped so later uploads continue", async () => {
+  const app = await connect();
+  app.reject("audio", 415);
+  app.button("start");
+  app.audio(Buffer.alloc(320).toString("base64"));
+  app.button("stop");
+  await app.settle();
+  expect(app.posts()).toEqual(["/api/sessions", "/audio", "/finish"]);
+  expect(app.state.pending).toBe(0);
+  expect(app.state.diagnostics.some(line => line.includes("upload.rejected"))).toBe(true);
+});
+
+test("negated, repeated, and out-of-place commands are ignored", async () => {
+  const app = await connect();
+  app.voice("stop", true);
+  expect(app.state.voiceCommand).toBe("Heard “stop”. Nothing is recording.");
+  app.voice("snap", true);
+  expect(app.state.voiceCommand).toBe("Heard “snap”. Say “start” first.");
+  app.voice("start", true);
+  // The recognizer restarts the utterance and repeats the word.
+  app.voice("start", false);
+  app.voice("start now", false);
+  await app.settle();
+  expect(app.calls.filter(call => call.path === "/api/sessions")).toHaveLength(1);
+  app.voice("don't stop compressions", true);
+  expect(app.state.phase).toBe("recording");
+});
+
+test("the phone follows the Mac's report status after finishing", async () => {
+  const app = await connect();
+  app.button("start");
+  app.button("snap");
+  app.button("stop");
+  await app.settle();
+  expect(app.state.delivered?.status).toBe("processing");
+  app.macStatus("complete");
+  app.tick();
+  await app.settle();
+  expect(app.state.delivered?.status).toBe("complete");
+  expect(app.state.delivered?.progress).toBe("Report ready on the Mac dashboard.");
+});
+
+test("a capture interrupted by a MiniApp restart is finished on the next launch", async () => {
+  const journal = JSON.stringify({ id: "11111111-2222-4333-8444-555555555555", server: SERVER, startedAt: Date.now() - 5000, audioSeq: 3, noteSeq: 1, photos: [] });
+  const app = await connect({ journal });
+  await app.settle();
+  const finish = app.calls.find(call => call.path.endsWith("/finish"))!;
+  expect(finish.path).toBe("/api/sessions/11111111-2222-4333-8444-555555555555/finish");
+  expect(app.storage.has("capture")).toBe(false);
+});
+
+test("the build's access token is sent, and a refused token keeps uploads queued", async () => {
+  host.INBOUND_TOKEN = "device-secret";
   try {
+    const app = await connect();
+    app.refuseToken(true);
     app.button("start");
+    app.voice("patient is stable", true);
     await app.settle();
-    app.voice("Stop");
-    expect(app.state.voiceCommand).toContain("Waiting for Mentra to confirm Start");
-    expect(app.requests.some(({ type }) => type === Request.VIDEO_RECORDING_STOP)).toBe(false);
-    app.confirmStart();
-    await app.settle();
-    expect(app.state.phase).toBe("waiting_upload");
-    expect(app.requests.find(({ type }) => type === Request.VIDEO_RECORDING_STOP)?.recordingId).toBe("camera-1");
-    expect(app.state.capture?.bookmarks).toHaveLength(0);
-    app.upload();
-    app.poll();
-    await app.settle();
-    expect(app.state.phase).toBe("processing");
-    expect(app.processedMarks).toEqual([[]]);
-    app.poll();
-    await app.settle();
-    expect(app.state.phase).toBe("awaiting_key");
-    app.voice("Start");
-    await app.settle();
-    app.confirmStart();
-    await app.settle();
-    expect(app.state.phase).toBe("recording");
-    expect(app.state.capture?.recordingId).toBe("camera-2");
-  } finally { app.close(); }
+    expect(app.calls.at(-1)!.auth).toBe("Bearer device-secret");
+    expect(app.state.pending).toBe(2);
+    expect(app.state.error).toContain("refused this phone");
+    app.refuseToken(false);
+    await app.settle(1100);
+    expect(app.state.pending).toBe(0);
+    expect(app.posts().slice(-2)).toEqual(["/api/sessions", "/notes"]);
+  } finally {
+    host.INBOUND_TOKEN = "";
+  }
 });

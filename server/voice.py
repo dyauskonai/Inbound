@@ -8,7 +8,9 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 
 
 MODEL_DIR = Path(os.getenv("INBOUND_VOICE_MODEL", Path(__file__).resolve().parent.parent / "runtime/models/vosk-model-small-en-us-0.15"))
-COMMANDS = {"start": "start", "start recording": "start", "snap": "snap", "stop": "stop", "stop recording": "stop"}
+COMMANDS = {"start": "start", "stop": "stop", "snap": "snap", "snapshot": "snap", "screenshot": "snap"}
+# "Don't stop" must not end a recording.
+NEGATIONS = {"don't", "dont", "not", "never", "cannot", "can't", "won't"}
 
 
 @lru_cache(maxsize=1)
@@ -31,8 +33,9 @@ def accept(recognizer, pcm: bytes) -> dict | None:
         return None
     result = json.loads(recognizer.Result())
     text = result.get("text", "").strip().lower()
-    command = COMMANDS.get(text)
     words = result.get("result", [])
-    if command and words and min(word.get("conf", 0) for word in words) < 0.65:
-        command = None
-    return {"heard": text, "command": command, "end": words[-1]["end"] if words else None}
+    # Command words count anywhere in a sentence, each with the time it was said.
+    commands = [{"command": COMMANDS[word["word"]], "end": word.get("end")} for index, word in enumerate(words)
+                if word.get("word") in COMMANDS and word.get("conf", 0) >= 0.65
+                and (index == 0 or words[index - 1].get("word") not in NEGATIONS)]
+    return {"heard": text, "commands": commands, "end": words[-1]["end"] if words else None}

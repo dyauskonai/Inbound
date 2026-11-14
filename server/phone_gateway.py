@@ -45,11 +45,12 @@ async def device(token: str, path: str, request: Request):
     if not path:
         return HTMLResponse("<body style='font:18px system-ui;padding:30px'><h1>Inbound is connected</h1><p>Use the Inbound MiniApp to record. Your full report appears in Inbound on the Mac.</p></body>", headers={"Referrer-Policy": "no-referrer"})
     allowed = (path == "api/health" and request.method == "GET") or (path == "api/sessions" and request.method == "POST")
-    match = re.fullmatch(r"api/sessions/([a-f0-9-]{36})(/(capture|video|process|report.json))?", path)
+    match = re.fullmatch(r"api/sessions/([a-f0-9-]{36})(/(capture|video|process|report.json|audio|photos|notes|finish))?", path)
     relay_session = match and match[1] in config.get("sessions", [])
     local_upload = match and not relay_session and match[3] == "video" and request.method == "POST"
     if relay_session:
-        methods = {None: "GET", "capture": "PUT", "video": "POST", "process": "POST", "report.json": "GET"}
+        methods = {None: "GET", "capture": "PUT", "video": "POST", "process": "POST", "report.json": "GET",
+                   "audio": "POST", "photos": "POST", "notes": "POST", "finish": "POST"}
         allowed = request.method == methods[match[3]]
     if not allowed and not local_upload:
         raise HTTPException(404)
@@ -73,10 +74,11 @@ async def device(token: str, path: str, request: Request):
             session = await client.get(f"http://127.0.0.1:8000/api/sessions/{match[1]}")
             if not session.is_success or session.json().get("source") != "glasses":
                 raise HTTPException(404)
-        response = await client.request(request.method, "http://127.0.0.1:8000/" + path, headers=headers, content=content())
+        query = f"?{request.url.query}" if request.url.query else ""
+        response = await client.request(request.method, "http://127.0.0.1:8000/" + path + query, headers=headers, content=content())
     if local_upload and response.is_success:
         return JSONResponse({"success": True, "requestId": match[1]}, headers={"Cache-Control": "no-store"})
-    if path == "api/sessions" and response.status_code == 201:
+    if path == "api/sessions" and response.status_code in {200, 201} and response.json()["id"] not in config.get("sessions", []):
         config.setdefault("sessions", []).append(response.json()["id"])
         STATE.write_text(json.dumps(config))
     return Response(response.content, status_code=response.status_code, headers={

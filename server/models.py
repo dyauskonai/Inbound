@@ -10,9 +10,37 @@ class Bookmark(BaseModel):
 
 
 class SessionInput(BaseModel):
+    # The glasses MiniApp names its session so a retried create is harmless.
+    id: str | None = Field(default=None, pattern=r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")
     title: str = Field(default="New recording", min_length=1, max_length=120)
     source: Literal["glasses", "upload", "mac"] = "upload"
     auto_report: bool = False
+
+
+class AudioPart(BaseModel):
+    seq: int = Field(ge=1, le=100_000)
+    # Seconds from Start to the first sample in this part; gaps are filled with silence.
+    at: float = Field(ge=0, le=7200, allow_inf_nan=False)
+    sample_rate: Literal[8000, 16000, 22050, 24000, 32000, 44100, 48000] = 16000
+    format: str | None = Field(default=None, max_length=40)
+    chunks: list[str] = Field(min_length=1, max_length=2000)
+
+
+class NoteInput(BaseModel):
+    seq: int = Field(ge=1, le=100_000)
+    seconds: float = Field(ge=0, le=7200, allow_inf_nan=False)
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class PhotoLink(BaseModel):
+    url: str = Field(min_length=8, max_length=8_000_000)
+
+
+class FinishInput(BaseModel):
+    audio_parts: int = Field(default=0, ge=0, le=100_000)
+    notes: int = Field(default=0, ge=0, le=100_000)
+    photos: int = Field(default=0, ge=0, le=40)
+    seconds: float = Field(default=0, ge=0, le=7200, allow_inf_nan=False)
 
 
 class CaptureInput(BaseModel):
@@ -55,8 +83,26 @@ class SnapCaption(BaseModel):
     caption: str
 
 
+class Handoff(BaseModel):
+    """The ER handoff card. Every value is what the medic reported, or null."""
+    model_config = ConfigDict(extra="forbid")
+    patient_age: str | None
+    patient_sex: str | None
+    blood_pressure: str | None
+    heart_rate: str | None
+    spo2: str | None
+    respiratory_rate: str | None
+    injuries: list[str]
+    mechanism: str | None
+    allergies: str | None
+    eta_minutes: int | None
+    missing_fields: list[str]
+    evidence_ids: list[str]
+
+
 class GeneratedReport(Report):
     snap_captions: list[SnapCaption]
+    handoff: Handoff
 
 
 def validate_evidence(report: Report, evidence: list[dict]) -> dict:
@@ -70,7 +116,10 @@ def validate_evidence(report: Report, evidence: list[dict]) -> dict:
             raise ValueError("The report contains a statement without valid source evidence. Retry generation.")
     result = report.model_dump()
     if isinstance(report, GeneratedReport):
-        expected = {item["id"] for item in evidence if item.get("clip")}
+        # An empty handoff card cites nothing; one with values must cite real evidence.
+        if any(key not in sources for key in report.handoff.evidence_ids):
+            raise ValueError("The handoff card cites unknown evidence. Retry generation.")
+        expected = {item["id"] for item in evidence if item["kind"] == "image" and item["id"].startswith("snap_")}
         received = [item.evidence_id for item in report.snap_captions]
         if set(received) != expected or len(received) != len(expected) or any(not item.caption.strip() for item in report.snap_captions):
             raise ValueError("The report did not describe every saved snap. Retry generation.")

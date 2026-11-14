@@ -50,6 +50,9 @@ def create_sample(store):
         "timeline": [{"seconds": 0, "title": "Initial account", "detail": "Age, symptoms, and mechanism are reported.", "evidence_ids": ["audio_0"]},
                      {"seconds": 4, "title": "Correction retained", "detail": "Both the original and corrected blood pressure appear in the scripted transcript.", "evidence_ids": ["audio_1", "snap_vitals"]},
                      {"seconds": 8, "title": "Handoff details", "detail": "Allergy report and ETA are included.", "evidence_ids": ["audio_2", "snap_handoff"]}],
+        "handoff": {"patient_age": "28", "patient_sex": None, "blood_pressure": "90/60", "heart_rate": "110", "spo2": "98%",
+                    "respiratory_rate": None, "injuries": ["Left forearm pain"], "mechanism": "Fall", "allergies": "None reported",
+                    "eta_minutes": 6, "missing_fields": ["patient_sex", "respiratory_rate"], "evidence_ids": ["audio_0", "audio_1", "audio_2"]},
         "uncertainties": ["This is a fixed sample report and transcript. AI did not generate this example.", "The sample video contains generated title cards and a silent audio track.", "Actual recordings require an OpenAI API key for transcription and report generation."],
     }
     return store.update(session["id"], **info, status="complete", progress="Sample report ready", has_video=True,

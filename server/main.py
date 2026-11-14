@@ -1,19 +1,27 @@
 import asyncio
+import base64
+import binascii
 import hashlib
+import io
 import json
 import logging
 import os
-import tempfile
+import sqlite3
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps, UnidentifiedImageError
+from pydantic import ValidationError
 
-from .models import CaptureInput, SessionInput
+from .auth import AccessControl
+from .models import AudioPart, CaptureInput, FinishInput, NoteInput, PhotoLink, SessionInput
 from .processing import Processor
 from .store import Store
 
@@ -21,7 +29,41 @@ from .store import Store
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 MAX_UPLOAD = 512 * 1024 * 1024
+MAX_PHOTO = 20 * 1024 * 1024
 log = logging.getLogger("uvicorn.error")
+
+
+def fetch_photo(url: str) -> bytes:
+    """Read a photo link the phone could not download itself."""
+    try:
+        if url.startswith("data:"):
+            header, _, payload = url.partition(",")
+            return base64.b64decode(payload) if header.endswith(";base64") else urllib.parse.unquote_to_bytes(payload)
+        if not url.startswith("https://"):
+            raise ValueError("unsupported link")
+        with urllib.request.urlopen(url, timeout=15) as response:
+            data = response.read(MAX_PHOTO + 1)
+    except (OSError, ValueError, binascii.Error) as error:
+        raise HTTPException(502, "The Mac could not download the photo.") from error
+    if len(data) > MAX_PHOTO:
+        raise HTTPException(413, "Photos must be under 20 MB")
+    return data
+
+
+def normalize_photo(data: bytes) -> bytes:
+    with Image.open(io.BytesIO(data)) as image:
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        image.thumbnail((2048, 2048))
+        output = io.BytesIO()
+        image.save(output, "JPEG", quality=88)
+    return output.getvalue()
+
+
+def live_progress(session: dict) -> str:
+    seconds = int(sum(part["bytes"] / (part["rate"] * 2) for part in session.get("audio_parts", {}).values()))
+    photos = len(session.get("photos", []))
+    return (f"Receiving from the glasses · {seconds // 60}:{seconds % 60:02d} audio · "
+            f"{photos} photo{'' if photos == 1 else 's'} · {len(session.get('notes', []))} transcript lines")
 
 
 def create_app(data_dir: Path | None = None, live_port: int | None = None):
@@ -44,6 +86,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
         processor.pool.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Inbound", lifespan=lifespan)
+    app.add_middleware(AccessControl, device_token=os.getenv("INBOUND_DEVICE_TOKEN") or None,
+                       dashboard_password=os.getenv("INBOUND_DASHBOARD_PASSWORD") or None)
     app.state.store = store
     app.state.processor = processor
 
@@ -55,10 +99,15 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
 
     @app.get("/api/health")
     def health():
-        from .voice import MODEL_DIR
+        try:
+            from .voice import MODEL_DIR
+            voice_ready = (MODEL_DIR / "am/final.mdl").exists()
+        except ImportError:
+            # The cloud server has no Mac recorder, so it may run without Vosk.
+            voice_ready = False
         return {"ok": True, "ai_configured": bool(os.getenv("OPENAI_API_KEY")),
                 "live_capture": live is not None,
-                "local_voice_ready": (MODEL_DIR / "am/final.mdl").exists(),
+                "local_voice_ready": voice_ready,
                 "transcribe_model": os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe"),
                 "report_model": os.getenv("OPENAI_REPORT_MODEL", "gpt-4.1")}
 
@@ -94,8 +143,16 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
                 for item in store.list()]
 
     @app.post("/api/sessions", status_code=201)
-    def create_session(body: SessionInput):
-        session = store.create(body.title, body.source)
+    def create_session(body: SessionInput, response: Response):
+        try:
+            session = store.create(body.title, body.source, body.id)
+        except sqlite3.IntegrityError:
+            # The phone retries a create it could not confirm. Answer with the session it already made.
+            session = get_session(body.id)
+            if session["source"] != body.source:
+                raise HTTPException(409, "This session ID belongs to another recording.")
+            response.status_code = 200
+            return session
         if body.source == "glasses" and body.auto_report:
             session = store.update(session["id"], auto_report=True)
         log.info("Inbound capture created session=%s source=%s", session["id"], body.source)
@@ -136,6 +193,97 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
             saved = store.update(session_id, **changes)
             log.info("Inbound capture marks saved session=%s count=%d", session_id, len(bookmarks))
             return saved
+
+    def phone_session(session_id: str) -> dict:
+        session = get_session(session_id)
+        if session["source"] != "glasses" or session["has_video"]:
+            raise HTTPException(409, "This session does not accept uploads from the glasses MiniApp.")
+        return session
+
+    def record_upload(session: dict, **changes) -> dict:
+        if session["status"] in {"created", "recording"}:
+            changes["status"] = "recording"
+            changes["progress"] = live_progress({**session, **changes})
+        return store.update(session["id"], **changes)
+
+    @app.post("/api/sessions/{session_id}/audio")
+    async def audio(session_id: str, part: AudioPart):
+        if part.format and not part.format.lower().startswith("pcm"):
+            raise HTTPException(415, "Inbound needs PCM audio from the phone.")
+        try:
+            data = b"".join(base64.b64decode(chunk, validate=True) for chunk in part.chunks)
+        except (binascii.Error, ValueError):
+            raise HTTPException(422, "Audio chunks must be base64 encoded")
+        if len(data) > 16 * 1024 * 1024:
+            raise HTTPException(413, "Send audio in smaller parts")
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = phone_session(session_id)
+            parts = session.get("audio_parts", {})
+            if str(part.seq) not in parts:
+                # 16-bit samples: drop a stray trailing byte rather than shift every later sample.
+                data = data[:len(data) - len(data) % 2]
+                (store.media_dir(session_id) / f"audio-{part.seq:06d}.pcm").write_bytes(data)
+                parts[str(part.seq)] = {"at": part.at, "rate": part.sample_rate, "bytes": len(data)}
+                record_upload(session, audio_parts=parts)
+        return {"ok": True}
+
+    @app.post("/api/sessions/{session_id}/photos")
+    async def photo(session_id: str, request: Request, seq: int = Query(ge=1, le=40), seconds: float = Query(ge=0, le=7200)):
+        phone_session(session_id)
+        if int(request.headers.get("content-length") or 0) > MAX_PHOTO:
+            raise HTTPException(413, "Photos must be under 20 MB")
+        body = await request.body()
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                link = PhotoLink.model_validate_json(body)
+            except ValidationError:
+                raise HTTPException(422, "Send the photo or a photo link")
+            body = await asyncio.to_thread(fetch_photo, link.url)
+        try:
+            jpeg = await asyncio.to_thread(normalize_photo, body)
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
+            raise HTTPException(422, "The upload is not a readable image")
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = phone_session(session_id)
+            photos = session.get("photos", [])
+            if all(item["seq"] != seq for item in photos):
+                name = f"photo-{seq}.jpg"
+                (store.media_dir(session_id) / name).write_bytes(jpeg)
+                photos = sorted([*photos, {"id": f"snap_photo-{seq}", "seq": seq, "seconds": seconds, "file": name}], key=lambda item: item["seq"])
+                record_upload(session, photos=photos)
+                log.info("Inbound photo saved session=%s seq=%d bytes=%d", session_id, seq, len(jpeg))
+        return {"ok": True}
+
+    @app.post("/api/sessions/{session_id}/notes")
+    async def note(session_id: str, body: NoteInput):
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = phone_session(session_id)
+            notes = session.get("notes", [])
+            if len(notes) >= 5000:
+                raise HTTPException(413, "This capture already has 5000 transcript lines")
+            if all(item["seq"] != body.seq for item in notes):
+                record_upload(session, notes=sorted([*notes, body.model_dump()], key=lambda item: item["seq"]))
+        return {"ok": True}
+
+    @app.post("/api/sessions/{session_id}/finish")
+    async def finish(session_id: str, body: FinishInput):
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = phone_session(session_id)
+            if session.get("capture_finished"):
+                return session
+            received = bool(session.get("audio_parts") or session.get("photos") or session.get("notes"))
+            session = store.update(
+                session_id, capture_finished=True, capture_seconds=body.seconds,
+                expected_audio_parts=body.audio_parts, expected_photos=body.photos,
+                status="uploaded" if received else "failed",
+                progress="Ready to generate report" if received else "Needs attention",
+                error=None if received else "No audio, transcript, or photos reached the Mac for this capture.",
+            )
+            log.info("Inbound capture finished session=%s audio_parts=%d photos=%d notes=%d", session_id,
+                     len(session.get("audio_parts", {})), len(session.get("photos", [])), len(session.get("notes", [])))
+        if received and session.get("auto_report"):
+            processor.submit(session_id)
+        return store.get(session_id)
 
     async def receive_video(session_id: str, video: UploadFile):
         session = get_session(session_id)
@@ -194,7 +342,7 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
     @app.post("/api/sessions/{session_id}/process", status_code=202)
     def process(session_id: str):
         session = get_session(session_id)
-        if not session["has_video"]:
+        if not (session["has_video"] or session.get("audio_parts") or session.get("photos") or session.get("notes")):
             raise HTTPException(409, "Upload the recording first")
         if session["source"] == "sample":
             return session
@@ -213,7 +361,7 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None):
     @app.get("/media/{session_id}/{filename}")
     def media_file(session_id: str, filename: str):
         session = get_session(session_id)
-        allowed = {"recording.mp4"}
+        allowed = {"recording.mp4", "recording.wav", *(item["file"] for item in session.get("photos", []))}
         for item in session["evidence"]:
             allowed.update(item[key] for key in ("file", "clip") if key in item)
         if filename not in allowed:

@@ -23,6 +23,7 @@ const time = (seconds) =>
 const mediaUrl = (name) => `/media/${selectedId}/${encodeURIComponent(name)}`;
 const labels = {
   created: "Awaiting recording",
+  recording: "Receiving from glasses",
   uploaded: "Ready to process",
   processing: "Processing",
   awaiting_key: "API key needed",
@@ -94,14 +95,42 @@ async function selectSession(id) {
   await refresh();
 }
 
+const isPhoto = (item) => item.kind === "image" && item.id.startsWith("snap_");
+const player = () => (selected?.has_video ? $("recording") : $("recording-audio"));
+
 function refs(ids) {
   return ids
     .map((id) => {
       const item = selected.evidence.find((evidence) => evidence.id === id);
       if (!item) return "";
-      return `<button class="source-ref" data-source="${escapeHtml(id)}" title="${item.kind === "image" ? "Frame" : "Transcript interval"}">${item.kind === "image" ? "Frame" : "Audio"} ${time(item.start)}</button>`;
+      const label = isPhoto(item) ? "Photo" : item.kind === "image" ? "Frame" : item.source === "phone" ? "Said" : "Audio";
+      return `<button class="source-ref" data-source="${escapeHtml(id)}" title="${item.kind === "image" ? "Image" : "Transcript interval"}">${label} ${time(item.start)}</button>`;
     })
     .join("");
+}
+
+// Values are the medic's spoken report. They are unconfirmed until a person checks them.
+function handoffCard(card) {
+  const value = (text) =>
+    text === null || text === undefined || text === ""
+      ? '<span class="not-reported">Not reported</span>'
+      : escapeHtml(text);
+  const rows = [
+    ["BP", card.blood_pressure],
+    ["Heart rate", card.heart_rate],
+    ["SpO₂", card.spo2],
+    ["Resp. rate", card.respiratory_rate],
+    ["Age", card.patient_age],
+    ["Sex", card.patient_sex],
+    ["Allergies", card.allergies],
+    ["ETA", card.eta_minutes === null ? null : `${card.eta_minutes} min`],
+  ];
+  return `<section class="handoff"><h2>Handoff card · medic's report</h2>
+    <dl>${rows.map(([label, text]) => `<div><dt>${label}</dt><dd>${value(text)}</dd></div>`).join("")}</dl>
+    <p><b>Injuries</b> ${card.injuries.length ? card.injuries.map(escapeHtml).join("; ") : value(null)}</p>
+    <p><b>Mechanism</b> ${value(card.mechanism)}</p>
+    ${card.missing_fields.length ? `<p class="missing-fields">Missing: ${card.missing_fields.map((field) => escapeHtml(field.replaceAll("_", " "))).join(", ")}</p>` : ""}
+    <p>${refs(card.evidence_ids)}</p></section>`;
 }
 
 function render(session) {
@@ -112,47 +141,61 @@ function render(session) {
     `${session.source === "sample" ? "TRAINING SAMPLE" : session.source.toUpperCase()} · ${new Date(session.created_at).toLocaleString()}`;
   $("sample-label").hidden = session.source !== "sample";
   $("duration").textContent = session.duration ? time(session.duration) : "";
-  const recording = $("recording");
-  const expected = mediaUrl("recording.mp4");
-  if (session.duration && recording.getAttribute("src") !== expected)
-    recording.src = expected;
-  recording.hidden = !session.duration;
+  const audioOnly = session.media === "audio";
+  for (const [id, name, show] of [
+    ["recording", "recording.mp4", session.has_video && session.duration],
+    ["recording-audio", "recording.wav", audioOnly],
+  ]) {
+    const element = $(id);
+    if (show && element.getAttribute("src") !== mediaUrl(name))
+      element.src = mediaUrl(name);
+    element.hidden = !show;
+  }
+  const photos = session.photos || [];
+  const notes = session.notes || [];
+  const received = session.has_video || photos.length || notes.length || Object.keys(session.audio_parts || {}).length;
   $("processing").hidden = session.status === "complete";
   $("process-title").textContent = labels[session.status] || session.status;
   $("process-detail").textContent = session.error || session.progress;
-  $("retry").hidden = !session.has_video || session.status === "processing";
-  $("attach-video").hidden = session.has_video;
+  $("retry").hidden = !received || session.status === "processing";
+  $("attach-video").hidden = session.has_video || session.source === "glasses";
   $("retry").textContent =
     session.status === "uploaded" ? "Generate report" : "Retry processing";
   $("print").hidden = $("export").hidden = !session.report;
   if (session.report) {
     const report = session.report;
     $("report").innerHTML =
-      `<section class="summary"><h2>Handoff summary</h2>${report.summary.map((item) => `<p>${escapeHtml(item.text)} ${refs(item.evidence_ids)}</p>`).join("")}</section>
+      `${report.handoff ? handoffCard(report.handoff) : ""}<section class="summary"><h2>Handoff summary</h2>${report.summary.map((item) => `<p>${escapeHtml(item.text)} ${refs(item.evidence_ids)}</p>`).join("")}</section>
       ${report.sections.map((section) => `<section><h2>${escapeHtml(section.heading)}</h2>${section.statements.map((item) => `<p>${escapeHtml(item.text)} ${refs(item.evidence_ids)}</p>`).join("")}</section>`).join("")}
       <section><h2>Session timeline</h2>${report.timeline.map((item) => `<div class="timeline-row"><div class="timeline-time">${time(item.seconds)}</div><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.detail)} ${refs(item.evidence_ids)}</p></div>`).join("")}</section>
       <section><div class="uncertainties"><h2>Unclear or missing information</h2><ul>${report.uncertainties.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div></section>`;
   } else
     $("report").innerHTML =
       '<div class="empty-report">The report will appear here after processing. Your recording and marked moments are saved locally.</div>';
-  const snaps = session.evidence.filter((item) => item.clip);
+  // Photos show up as they arrive, before the report is processed.
+  const snaps = session.evidence.some(isPhoto)
+    ? session.evidence.filter(isPhoto)
+    : photos.map((photo) => ({ id: photo.id, kind: "image", file: photo.file, start: photo.seconds, label: `Photo ${photo.seq}` }));
   const captions = new Map((session.report?.snap_captions || []).map((item) => [item.evidence_id, item.caption]));
   $("snap-count").textContent = String(snaps.length);
   $("snaps").innerHTML = snaps.length
     ? snaps
         .map(
           (item) =>
-            `<button class="snap" data-evidence="${escapeHtml(item.id)}"><img src="${mediaUrl(item.file)}" alt="${escapeHtml(item.label)}" loading="lazy"><span>${escapeHtml(item.label)}<small>${time(item.start)} · clip ↗</small></span>${captions.has(item.id) ? `<p class="snap-caption">${escapeHtml(captions.get(item.id))}</p>` : ""}</button>`,
+            `<button class="snap" data-evidence="${escapeHtml(item.id)}"><img src="${mediaUrl(item.file)}" alt="${escapeHtml(item.label)}" loading="lazy"><span>${escapeHtml(item.label)}<small>${time(item.start)}${item.clip ? " · clip ↗" : ""}</small></span>${captions.has(item.id) ? `<p class="snap-caption">${escapeHtml(captions.get(item.id))}</p>` : ""}</button>`,
         )
         .join("")
-    : '<p class="muted small">Marked moments appear here after video processing.</p>';
-  $("transcript-count").textContent =
-    `(${session.transcript.length} intervals)`;
+    : '<p class="muted small">Photos and marked moments appear here as they arrive.</p>';
+  const lines = session.transcript.length
+    ? session.transcript
+    : notes.map((note) => ({ id: `note_${note.seq}`, start: note.seconds, end: note.seconds, text: note.text }));
+  $("transcript-count").textContent = `(${lines.length} ${lines.length === 1 ? "entry" : "entries"})`;
+  $("transcript-section").open ||= session.status === "recording" && lines.length > 0;
   $("transcript").innerHTML =
-    session.transcript
+    lines
       .map(
         (item) =>
-          `<div class="transcript-entry"><button class="source-ref" data-source="${item.id}">${time(item.start)}–${time(item.end)}</button><p>${escapeHtml(item.text)}</p></div>`,
+          `<div class="transcript-entry"><button class="source-ref" data-source="${escapeHtml(item.id)}">${time(item.start)}${item.end > item.start ? `–${time(item.end)}` : ""}</button><p>${escapeHtml(item.text)}</p></div>`,
       )
       .join("") ||
     '<p class="muted small">Transcript is available after AI processing.</p>';
@@ -162,28 +205,34 @@ document.addEventListener("click", (event) => {
   const sessionButton = event.target.closest("[data-session]");
   if (sessionButton) void selectSession(sessionButton.dataset.session);
   const source = event.target.closest("[data-source]");
-  if (source) {
-    const item = selected.evidence.find(
-      (entry) => entry.id === source.dataset.source,
-    );
-    $("recording").currentTime = item.start;
-    $("recording").scrollIntoView({ behavior: "smooth", block: "center" });
-    $("recording").play().catch(showError);
+  const sourceItem = source && selected.evidence.find((entry) => entry.id === source.dataset.source);
+  if (sourceItem && isPhoto(sourceItem)) showEvidence(sourceItem);
+  else if (sourceItem && !player().hidden) {
+    player().currentTime = sourceItem.start;
+    player().scrollIntoView({ behavior: "smooth", block: "center" });
+    player().play().catch(showError);
   }
   const snap = event.target.closest("[data-evidence]");
   if (snap) {
-    const item = selected.evidence.find(
-      (entry) => entry.id === snap.dataset.evidence,
+    const photo = (selected.photos || []).find((entry) => entry.id === snap.dataset.evidence);
+    showEvidence(
+      selected.evidence.find((entry) => entry.id === snap.dataset.evidence) ||
+        { id: photo.id, file: photo.file, start: photo.seconds, label: `Photo ${photo.seq}` },
     );
-    $("evidence-title").textContent = `${item.label} · ${time(item.start)}`;
-    const caption = selected.report?.snap_captions?.find((entry) => entry.evidence_id === item.id)?.caption;
-    $("evidence-caption").textContent = caption || "";
-    $("evidence-caption").hidden = !caption;
-    $("evidence-image").src = mediaUrl(item.file);
-    $("evidence-clip").src = mediaUrl(item.clip);
-    $("evidence-dialog").showModal();
   }
 });
+
+function showEvidence(item) {
+  $("evidence-title").textContent = `${item.label} · ${time(item.start)}`;
+  const caption = selected.report?.snap_captions?.find((entry) => entry.evidence_id === item.id)?.caption;
+  $("evidence-caption").textContent = caption || "";
+  $("evidence-caption").hidden = !caption;
+  $("evidence-image").src = mediaUrl(item.file);
+  $("evidence-clip").hidden = !item.clip;
+  if (item.clip) $("evidence-clip").src = mediaUrl(item.clip);
+  else $("evidence-clip").removeAttribute("src");
+  $("evidence-dialog").showModal();
+}
 
 function openImport() {
   attachId = null;
@@ -358,6 +407,8 @@ events.onerror = () => {
   $("connection").textContent = "Reconnecting to server";
 };
 events.addEventListener("update", () => void refresh());
+// Some HTTPS proxies, like Cloudflare quick tunnels, hold back event streams. Poll as well.
+setInterval(() => void refresh(), 3000);
 const initialId = location.hash.slice(1);
 if (/^[a-f0-9-]{36}$/.test(initialId)) void selectSession(initialId);
 else void refresh();

@@ -401,6 +401,47 @@ video {
   display: block;
   max-height: 380px;
 }
+#recording-audio {
+  width: 100%;
+  display: block;
+}
+.handoff dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  gap: 10px;
+  margin: 0 0 16px;
+}
+.handoff dl div {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 10px 12px;
+}
+.handoff dt {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.handoff dd {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: #1f3a2f;
+  font-variant-numeric: tabular-nums;
+}
+.handoff .not-reported {
+  font-size: 12px;
+  font-weight: 400;
+  color: #a08a52;
+}
+.handoff .missing-fields {
+  color: #776646;
+  background: #faf8f0;
+  border: 1px solid #eee7ce;
+  border-radius: 7px;
+  padding: 8px 12px;
+}
 .evidence-panel .panel-heading:not(:first-child) {
   margin-top: 27px;
 }
