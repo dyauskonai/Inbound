@@ -1,7 +1,7 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { MiniappRequestType as Request, MiniappResponseType as ResponseType } from "@mentra/miniapp/background";
 import type { State } from "../src/shared/channels";
-import { commandFrom, findCommands, speechWords } from "../src/shared/commands";
+import { commandFrom, findCommands, speechWords, withoutCommands } from "../src/shared/commands";
 
 const SERVER = "http://192.0.2.1:8000";
 const PHOTO = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9]);
@@ -219,26 +219,39 @@ async function connect({ journal = null as string | null, video = false, failVid
 }
 
 test("command words are found anywhere in a sentence", () => {
-  expect(commandFrom("Okay, start the handoff now.")).toBe("start");
+  expect(commandFrom("Okay, inbound start the handoff now.")).toBe("start");
   expect(commandFrom("Please take a screenshot of the wound")).toBe("snap");
-  expect(commandFrom("That's everything, stop.")).toBe("stop");
-  expect(commandFrom("don't stop compressions")).toBeNull();
+  expect(commandFrom("That's everything, inbound stop.")).toBe("stop");
+  expect(commandFrom("don't snap that")).toBeNull();
   expect(commandFrom("the patient started shaking")).toBeNull();
-  expect(findCommands(speechWords("snap the arm then snap the leg and stop")).map(hit => `${hit.command}${hit.occurrence}`))
+  expect(findCommands(speechWords("snap the arm then snap the leg and inbound stop")).map(hit => `${hit.command}${hit.occurrence}`))
     .toEqual(["snap1", "snap2", "stop1"]);
 });
 
-test("start inside a sentence begins recording from a partial result, with no network wait", async () => {
+test("start and stop need inbound in front, so conversation can't start or end a capture", () => {
+  expect(commandFrom("Okay, start the handoff now.")).toBeNull();
+  expect(commandFrom("we had to stop the bleeding")).toBeNull();
+  expect(commandFrom("start CPR")).toBeNull();
+  expect(commandFrom("Inbound, start.")).toBe("start");
+  // The recognizer may split the word.
+  expect(commandFrom("in bound start the handoff")).toBe("start");
+  expect(commandFrom("in-bound stop")).toBe("stop");
+  expect(commandFrom("don't inbound stop")).toBeNull();
+  expect(withoutCommands("Penicillin, he gets a rash. Inbound stop.")).toBe("Penicillin, he gets a rash.");
+  expect(withoutCommands("we had to stop the bleeding snap")).toBe("we had to stop the bleeding");
+});
+
+test("“inbound start” inside a sentence begins recording from a partial result, with no network wait", async () => {
   const app = await connect();
-  app.voice("okay start the handoff", false);
+  app.voice("okay inbound start the handoff", false);
   expect(app.state.phase).toBe("recording");
   expect(app.state.voiceCommand).toBe("Voice command accepted: start");
   await app.settle();
   const create = app.calls.find(call => call.path === "/api/sessions")!;
   expect((create.body as { id: string }).id).toBe(app.state.capture!.id);
   // Later partials and the final repeat the same word; it fires once.
-  app.voice("okay start the handoff patient is", false);
-  app.voice("okay start the handoff patient is 45", true);
+  app.voice("okay inbound start the handoff patient is", false);
+  app.voice("okay inbound start the handoff patient is 45", true);
   await app.settle();
   expect(app.state.phase).toBe("recording");
   expect(app.calls.filter(call => call.path === "/api/sessions")).toHaveLength(1);
@@ -246,12 +259,12 @@ test("start inside a sentence begins recording from a partial result, with no ne
 
 test("a command word at the end of a partial waits briefly in case the word grows", async () => {
   const app = await connect();
-  app.voice("the patient start", false);
+  app.voice("the patient inbound start", false);
   expect(app.state.phase).toBe("ready");
-  app.voice("the patient started", false);
+  app.voice("the patient inbound started", false);
   await app.settle(400);
   expect(app.state.phase).toBe("ready");
-  app.voice("now start", false);
+  app.voice("now inbound start", false);
   await app.settle(400);
   expect(app.state.phase).toBe("recording");
 });
@@ -272,7 +285,7 @@ test("snap takes a photo and uploads it to the Mac; stop sends audio, transcript
   expect(upload.path).toContain("seq=1");
   expect([...(upload.body as Uint8Array)]).toEqual([...PHOTO]);
   app.voice("bp is 190 over 90 snap the left forearm", true);
-  app.voice("that's all, stop", true);
+  app.voice("that's all, inbound stop", true);
   expect(app.state.phase).toBe("ready");
   await app.settle();
   // "BP is 190 over 90" in the snap sentence is logged as a vital too.
@@ -289,7 +302,7 @@ test("snap takes a photo and uploads it to the Mac; stop sends audio, transcript
 test("two snaps in one sentence take two photos, and finish waits for the last photo", async () => {
   const app = await connect();
   app.button("start");
-  app.voice("snap the arm then snap the leg and stop", true);
+  app.voice("snap the arm then snap the leg and inbound stop", true);
   await app.settle();
   expect(app.requests.filter(request => request.type === Request.PHOTO)).toHaveLength(2);
   expect(app.posts()).toEqual(["/api/sessions", "/notes", "/photos", "/photos", "/finish"]);
@@ -348,17 +361,19 @@ test("a request the Mac refuses is dropped so later uploads continue", async () 
 
 test("negated, repeated, and out-of-place commands are ignored", async () => {
   const app = await connect();
-  app.voice("stop", true);
-  expect(app.state.voiceCommand).toBe("Heard “stop”. Nothing is recording.");
+  app.voice("inbound stop", true);
+  expect(app.state.voiceCommand).toBe("Heard “inbound stop”. Nothing is recording.");
   app.voice("snap", true);
-  expect(app.state.voiceCommand).toBe("Heard “snap”. Say “start” first.");
-  app.voice("start", true);
-  // The recognizer restarts the utterance and repeats the word.
-  app.voice("start", false);
-  app.voice("start now", false);
+  expect(app.state.voiceCommand).toBe("Heard “snap”. Say “inbound start” first.");
+  app.voice("inbound start", true);
+  // The recognizer restarts the utterance and repeats the words.
+  app.voice("inbound start", false);
+  app.voice("inbound start now", false);
   await app.settle();
   expect(app.calls.filter(call => call.path === "/api/sessions")).toHaveLength(1);
-  app.voice("don't stop compressions", true);
+  // "Stop" on its own is an ordinary word, and a negated command doesn't count.
+  app.voice("we had to stop the bleeding", true);
+  app.voice("don't inbound stop", true);
   expect(app.state.phase).toBe("recording");
 });
 
@@ -417,21 +432,21 @@ test("raw audio streams only between start and stop", async () => {
   app.button("stop");
   await app.settle();
   expect(subscribed()).toBe(false);
-  // Voice commands keep listening for the next "start".
-  app.voice("okay start again", true);
+  // Voice commands keep listening for the next "inbound start".
+  app.voice("okay inbound start again", true);
   expect(app.state.phase).toBe("recording");
   expect(subscribed()).toBe(true);
 });
 
 test("start also records video, and stop asks the glasses to upload it to the session", async () => {
   const app = await connect({ video: true });
-  app.voice("okay start the handoff", false);
+  app.voice("okay inbound start the handoff", false);
   await app.settle();
   const id = app.state.capture!.id;
   const start = app.requests.find(request => request.type === Request.VIDEO_RECORDING_START)!;
   expect(start).toMatchObject({ save: true, width: 1280, height: 720 });
   expect(app.state.capture!.video).toMatchObject({ state: "recording", recordingId: "camera-1" });
-  app.voice("okay start the handoff and stop", true);
+  app.voice("okay inbound start the handoff and inbound stop", true);
   await app.settle();
   const stop = app.requests.find(request => request.type === Request.VIDEO_RECORDING_STOP)!;
   expect(stop).toMatchObject({ recordingId: "camera-1", uploadUrl: `${SERVER}/api/sessions/${id}/video` });
@@ -607,7 +622,7 @@ test("the video upload test records a short clip and confirms it reached the ser
   app.checkUpload();
   await app.settle(50);
   // Voice can't start a capture while the test holds the camera.
-  app.voice("start", true);
+  app.voice("inbound start", true);
   expect(app.state.phase).toBe("ready");
   await app.settle(3200);
   const create = app.calls.find(call => call.path === "/api/sessions")!.body as { check: boolean; upload_token: string; id: string };
@@ -805,6 +820,25 @@ test("while the last video is still uploading, the next capture starts its video
 });
 
 const ANSWER_SETTLE = 2000;
+
+test("in a reply, a plain “stop” is part of the answer and “inbound stop” sends it at once", async () => {
+  const app = await connect();
+  app.button("start");
+  app.button("stop");
+  await app.settle();
+  app.holdSpeech();
+  const question = app.erSays("Is the bleeding controlled?");
+  app.tick();
+  await app.settle();
+  app.finishSpeech();
+  await app.settle(AFTER_SPEECH);
+  app.voice("we had to stop the bleeding", true);
+  await app.settle();
+  expect(app.replies()).toEqual([]);
+  app.voice("with a tourniquet inbound stop", true);
+  await app.settle();
+  expect(app.replies()).toMatchObject([{ text: "we had to stop the bleeding with a tourniquet", reply_to: question }]);
+});
 
 test("after a capture, the glasses read the ER's message aloud and send back the medic's spoken answer", async () => {
   const app = await connect();

@@ -1,6 +1,6 @@
 import { MiniappRequestType, registerMiniapp } from "@mentra/miniapp/background";
 import type { Capture, CaptureVideo, Channels, ChatMessage, Command, Photo, State, Vital } from "../shared/channels";
-import { findCommands, isPhoneRelay, serverOrigin, speechWords } from "../shared/commands";
+import { commandPhrases, findCommands, isPhoneRelay, serverOrigin, speechWords, withoutCommands } from "../shared/commands";
 import { findVitals, spokenValue, UNCLEAR, vitalNames, type VitalKind, type VitalReading } from "../shared/vitals";
 
 declare const INBOUND_SERVER: string;
@@ -63,7 +63,7 @@ registerMiniapp<Channels>(async (session) => {
     phase: "ready", server: INBOUND_SERVER, defaultServer: INBOUND_SERVER,
     online: false, aiConfigured: false, camera: false, connected: false, wifi: false, glassesNetwork: "", glassesIp: "", videoUploadBase: "", uploadCheck: "", videoEnabled: true, battery: null, audio: false,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
-    message: "Say “start” to begin. Nothing is recorded or sent until then.", error: "",
+    message: "Say “inbound start” to begin. Nothing is recorded or sent until then.", error: "",
     capture: null, vitals: [], delivered: null, conversation: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
   };
   let hydrated = false;
@@ -281,7 +281,7 @@ registerMiniapp<Channels>(async (session) => {
     state.phase = "recording";
     state.audio = false;
     state.error = "";
-    state.message = "Recording. Say “snap” for a photo, then “stop” to send the report.";
+    state.message = "Recording. Say “snap” for a photo, then “inbound stop” to send the report.";
     diagnostic("capture.started", { session: capture.id, glasses: state.connected });
     void save().catch(problem);
     if (state.videoEnabled && state.camera) startVideo(capture);
@@ -905,7 +905,7 @@ registerMiniapp<Channels>(async (session) => {
     // A sentence that starts a new capture is a command, not an answer.
     if (final && !findCommands(speechWords(text)).some(hit => hit.command === "start")) {
       // Command words steer the reply; the ER doesn't need them in its text.
-      const said = text.replace(/\b(?:snap(?:shot)?|screen ?shot|stop)\b[.,!?]?/gi, " ").replace(/\s+/g, " ").trim();
+      const said = withoutCommands(text);
       if (said) reply.parts.push(said);
       state.conversation = state.conversation && { ...state.conversation, draft: reply.parts.join(" ") };
     }
@@ -1046,21 +1046,21 @@ registerMiniapp<Channels>(async (session) => {
       if (source === "voice") state.voiceCommand = message;
       publish();
     };
-    if (!hydrated) return feedback(`Heard “${command}”. Inbound is still loading.`);
-    // While the medic answers the ER, "snap" adds a photo to the reply and "stop" sends it.
+    if (!hydrated) return feedback(`Heard “${commandPhrases[command]}”. Inbound is still loading.`);
+    // While the medic answers the ER, "snap" adds a photo to the reply and "inbound stop" sends it.
     const answering = !state.capture ? replying : null;
     if (command === "start") {
-      if (state.capture) return feedback("Heard “start”. Already recording.");
-      if (checking) return feedback("Heard “start”. Wait for the video upload test to finish.");
+      if (state.capture) return feedback("Heard “inbound start”. Already recording.");
+      if (checking) return feedback("Heard “inbound start”. Wait for the video upload test to finish.");
       if (answering) void sendReply();
       start();
     } else if (command === "snap") {
       if (answering) replyPhoto(answering);
-      else if (!state.capture) return feedback("Heard “snap”. Say “start” first.");
+      else if (!state.capture) return feedback("Heard “snap”. Say “inbound start” first.");
       else snap();
     } else if (answering) void sendReply();
     else {
-      if (!state.capture) return feedback("Heard “stop”. Nothing is recording.");
+      if (!state.capture) return feedback("Heard “inbound stop”. Nothing is recording.");
       stop();
     }
     diagnostic("command.accepted", { command, source });
@@ -1114,13 +1114,13 @@ registerMiniapp<Channels>(async (session) => {
     if (data.isFinal || hits) diagnostic("speech.transcript", { final: data.isFinal, words: words.length, commands: hits || "none", source: data.source });
     const capture = state.capture;
     // Between captures, what the medic says after an ER message is the reply. Its words go in
-    // before commands run, so a "stop" at the end sends them too.
+    // before commands run, so an "inbound stop" at the end sends them too.
     const reply = !capture && replying && Date.now() >= speakingUntil ? replying : null;
     if (reply && data.isFinal) hearReply(reply, text, true);
     scan(data.isFinal);
     if (reply && !data.isFinal && replying === reply) hearReply(reply, text, false);
     if (data.isFinal) {
-      // The sentence that said "start" or "stop" belongs to that capture too.
+      // The sentence that said "inbound start" or "inbound stop" belongs to that capture too.
       const target = capture ?? state.capture;
       if (target) {
         note(target, text);
@@ -1171,7 +1171,7 @@ registerMiniapp<Channels>(async (session) => {
     await selectServer(serverOrigin(server));
     const capture = state.capture;
     if (capture && !sent.get(capture)) capture.server = state.server;
-    state.message = "Mac connected. Say “start” to record.";
+    state.message = "Mac connected. Say “inbound start” to record.";
   }); });
   session.ui.on("video", ({ enabled }) => {
     if (typeof enabled !== "boolean") return;

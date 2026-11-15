@@ -51,7 +51,7 @@ const severityText = { critical: "text-rose-600 dark:text-rose-300", abnormal: "
 export function Board({ cards, selectedId, onSelect, now }: { cards: SessionCard[]; selectedId: string | null; onSelect: (id: string) => void; now: number }) {
   if (!cards.length) {
     return <div className="rounded-2xl border border-dashed border-slate-300 p-5 text-center text-sm leading-relaxed text-slate-500 dark:border-white/10 dark:text-slate-400">
-      No ambulances on the way.<br />A card appears here the moment a medic says “start”.
+      No ambulances on the way.<br />A card appears here the moment a medic says “inbound start”.
     </div>;
   }
   return <ul className="space-y-2">

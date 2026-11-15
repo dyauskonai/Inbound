@@ -5,6 +5,7 @@ import {
   Laptop, LoaderCircle, MessageSquare, Mic, MicOff, Send, Square, TriangleAlert, Video, VideoOff, Volume2, Wind, X,
 } from "lucide-react";
 import type { Conversation, Photo, State, Vital } from "../shared/channels";
+import { commandPhrases } from "../shared/commands";
 import type { VitalKind } from "../shared/vitals";
 
 type Icon = ComponentType<{ className?: string; strokeWidth?: number }>;
@@ -64,7 +65,7 @@ export function Banner({ tone = "rec", children }: { tone?: Tone; children: Reac
   </div>;
 }
 
-const commands: [string, string][] = [["start", "record"], ["snap", "photo"], ["stop", "send"]];
+const commands: [string, string][] = [[commandPhrases.start, "record"], [commandPhrases.snap, "photo"], [commandPhrases.stop, "send"]];
 
 export function StatusHero({ state, now }: { state: State | null; now: number }) {
   if (!state) {
@@ -93,7 +94,7 @@ export function StatusHero({ state, now }: { state: State | null; now: number })
   const glasses = state.connected && state.camera;
   const listening = glasses && state.voice === "Voice commands ready";
   const [title, detail, HeroIcon] = !glasses ? ["Glasses off", "Connect Mentra Live in the Mentra app.", Glasses]
-    : listening ? ["Listening", "Say “start” to begin", Mic] : ["Voice loading", state.voice, MicOff];
+    : listening ? ["Listening", "Say “inbound start” to begin", Mic] : ["Voice loading", state.voice, MicOff];
   return <Card className="py-6">
     <div className="flex items-center gap-4">
       <div className={clsx("relative grid size-16 shrink-0 place-items-center rounded-full", listening ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" : "bg-amber-500/15 text-amber-600 dark:text-amber-400")}>
@@ -106,8 +107,8 @@ export function StatusHero({ state, now }: { state: State | null; now: number })
       </div>
     </div>
     <div className="mt-5 grid grid-cols-3 gap-2">
-      {commands.map(([word, meaning]) => <div key={word} className="rounded-2xl bg-slate-100 px-3 py-2.5 text-center dark:bg-white/5">
-        <div className="text-[17px] font-semibold">“{word}”</div>
+      {commands.map(([word, meaning]) => <div key={word} className="flex flex-col justify-center rounded-2xl bg-slate-100 px-2 py-2.5 text-center dark:bg-white/5">
+        <div className="text-[17px] font-semibold leading-tight">“{word}”</div>
         <div className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">{meaning}</div>
       </div>)}
     </div>
@@ -277,9 +278,9 @@ export function ActionBar({ state, onCommand }: { state: State | null; onCommand
         : recording
         ? <div className="grid grid-cols-2 gap-3">
           <BigButton icon={Camera} label="Snap" hint="or say “snap”" onClick={() => onCommand("snap")} className="bg-sky-400 text-sky-950 shadow-sky-500/20" />
-          <BigButton icon={Square} label="Stop" hint="or say “stop”" onClick={() => onCommand("stop")} className="bg-rose-600 text-white shadow-rose-600/25" />
+          <BigButton icon={Square} label="Stop" hint="or say “inbound stop”" onClick={() => onCommand("stop")} className="bg-rose-600 text-white shadow-rose-600/25" />
         </div>
-        : <BigButton icon={Mic} label="Start recording" hint="or say “start”" disabled={!state?.server} onClick={() => onCommand("start")} className="w-full bg-emerald-500 text-emerald-950 shadow-emerald-500/20" />}
+        : <BigButton icon={Mic} label="Start recording" hint="or say “inbound start”" disabled={!state?.server} onClick={() => onCommand("start")} className="w-full bg-emerald-500 text-emerald-950 shadow-emerald-500/20" />}
     </div>
   </div>;
 }

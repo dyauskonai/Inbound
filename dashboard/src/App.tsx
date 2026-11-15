@@ -337,7 +337,7 @@ function Arrived({ card, title, onView, onDismiss }: { card: SessionCard; title?
 }
 
 const steps = [
-  { icon: Glasses, title: "The medic says “start”", text: "Voice, vitals and injury photos stream here from the glasses while hands stay on the patient." },
+  { icon: Glasses, title: "The medic says “inbound start”", text: "Voice, vitals and injury photos stream here from the glasses while hands stay on the patient." },
   { icon: HeartPulse, title: "Numbers are double-checked", text: "When two values conflict or a number makes no sense, the glasses ask the medic to repeat it, then read back the value they log." },
   { icon: ClipboardList, title: "Handover before arrival", text: "An IMIST-AMBO handover with NEWS2 colour cues, a source for every statement, and what to ask the crew." },
 ];
@@ -362,7 +362,7 @@ function Welcome({ onRecord, onImport, onSample, sampling, waiting }: { onRecord
             {waiting && <span className="absolute inset-0 rounded-full bg-emerald-500 motion-safe:animate-ring" />}
             <span className={clsx("relative size-2.5 rounded-full", waiting ? "bg-emerald-500" : "bg-amber-500")} />
           </span>
-          {waiting ? "Waiting for ambulances. A patient opens here the moment a medic says “start”." : "Can’t reach the Inbound server. Retrying…"}
+          {waiting ? "Waiting for ambulances. A patient opens here the moment a medic says “inbound start”." : "Can’t reach the Inbound server. Retrying…"}
         </div>
       </div>
     </section>
