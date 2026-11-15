@@ -16,6 +16,10 @@ const result = await Bun.build({
   publicPath: "/static/dist/",
   plugins: [tailwind],
   minify: true,
+  // The handover PDF's code loads only when someone makes one.
+  splitting: true,
+  // jsPDF loads these only to draw HTML and SVG, which the handover doesn't use.
+  external: ["canvg", "dompurify", "html2canvas"],
   define: { "process.env.NODE_ENV": JSON.stringify("production") },
 });
 

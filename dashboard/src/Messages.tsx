@@ -9,8 +9,9 @@ import { Button, Heading, Panel } from "./ui";
 // Dictation uses the browser's own speech recognition, which Chrome, Edge, and Safari have.
 interface Dictation {
   lang: string; interimResults: boolean; continuous: boolean;
-  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
+  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal: boolean }> }) => void) | null;
   onerror: ((event: { error: string }) => void) | null;
+  onaudiostart: (() => void) | null;
   onend: (() => void) | null;
   start(): void; stop(): void; abort(): void;
 }
@@ -18,6 +19,24 @@ const speech = window as unknown as { SpeechRecognition?: new () => Dictation; w
 const Dictation = speech.SpeechRecognition ?? speech.webkitSpeechRecognition;
 // Browsers allow the microphone only on a secure page. On this Mac, localhost counts as one.
 const secureAddress = () => `${location.protocol}//localhost:${location.port}${location.pathname}${location.hash}`;
+
+// A dictated message that ends with "send" goes straight to the medic: "Any allergies? Send." The server's
+// transcription adds punctuation, so "send" can carry a question mark, and "send it" or "send that" work too.
+const SEND = /^(.*?)[\s,;:–—-]*\bsend(?:\s+(?:it|that|this|now|(?:the\s+)?message))?[\s.!?"'”’]*$/i;
+// "…and send it" or "can you send it" asks the medic for something, so it stays in the box to finish.
+const MID_SENTENCE = /\b(?:and|or|to|please|then|i|you|he|she|we|they|can|could|would|will|should|did|do|does|not|don['’]t|can['’]t|won['’]t)$/i;
+
+/** The message to send if the doctor ended with "send": "" when "send" was all they said. */
+function spokenSend(text: string): string | null {
+  const spoken = SEND.exec(text);
+  if (!spoken) return null;
+  const message = spoken[1].trim();
+  if (MID_SENTENCE.test(message)) return null;
+  if (!message) return "";
+  // The question mark often lands after "send": "Any allergies, send?"
+  const asked = text.slice(spoken[1].length).includes("?") && !/[.?!]$/.test(message);
+  return message[0].toUpperCase() + message.slice(1) + (asked ? "?" : "");
+}
 
 const timeOf = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 
@@ -76,37 +95,55 @@ export function CrewMessages({ session, isLive, onPhoto, onSend }: {
       setSending(false);
     }
   };
-  // A dictated message ending with "send" goes straight to the medic.
   const dictated = (text: string) => {
-    setDraft(text);
-    const spoken = /^(.*?)[\s,.]*\bsend(?: it)?[.!]?$/i.exec(text);
-    if (spoken?.[1].trim()) void send(spoken[1].trim());
+    const message = spokenSend(text);
+    setDraft(message ?? text);
+    if (message) void send(message);
   };
 
-  // The browser's own recognizer: the words fill the box as they're heard. Safari refuses it
-  // without asking when macOS Dictation is off, and then the server transcribes instead.
+  // The browser's own recognizer: the words fill the box as they're heard. It listens on through short
+  // pauses, so a beat before "send" doesn't cut it off, and stops as soon as it hears "send". Safari
+  // refuses it without asking when macOS Dictation is off, and then the server transcribes instead.
   const recognize = (typed: string) => {
     const listener = new Dictation!();
     let refused = false;
+    let opened = false;
+    let pause: ReturnType<typeof setTimeout> | undefined;
+    const stopAfter = (ms: number) => {
+      clearTimeout(pause);
+      pause = setTimeout(() => listener.stop(), ms);
+    };
     listener.lang = "en-US";
     listener.interimResults = true;
-    listener.continuous = false;
+    listener.continuous = true;
     listener.onresult = event => {
-      said.current = [typed, Array.from(event.results, result => result[0].transcript).join(" ").trim()].filter(Boolean).join(" ");
+      const heard = Array.from(event.results, result => result[0].transcript).join(" ").replace(/\s+/g, " ").trim();
+      said.current = [typed, heard].filter(Boolean).join(" ");
       setDraft(said.current);
+      if (event.results[event.results.length - 1].isFinal && spokenSend(said.current) !== null) listener.stop();
+      else stopAfter(1500);
     };
     listener.onerror = event => {
       if (["not-allowed", "service-not-allowed", "network", "audio-capture"].includes(event.error)) {
         refused = true;
+        clearTimeout(pause);
         stopDictation.current = null;
         recordOnly.current = true;
         void record(typed);
-      } else if (event.error !== "aborted" && event.error !== "no-speech") setError(`Dictation stopped (${event.error}). Type the message instead.`);
+      } else if (event.error === "no-speech") setError("Didn’t hear anything. Tap the mic and speak.");
+      else if (event.error !== "aborted") setError(`Dictation stopped (${event.error}). Type the message instead.`);
     };
+    listener.onaudiostart = () => { opened = true; };
     listener.onend = () => {
+      clearTimeout(pause);
       if (refused) return;
       stopDictation.current = null;
       setListening(false);
+      // Some recognizers, like Firefox's, can end without ever opening the microphone. The recorder takes over.
+      if (!opened) {
+        recordOnly.current = true;
+        return setError("Didn’t catch that. Tap the mic and say it again.");
+      }
       dictated(said.current);
     };
     said.current = typed;
@@ -114,6 +151,7 @@ export function CrewMessages({ session, isLive, onPhoto, onSend }: {
     setListening(true);
     try {
       listener.start();
+      stopAfter(8000);
     } catch {
       stopDictation.current = null;
       recordOnly.current = true;
@@ -135,24 +173,30 @@ export function CrewMessages({ session, isLive, onPhoto, onSend }: {
     const recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
     const chunks: Blob[] = [];
     recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
-    // A pause after speaking ends the message, as does a minute.
+    // A pause after speaking ends the message, as does a minute. Speech is measured against the room's own
+    // noise, which drops at once and rises slowly, so a busy department doesn't keep the mic open.
     const context = new AudioContext();
     const analyser = context.createAnalyser();
     context.createMediaStreamSource(stream).connect(analyser);
     const samples = new Float32Array(analyser.fftSize);
     const started = Date.now();
+    let heard = false;
     let spoke = false;
+    let floor = Infinity;
     let quietSince = started;
     const stop = () => { if (recorder.state !== "inactive") recorder.stop(); };
     const watch = setInterval(() => {
       analyser.getFloatTimeDomainData(samples);
       const level = Math.sqrt(samples.reduce((sum, value) => sum + value * value, 0) / samples.length);
-      if (level > 0.02) {
-        spoke = true;
-        quietSince = Date.now();
-      }
+      floor = level < floor ? level : floor + (level - floor) * 0.005;
       const now = Date.now();
-      if ((spoke && now - quietSince > 1500) || (!spoke && now - started > 8000) || now - started > 60_000) stop();
+      if (level > 0.02) heard = true;
+      if (level > Math.max(0.02, floor * 2.5)) {
+        spoke = true;
+        quietSince = now;
+      }
+      // Two seconds of quiet leaves time to say "send" after the message.
+      if ((spoke && now - quietSince > 2000) || (!spoke && now - started > 8000) || now - started > 60_000) stop();
     }, 100);
     recorder.onstop = async () => {
       clearInterval(watch);
@@ -160,7 +204,7 @@ export function CrewMessages({ session, isLive, onPhoto, onSend }: {
       void context.close();
       stopDictation.current = null;
       setListening(false);
-      if (!spoke || !chunks.length) return setError("Didn’t hear anything. Tap the mic and speak.");
+      if (!heard || !chunks.length) return setError("Didn’t hear anything. Tap the mic and speak.");
       setTranscribing(true);
       try {
         const data = new FormData();
@@ -237,7 +281,7 @@ export function CrewMessages({ session, isLive, onPhoto, onSend }: {
       </div>
       <form onSubmit={event => { event.preventDefault(); void send(draft); }} className="mt-3 flex gap-2">
         <input value={draft} onChange={event => setDraft(event.target.value)} maxLength={500} aria-label="Message to the medic"
-          placeholder={listening ? "Listening… end with “send” to send" : transcribing ? "Writing down what you said…" : "Ask the medic, or tap the mic…"}
+          placeholder={listening ? "Listening…" : transcribing ? "Writing down what you said…" : "Ask the medic, or tap the mic…"}
           className="h-10 min-w-0 flex-1 rounded-xl bg-white px-3 text-sm ring-1 ring-slate-300 outline-none transition placeholder:text-slate-400 focus:ring-2 focus:ring-emerald-500 dark:bg-white/[0.04] dark:ring-white/10" />
         <button type="button" onClick={dictate} disabled={transcribing} aria-pressed={listening} aria-label={listening ? "Stop dictating" : "Speak the message"}
           title={listening ? "Stop dictating" : "Speak the message. End with “send” to send it."}
@@ -248,6 +292,7 @@ export function CrewMessages({ session, isLive, onPhoto, onSend }: {
         </button>
         <Button type="submit" variant="primary" icon={Send} disabled={sending || !draft.trim()}>Send</Button>
       </form>
+      {listening && <p className="mt-2 text-xs font-medium text-rose-700 dark:text-rose-300">Listening. End with “send” to send it to the medic, or pause to read it over first.</p>}
       {insecure && <p role="alert" className="mt-2 text-sm leading-snug text-amber-700 dark:text-amber-300">
         Browsers allow the microphone only on a secure address. <a href={secureAddress()} className="font-semibold underline">Open the dashboard at localhost</a> on this Mac, then tap the mic again.
       </p>}
