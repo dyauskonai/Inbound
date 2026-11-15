@@ -1,14 +1,15 @@
 import clsx from "clsx";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
-  Ambulance, ArrowRight, ChevronLeft, ClipboardList, MessagesSquare, Download, Glasses, HeartPulse, Mic, Moon, Play, Printer, Sparkles, Sun, TriangleAlert, Upload, Wifi, WifiOff, X,
+  Ambulance, ArrowRight, Check, ChevronLeft, ClipboardList, MessagesSquare, Download, FileDown, Glasses, HeartPulse, LoaderCircle, Mic, Moon, Play, Sparkles, Sun,
+  TriangleAlert, Upload, Wifi, WifiOff, X,
 } from "lucide-react";
 import { setupRecorder } from "../recorder.js";
 import { Board } from "./Board";
 import { api, arrival, identity, inbound, live, type Health, type Session, type SessionCard } from "./data";
 import { ImportDialog, PhotoDialog, RecordDialog } from "./Dialogs";
 import { PatientView, type PhotoView } from "./Patient";
-import { Button, Pill, useNow } from "./ui";
+import { Button, Pill, useNow, type Icon } from "./ui";
 
 const idFromHash = () => {
   const id = location.hash.slice(1);
@@ -27,6 +28,7 @@ export function App() {
   const [importing, setImporting] = useState<{ attach: Session | null } | null>(null);
   const [viewing, setViewing] = useState<{ photo: PhotoView; photos: PhotoView[] } | null>(null);
   const [sampling, setSampling] = useState(false);
+  const [pdf, setPdf] = useState<"making" | "saved" | null>(null);
   const [allEarlier, setAllEarlier] = useState(false);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const control = useRef<{ select: (id: string | null) => void; refresh: () => Promise<void> } | null>(null);
@@ -151,13 +153,24 @@ export function App() {
   };
   const exportJson = () => act(async () => {
     const result = await api(`/api/sessions/${selectedId}/report.json`);
-    const url = URL.createObjectURL(new Blob([JSON.stringify(result, null, 2)], { type: "application/json" }));
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `inbound-${selectedId}.json`;
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    download(new Blob([JSON.stringify(result, null, 2)], { type: "application/json" }), `inbound-${selectedId}.json`);
   });
+  // The handover as a PDF file, made here rather than through the browser's print dialog.
+  const savePdf = async () => {
+    if (!session || pdf === "making") return;
+    setPdf("making");
+    try {
+      const { handoverPdf } = await import("./pdf");
+      const { blob, name } = await handoverPdf(session);
+      download(blob, name);
+      setPdf("saved");
+      setTimeout(() => setPdf(state => (state === "saved" ? null : state)), 4000);
+    } catch (error) {
+      console.error(error);
+      setPdf(null);
+      setNotice("Could not make the handover PDF. Try again.");
+    }
+  };
   const uploadVideo = async (file: File) => {
     const data = new FormData();
     data.append("video", file);
@@ -181,9 +194,12 @@ export function App() {
       <span className="hidden h-5 w-px bg-slate-200 dark:bg-white/10 md:block" />
       <span className="hidden text-sm font-medium text-slate-500 dark:text-slate-400 md:block">Emergency department · Arrivals</span>
       <div className="ml-auto flex items-center gap-1.5 sm:gap-2.5">
-        {session?.report && <div className="hidden items-center gap-1 lg:flex">
-          <Button variant="ghost" icon={Printer} onClick={() => window.print()}>Print</Button>
-          <Button variant="ghost" icon={Download} onClick={() => void exportJson()}>Export</Button>
+        {session?.report && <div className="flex items-center gap-1">
+          <Button variant="ghost" icon={pdf === "making" ? Spinner : pdf === "saved" ? Check : FileDown} disabled={pdf === "making"} onClick={() => void savePdf()}
+            title="Download the handover as a PDF: vitals, IMIST-AMBO, messages with the crew, and photos">
+            {pdf === "making" ? "Making PDF…" : pdf === "saved" ? "PDF saved" : <span><span className="hidden sm:inline">Handover </span>PDF</span>}
+          </Button>
+          <div className="hidden lg:block"><Button variant="ghost" icon={Download} onClick={() => void exportJson()}>Export</Button></div>
         </div>}
         {connected === false
           ? <Pill tone="warn" icon={WifiOff}>Reconnecting</Pill>
@@ -256,6 +272,20 @@ export function App() {
     <RecordDialog />
   </div>;
 }
+
+// Firefox follows a download link only once it's in the page.
+function download(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+const Spinner: Icon = ({ className }) => <LoaderCircle className={clsx(className, "animate-spin")} />;
 
 function Clock() {
   const now = useNow(1000);

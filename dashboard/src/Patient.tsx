@@ -5,7 +5,7 @@ import {
   MessagesSquare, Paperclip, RotateCw, ShieldAlert, Sparkles, TriangleAlert, Video,
 } from "lucide-react";
 import { Eta, minutesAgo, statusLook } from "./Board";
-import { arrival, clock, identity, live, mediaUrl, snapsInVideo, type Evidence, type Session } from "./data";
+import { arrival, clock, identity, live, mediaUrl, snapsInVideo, type Evidence, type Handoff, type Session } from "./data";
 import { CrewMessages } from "./Messages";
 import { UploadBar } from "./Upload";
 import { Button, Heading, Panel, Pill, toneSoft, toneText, useNow, type Tone } from "./ui";
@@ -91,7 +91,7 @@ export function PatientView({ session, now, onPhoto, onRetry, onAttach, onUpload
   </div>;
 }
 
-const sources: Record<Session["source"], string> = {
+export const sourceLabels: Record<Session["source"], string> = {
   glasses: "From the medic’s glasses", mac: "Recorded on this Mac", upload: "Imported recording", sample: "Fictional scenario",
 };
 
@@ -108,7 +108,7 @@ function Header({ session, now }: { session: Session; now: number }) {
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <Pill tone={look.tone} icon={look.icon}>{isLive ? "Live from the ambulance" : look.label}</Pill>
           {session.source === "sample" && <Pill tone="idle">Training sample</Pill>}
-          <span className="text-sm text-slate-500 dark:text-slate-400">{sources[session.source]} · received {minutesAgo(session.created_at, now)}</span>
+          <span className="text-sm text-slate-500 dark:text-slate-400">{sourceLabels[session.source]} · received {minutesAgo(session.created_at, now)}</span>
         </div>
         <h1 className="mt-3 text-[34px] font-semibold leading-[1.08] tracking-[-0.03em] sm:text-[40px]">
           {who}<span className="mx-2.5 text-slate-300 dark:text-slate-600">·</span><span className="text-slate-700 dark:text-slate-200">{what}</span>
@@ -153,13 +153,18 @@ function ProcessingBar({ session, now, onRetry, onAttach }: { session: Session; 
 }
 
 // Only what is actually off. Too many alerts and staff stop reading them.
-function Alerts({ vitals }: { vitals: VitalView[] }) {
-  const items: { tone: Tone; text: string }[] = [];
+export function vitalAlerts(vitals: VitalView[]) {
+  const items: { tone: "critical" | "warn"; text: string }[] = [];
   for (const vital of vitals) {
     const { label, unit } = vitalKinds.find(item => item.kind === vital.kind)!;
     if (vital.candidates.length) items.push({ tone: "warn", text: `${label} not confirmed: ${vital.candidates.join(" or ")}. Check with the crew.` });
-    else if (vital.value && severity(vital.points) === "critical") items.push({ tone: "critical", text: `${label} ${vital.value} ${unit} is in a NEWS2 red band.` });
+    else if (vital.value && severity(vital.points) === "critical") items.push({ tone: "critical", text: `${label} ${vital.value}${unit === "%" ? "" : " "}${unit} is in a NEWS2 red band.` });
   }
+  return items;
+}
+
+function Alerts({ vitals }: { vitals: VitalView[] }) {
+  const items = vitalAlerts(vitals);
   if (!items.length) return null;
   return <div className="grid gap-2 md:grid-cols-2">
     {items.map(item => <div key={item.text} role="alert" className={clsx("flex items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-sm font-semibold ring-1", toneSoft[item.tone], toneText[item.tone])}>
@@ -168,13 +173,13 @@ function Alerts({ vitals }: { vitals: VitalView[] }) {
   </div>;
 }
 
-const severityStyle = {
+export const severityStyle = {
   critical: { tone: "critical" as Tone, label: "NEWS2 red band" },
   abnormal: { tone: "warn" as Tone, label: "Outside normal range" },
   normal: { tone: "ok" as Tone, label: "Normal range" },
   unknown: { tone: "idle" as Tone, label: "" },
 };
-const statusBadge: Record<VitalView["status"], { tone: Tone; label: string }> = {
+export const statusBadge: Record<VitalView["status"], { tone: Tone; label: string }> = {
   confirmed: { tone: "ok", label: "Read back" },
   updated: { tone: "info", label: "Updated" },
   conflict: { tone: "warn", label: "Medic asked to repeat" },
@@ -420,15 +425,19 @@ function Media({ session, isLive, video, audio, onUploadVideo }: {
   </Panel>;
 }
 
-function AskCrew({ session, vitals }: { session: Session; vitals: VitalView[] }) {
-  const [asked, setAsked] = useState<Set<string>>(new Set());
-  const handoff = session.report!.handoff!;
+/** What to ask the crew on arrival: unsettled vitals, then what the handover left out. */
+export function crewQuestions(handoff: Handoff, vitals: VitalView[]) {
   // A vital the medic gave after the report was written is no longer missing.
   const known = new Set(vitals.filter(vital => vital.value).map(vital => vitalKinds.find(item => item.kind === vital.kind)!.field as string));
-  const items = [
+  return [
     ...vitals.filter(vital => vital.candidates.length).map(vital => `${vitalKinds.find(item => item.kind === vital.kind)!.label}: ${vital.candidates.join(" or ")}?`),
     ...handoff.missing_fields.filter(field => fieldLabels[field] && !known.has(field)).map(field => fieldLabels[field]),
   ];
+}
+
+function AskCrew({ session, vitals }: { session: Session; vitals: VitalView[] }) {
+  const [asked, setAsked] = useState<Set<string>>(new Set());
+  const items = crewQuestions(session.report!.handoff!, vitals);
   if (!items.length) return null;
   const toggle = (item: string) => setAsked(current => {
     const next = new Set(current);
