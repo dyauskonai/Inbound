@@ -60,21 +60,21 @@ Inbound lets the paramedic hand over without using their hands, and gives the ER
 ## How it works
 
 ```mermaid
-flowchart LR
+flowchart TB
     glasses["Mentra Live glasses<br/>mic · camera · speaker"]
     phone["Inbound MiniApp<br/>on the medic's phone"]
     server["Inbound server<br/>FastAPI"]
-    openai["OpenAI<br/>transcription · structured reports"]
+    openai["OpenAI<br/>transcription · reports"]
     dashboard["ER dashboard<br/>any browser"]
 
     glasses -->|"voice and photos, Bluetooth"| phone
-    phone -->|"read-back and ER messages"| glasses
-    phone -->|"audio, photos, transcript, vitals"| server
+    phone -->|"read-back, ER messages"| glasses
+    phone -->|"audio, photos, vitals"| server
+    server -->|"ER messages"| phone
     server <--> openai
     server -->|"live updates"| dashboard
     dashboard -->|"questions for the crew"| server
-    server -->|"ER messages"| phone
-    glasses -.->|"scene video over Wi-Fi, optional"| server
+    glasses -.->|"video over Wi-Fi, optional"| server
 ```
 
 - **The phone** ([`app/`](app/)) runs a Mentra MiniApp. On-device speech recognition catches the voice commands and vitals instantly, the glasses' speaker reads values back, and every upload goes through an ordered queue that retries until the server confirms it. If the signal drops, recording carries on.
