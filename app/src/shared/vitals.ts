@@ -4,7 +4,8 @@ export type VitalKind = "bp" | "hr" | "spo2" | "rr";
  * `unclear`: a number was said for the vital but doesn't make sense ("BP one nine over sixty",
  * when the recognizer dropped "-ty"). The glasses ask about it rather than guess.
  */
-export interface VitalReading { kind: VitalKind; value: string; unclear?: boolean }
+/** `heard`: the number behind an unclear reading that was a clear number, just an unlikely one ("sats twenty"). */
+export interface VitalReading { kind: VitalKind; value: string; unclear?: boolean; heard?: string }
 export const UNCLEAR = "unclear";
 
 export const vitalNames: Record<VitalKind, string> = {
@@ -29,8 +30,11 @@ const PHRASES: [string[], VitalKind][] = ([
   [["pulse", "oximetry"], "spo2"], [["oxygen", "saturation"], "spo2"], [["oxygen", "sat"], "spo2"], [["o2", "sat"], "spo2"],
   [["o2", "sats"], "spo2"], [["spo2"], "spo2"], [["sats"], "spo2"], [["sat"], "spo2"], [["saturation"], "spo2"],
   [["oxygen"], "spo2"], [["o2"], "spo2"],
+  // How the recognizer often hears "sats".
+  [["sas"], "spo2"], [["sass"], "spo2"], [["stats"], "spo2"], [["satch"], "spo2"], [["satches"], "spo2"], [["sach"], "spo2"], [["sax"], "spo2"],
   [["heart", "rate"], "hr"], [["h", "r"], "hr"], [["hr"], "hr"], [["pulse"], "hr"], [["heart"], "hr"],
   [["respiratory", "rate"], "rr"], [["resp", "rate"], "rr"], [["breathing", "rate"], "rr"], [["respirations"], "rr"],
+  [["respiration", "rate"], "rr"], [["respiration"], "rr"], [["breathing"], "rr"],
   [["respiratory"], "rr"], [["resp"], "rr"], [["r", "r"], "rr"], [["rr"], "rr"],
 ] as [string[], VitalKind][]).sort((a, b) => b[0].length - a[0].length);
 
@@ -113,14 +117,15 @@ function plausible(kind: VitalKind, first: number, second = 0): boolean {
 function readVital(t: string[], i: number, kind: VitalKind): { vital: VitalReading; next: number } | null {
   const first = readNumber(t, i);
   if (!first || OTHER_UNITS.has(t[first.next])) return null;
-  const unclear = (next: number) => ({ vital: { kind, value: "", unclear: true }, next });
+  const unclear = (next: number, heard?: string) => ({ vital: { kind, value: "", unclear: true, ...(heard ? { heard } : {}) }, next });
   if (kind === "bp") {
     if (!["over", "by", "slash"].includes(t[first.next])) return unclear(first.next);
     const second = readNumber(t, first.next + 1);
-    if (!second || !plausible(kind, first.value, second.value)) return unclear(second ? second.next : first.next + 1);
+    if (!second) return unclear(first.next + 1);
+    if (!plausible(kind, first.value, second.value)) return unclear(second.next, `${first.value}/${second.value}`);
     return { vital: { kind, value: `${first.value}/${second.value}` }, next: second.next };
   }
-  if (!plausible(kind, first.value)) return unclear(first.next);
+  if (!plausible(kind, first.value)) return unclear(first.next, String(first.value));
   return { vital: { kind, value: String(first.value) }, next: t[first.next] === "percent" ? first.next + 1 : first.next };
 }
 

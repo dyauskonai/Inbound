@@ -358,7 +358,6 @@ export function setupRecorder({ api, selectSession }) {
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
-  $("record-mac").onclick = $("welcome-record").onclick = openRecorder;
   $("enable-camera").onclick = enableCamera;
   $("start-capture").onclick = startRecording;
   $("snap-capture").onclick = () => snap();
@@ -379,4 +378,6 @@ export function setupRecorder({ api, selectSession }) {
       event.returnValue = "";
     }
   });
+  // The dashboard's own buttons open the recorder.
+  return { open: openRecorder };
 }

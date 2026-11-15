@@ -51,3 +51,21 @@ test("values are read back the way people say them", () => {
   expect(spokenValue("bp", "90/60")).toBe("90 over 60");
   expect(spokenValue("spo2", "98")).toBe("98 percent");
 });
+
+test("vitals the recognizer mishears or names another way", () => {
+  // A medic's reply on the glasses, as the phone heard it.
+  expect(read("blood pressure one ten over seventy heart rate one sixty sas ninety six respiration fourteen"))
+    .toEqual(["bp 110/70", "hr 160", "spo2 96", "rr 14"]);
+  expect(read("stats ninety eight percent, respiration rate eighteen")).toEqual(["spo2 98", "rr 18"]);
+  // Without a number after it, the word is not a vital.
+  expect(read("her stats were stable on the way")).toEqual([]);
+});
+
+test("more ways the recognizer writes saturation and breathing", () => {
+  expect(read("satch ninety eight")).toEqual(["spo2 98"]);
+  expect(read("breathing at twelve")).toEqual(["rr 12"]);
+  expect(read("he's barely breathing")).toEqual([]);
+  // An unlikely number is unclear, but keeps what was heard so a repeat can confirm it.
+  expect(findVitals("sats twenty")).toEqual([{ kind: "spo2", value: "", unclear: true, heard: "20" }]);
+  expect(findVitals("blood pressure four hundred over fifty")).toEqual([{ kind: "bp", value: "", unclear: true, heard: "400/50" }]);
+});

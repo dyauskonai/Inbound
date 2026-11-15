@@ -1,5 +1,5 @@
 import { MiniappRequestType, registerMiniapp } from "@mentra/miniapp/background";
-import type { Capture, CaptureVideo, Channels, Command, Photo, State, Vital } from "../shared/channels";
+import type { Capture, CaptureVideo, Channels, ChatMessage, Command, Photo, State, Vital } from "../shared/channels";
 import { findCommands, isPhoneRelay, serverOrigin, speechWords } from "../shared/commands";
 import { findVitals, spokenValue, UNCLEAR, vitalNames, type VitalKind, type VitalReading } from "../shared/vitals";
 
@@ -52,6 +52,11 @@ const REPEAT_WAIT_MS = 20000;
 // The glasses' microphone hears their own speaker. Vitals heard while they talk, and just
 // after, are their own read-back.
 const ECHO_TAIL_MS = 2000;
+// Between captures the phone checks for messages from the ER this often.
+const MESSAGE_POLL_MS = 3000;
+// After an ER message the medic has this long to start answering, and a pause this long ends the answer.
+const ANSWER_WAIT_MS = 20000;
+const ANSWER_SETTLE_MS = 1800;
 
 registerMiniapp<Channels>(async (session) => {
   const state: State = {
@@ -59,7 +64,7 @@ registerMiniapp<Channels>(async (session) => {
     online: false, aiConfigured: false, camera: false, connected: false, wifi: false, glassesNetwork: "", glassesIp: "", videoUploadBase: "", uploadCheck: "", videoEnabled: true, battery: null, audio: false,
     voice: "Waiting for the on-device English speech model", voiceCommand: "", heard: "", heardFinal: false,
     message: "Say “start” to begin. Nothing is recorded or sent until then.", error: "",
-    capture: null, vitals: [], delivered: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
+    capture: null, vitals: [], delivered: null, conversation: null, pending: 0, pendingBytes: 0, busy: false, diagnostics: [],
   };
   let hydrated = false;
   let closed = false;
@@ -76,7 +81,8 @@ registerMiniapp<Channels>(async (session) => {
   // `settled`: the medic confirmed or deliberately changed it. A later value replaces it.
   const lastVitals = new Map<VitalKind, { value: string; at: number; settled: boolean }>();
   let speech = Promise.resolve(true);
-  type Repeat = { capture: Capture; kind: VitalKind; candidates: string[]; asks: number; timer?: ReturnType<typeof setTimeout> };
+  // `unlikely`: numbers the medic gave that were clear but out of range, like "sats twenty".
+  type Repeat = { capture: Capture; kind: VitalKind; candidates: string[]; unlikely: string[]; asks: number; timer?: ReturnType<typeof setTimeout> };
   let repeat: Repeat | null = null;
   const repeatQueue: Repeat[] = [];
   let speakingUntil = 0;
@@ -94,6 +100,13 @@ registerMiniapp<Channels>(async (session) => {
   let lastFinal = { text: "", at: 0 };
   let lastStatusCheck = 0;
   const sent = new WeakMap<Capture, number>();
+  // The finished capture the ER can ask about, and the reply the medic is giving.
+  let talk: Capture | null = null;
+  const announced = new Set<string>();
+  type Reply = { capture: Capture; id: string; to: string; question: string; parts: string[]; photo?: Promise<boolean>; wait?: ReturnType<typeof setTimeout>; settle?: ReturnType<typeof setTimeout> };
+  let replying: Reply | null = null;
+  let lastMessageCheck = 0;
+  let checkingMessages = false;
   const outbox: Job[] = [];
   let pumping = false;
 
@@ -341,53 +354,66 @@ registerMiniapp<Channels>(async (session) => {
     }
   }
 
-  async function takePhoto(capture: Capture, photo: Photo, previous: Promise<void>) {
-    const requestedAt = Date.now();
-    // The glasses hold the camera until a photo has fully reached the phone, so transfer
-    // speed decides how soon the next snap can fire. A photo kept on the phone
-    // (`delivery: "local"`) always crosses Bluetooth, about 20 s each on Mentra Live.
-    // With Wi-Fi, the standard path has the glasses upload it to Mentra's cloud in
-    // seconds and falls back to Bluetooth itself; the phone then downloads it.
+  type Shot = { bytes: Uint8Array | null; url?: string; mimeType?: string; local: boolean };
+
+  // One photo from the glasses. They hold the camera until a photo has fully reached the
+  // phone, so transfer speed decides how soon the next one can fire. A photo kept on the
+  // phone (`delivery: "local"`) always crosses Bluetooth, about 20 s each on Mentra Live.
+  // With Wi-Fi, the standard path has the glasses upload it to Mentra's cloud in seconds
+  // and falls back to Bluetooth itself; the phone then downloads it.
+  async function grabPhoto(about: { session: string; number: number }, busy: () => void, previous: Promise<void>): Promise<Shot> {
     let local = !state.wifi;
     const request = () => session.sendRequest<PhotoResult>({
       type: MiniappRequestType.PHOTO, size: "medium", mode: "photo", transferMethod: "auto", compress: "medium",
       sound: true, saveToGallery: false, ...(local ? { delivery: "local" } : {}),
     }, { timeoutMs: PHOTO_TIMEOUT_MS });
+    let result: PhotoResult;
     try {
-      let result: PhotoResult;
-      try {
-        result = await request();
-      } catch (error) {
-        const { code, message } = (error as { code?: string; message?: string }) ?? {};
-        if (/busy/i.test(`${code} ${message}`)) {
-          // The previous photo is still on its way to the phone. Take this one as soon as it arrives.
-          diagnostic("photo.camera_busy", { session: capture.id, number: photo.seq });
-          if (state.capture === capture) state.message = `Photo ${photo.seq} is next. The glasses are still sending the previous photo.`;
-          publish();
-          await previous;
-        } else if (local) throw error;
-        else {
-          // Mentra's cloud was unreachable. Bring the photo over Bluetooth instead.
-          diagnostic("photo.cloud_unavailable", { session: capture.id, number: photo.seq, code });
-          local = true;
-        }
-        result = await request();
+      result = await request();
+    } catch (error) {
+      const { code, message } = (error as { code?: string; message?: string }) ?? {};
+      if (/busy/i.test(`${code} ${message}`)) {
+        // The previous photo is still on its way to the phone. Take this one as soon as it arrives.
+        diagnostic("photo.camera_busy", about);
+        busy();
+        await previous;
+      } else if (local) throw error;
+      else {
+        // Mentra's cloud was unreachable. Bring the photo over Bluetooth instead.
+        diagnostic("photo.cloud_unavailable", { ...about, code });
+        local = true;
       }
-      let bytes: Uint8Array | null = null;
-      if (result?.key) {
-        bytes = await session.blob.bytes(result.key).catch(() => null);
-        void session.blob.delete(result.key).catch(() => {});
-      } else if (result?.photoUrl?.startsWith("http")) bytes = await download(result.photoUrl);
-      const url = [result?.photoUrl, result?.url].find(item => item && /^(?:https?|data):/.test(item));
-      if (!bytes?.length && !url) throw new Error("The glasses did not return the photo.");
+      result = await request();
+    }
+    let bytes: Uint8Array | null = null;
+    if (result?.key) {
+      bytes = await session.blob.bytes(result.key).catch(() => null);
+      void session.blob.delete(result.key).catch(() => {});
+    } else if (result?.photoUrl?.startsWith("http")) bytes = await download(result.photoUrl);
+    const url = [result?.photoUrl, result?.url].find(item => item && /^(?:https?|data):/.test(item));
+    if (!bytes?.length && !url) throw new Error("The glasses did not return the photo.");
+    return { bytes, url, mimeType: result.mimeType, local };
+  }
+
+  // When the phone can't read the image itself, the Mac fetches the link.
+  const photoBody = (shot: Shot) => shot.bytes?.length
+    ? { body: shot.bytes, contentType: shot.mimeType || "image/jpeg" }
+    : { body: JSON.stringify({ url: shot.url }), contentType: "application/json" };
+
+  async function takePhoto(capture: Capture, photo: Photo, previous: Promise<void>) {
+    const requestedAt = Date.now();
+    try {
+      const shot = await grabPhoto({ session: capture.id, number: photo.seq }, () => {
+        if (state.capture === capture) state.message = `Photo ${photo.seq} is next. The glasses are still sending the previous photo.`;
+        publish();
+      }, previous);
       photo.status = "uploading";
-      diagnostic("photo.taken", { session: capture.id, number: photo.seq, elapsedMs: Date.now() - requestedAt, bytes: bytes?.length ?? 0, transfer: local ? "bluetooth" : "wifi" });
+      diagnostic("photo.taken", { session: capture.id, number: photo.seq, elapsedMs: Date.now() - requestedAt, bytes: shot.bytes?.length ?? 0, transfer: shot.local ? "bluetooth" : "wifi" });
       if (state.capture === capture) state.message = `Photo ${photo.seq} taken. Sending it to the Mac.`;
       enqueue({
         capture, label: `photo ${photo.seq}`,
         path: `/api/sessions/${capture.id}/photos?seq=${photo.seq}&seconds=${photo.seconds}`,
-        // When the phone can't read the image itself, the Mac fetches the link.
-        ...(bytes?.length ? { body: bytes, contentType: result.mimeType || "image/jpeg" } : { body: JSON.stringify({ url }), contentType: "application/json" }),
+        ...photoBody(shot),
         done: (ok) => { photo.status = ok ? "saved" : "failed"; publish(); },
       });
     } catch (error) {
@@ -608,6 +634,7 @@ registerMiniapp<Channels>(async (session) => {
     clearTimeout(warmTimer);
     clearTimeout(videoLimit);
     state.delivered = { id: capture.id, server: capture.server, status: "uploading", progress: "Sending the last audio and photos to the Mac…" };
+    converse(capture);
     state.message = "Stopped. Nothing more is recorded or sent. The report will appear on the dashboard.";
     diagnostic("capture.stopped", { session: capture.id, seconds, audio: capture.audioSeq, photos: capture.photos.length, notes: capture.noteSeq });
     void save().catch(problem);
@@ -687,7 +714,7 @@ registerMiniapp<Channels>(async (session) => {
       const unclear = said.some(reading => reading.unclear);
       if (live && (unclear || values.length > 1)) {
         if (clear.length) lastVitals.set(kind, { value: clear.at(-1)!, at: Date.now(), settled: false });
-        askToRepeat(capture, kind, unclear ? [...values, UNCLEAR] : values);
+        askToRepeat(capture, kind, unclear ? [...values, UNCLEAR] : values, said.flatMap(reading => reading.heard ?? []));
         continue;
       }
       for (const value of clear) {
@@ -707,12 +734,19 @@ registerMiniapp<Channels>(async (session) => {
   }
 
   // One clear value answers the question. Another unclear or conflicting answer is asked again.
+  // An unlikely number said again when asked is what the medic means: "sats twenty", twice.
   function answerRepeat(request: Repeat, answer: VitalReading[]) {
     const clear = [...new Set(answer.filter(reading => !reading.unclear).map(reading => reading.value))];
     if (clear.length === 1 && !answer.some(reading => reading.unclear)) {
       confirmRepeat(clear[0]);
       return;
     }
+    const insisted = answer.find(reading => reading.heard && request.unlikely.includes(reading.heard))?.heard;
+    if (insisted && !clear.length) {
+      confirmRepeat(insisted);
+      return;
+    }
+    request.unlikely = [...new Set([...request.unlikely, ...answer.flatMap(reading => reading.heard ?? [])])];
     clearTimeout(request.timer);
     request.candidates = [...new Set([...request.candidates, ...clear, ...(answer.some(reading => reading.unclear) ? [UNCLEAR] : [])])];
     diagnostic("vital.answer_unclear", { session: request.capture.id, kind: request.kind, asks: request.asks });
@@ -725,9 +759,9 @@ registerMiniapp<Channels>(async (session) => {
 
   const lastClear = (candidates: string[]) => candidates.filter(value => value !== UNCLEAR).at(-1) ?? "";
 
-  function askToRepeat(capture: Capture, kind: VitalKind, candidates: string[]) {
+  function askToRepeat(capture: Capture, kind: VitalKind, candidates: string[], unlikely: string[] = []) {
     logVital(capture, kind, lastClear(candidates), "conflict", candidates);
-    const request: Repeat = { capture, kind, candidates, asks: 0 };
+    const request: Repeat = { capture, kind, candidates, unlikely, asks: 0 };
     if (repeat) repeatQueue.push(request);
     else {
       repeat = request;
@@ -797,6 +831,180 @@ registerMiniapp<Channels>(async (session) => {
     });
   }
 
+  // After a capture the ER can ask the medic about it. The glasses read each message aloud
+  // between captures, never into a recording, and the medic's spoken answer is the reply.
+  // Nothing is stored: closing Inbound ends the conversation, and its record stays with the ER.
+  function converse(capture: Capture) {
+    talk = capture;
+    state.conversation = { session: capture.id, current: null, listening: false, draft: "", photo: "none", sent: false };
+  }
+
+  async function checkMessages() {
+    const capture = talk;
+    if (!capture || state.capture || checkingMessages || Date.now() - lastMessageCheck < MESSAGE_POLL_MS) return;
+    // The capture has to reach the Mac before anyone can write about it.
+    if (outbox.some(job => job.capture.id === capture.id && job.label === "session")) return;
+    lastMessageCheck = Date.now();
+    checkingMessages = true;
+    try {
+      const { messages } = await request<{ messages: ChatMessage[] }>(capture.server, `/api/sessions/${capture.id}/messages`);
+      if (talk !== capture || !Array.isArray(messages)) return;
+      for (const message of messages) {
+        if (message.from !== "er" || message.heard_at || announced.has(message.id)) continue;
+        announced.add(message.id);
+        void announce(capture, message);
+      }
+    } catch {
+      // Checked again shortly.
+    } finally {
+      checkingMessages = false;
+    }
+  }
+
+  async function announce(capture: Capture, message: ChatMessage) {
+    diagnostic("message.received", { session: capture.id });
+    state.conversation = state.conversation && { ...state.conversation, current: message, listening: false, draft: "", photo: "none", sent: false };
+    state.message = "Message from the ER. Listen on the glasses.";
+    publish();
+    // "Go ahead": radio for "your turn". Whatever the medic says next is the reply.
+    const spoke = await say(`Message from the E.R.: ${message.text} … Go ahead.`);
+    if (talk !== capture || state.capture) return;
+    if (!spoke) {
+      state.error = "The glasses could not read the ER’s message aloud. It is shown below.";
+      publish();
+      return;
+    }
+    enqueue({ capture, path: `/api/sessions/${capture.id}/messages/${message.id}/heard`, label: "message heard", contentType: "application/json", body: "{}" });
+    listen(capture, message);
+  }
+
+  function listen(capture: Capture, message: ChatMessage) {
+    if (replying) void sendReply();
+    const reply: Reply = { capture, id: crypto.randomUUID(), to: message.id, question: message.text, parts: [] };
+    replying = reply;
+    reply.wait = setTimeout(() => {
+      if (replying !== reply || reply.parts.length || reply.photo) return;
+      replying = null;
+      state.conversation = state.conversation && { ...state.conversation, listening: false };
+      state.message = "No reply heard. Tap Reply to answer the ER.";
+      publish();
+    }, ANSWER_WAIT_MS);
+    state.conversation = state.conversation && { ...state.conversation, listening: true, draft: "", photo: "none" };
+    state.message = "Say your reply to the ER. Say “snap” to add a photo.";
+    publish();
+  }
+
+  // A pause ends the reply. The medic still talking, or a photo still coming, holds it open.
+  function settleReply(reply: Reply, ms = ANSWER_SETTLE_MS) {
+    clearTimeout(reply.settle);
+    reply.settle = setTimeout(() => { if (replying === reply) void sendReply(); }, ms);
+  }
+
+  function hearReply(reply: Reply, text: string, final: boolean) {
+    clearTimeout(reply.wait);
+    // A sentence that starts a new capture is a command, not an answer.
+    if (final && !findCommands(speechWords(text)).some(hit => hit.command === "start")) {
+      // Command words steer the reply; the ER doesn't need them in its text.
+      const said = text.replace(/\b(?:snap(?:shot)?|screen ?shot|stop)\b[.,!?]?/gi, " ").replace(/\s+/g, " ").trim();
+      if (said) reply.parts.push(said);
+      state.conversation = state.conversation && { ...state.conversation, draft: reply.parts.join(" ") };
+    }
+    // A final result follows a partial, so wait longer after one.
+    if (!reply.photo || final) settleReply(reply, final ? ANSWER_SETTLE_MS : ANSWER_SETTLE_MS * 2);
+  }
+
+  function replyPhoto(reply: Reply) {
+    if (reply.photo) return;
+    clearTimeout(reply.wait);
+    clearTimeout(reply.settle);
+    state.conversation = state.conversation && { ...state.conversation, photo: "taking" };
+    state.message = "Taking a photo for the ER…";
+    publish();
+    reply.photo = (async () => {
+      try {
+        const shot = await grabPhoto({ session: reply.capture.id, number: 0 }, () => {}, lastPhoto);
+        enqueue({ capture: reply.capture, label: "reply photo", path: `/api/sessions/${reply.capture.id}/replies/${reply.id}/photo`, ...photoBody(shot) });
+        diagnostic("message.photo", { session: reply.capture.id, transfer: shot.local ? "bluetooth" : "wifi" });
+        state.conversation = state.conversation && { ...state.conversation, photo: "attached" };
+        return true;
+      } catch (error) {
+        state.conversation = state.conversation && { ...state.conversation, photo: "failed" };
+        problem(error, "reply photo");
+        return false;
+      } finally {
+        publish();
+        // Words said while the photo was taken belong to the reply; send after the next pause.
+        if (replying === reply) settleReply(reply);
+      }
+    })();
+  }
+
+  async function sendReply() {
+    const reply = replying;
+    if (!reply) return;
+    clearTimeout(reply.wait);
+    clearTimeout(reply.settle);
+    replying = null;
+    const heard = reply.parts.join(" ");
+    const text = withoutEcho(heard, reply.question);
+    state.conversation = state.conversation && { ...state.conversation, listening: false, draft: text };
+    if (!text && !reply.photo) {
+      state.message = "No reply heard. Tap Reply to answer the ER.";
+      publish();
+      return;
+    }
+    // Vitals in the answer update the patient. The last value given for each counts.
+    // An unlikely but clear number counts too: the read-back lets the medic catch a mishearing.
+    const readings = findVitals(text, expectedVital(reply.question)).map(reading => ({ kind: reading.kind, value: reading.value || reading.heard || "" })).filter(reading => reading.value);
+    const vitals = [...new Map(readings.map(reading => [reading.kind, reading.value])).entries()].map(([kind, value]) => ({ kind, value }));
+    enqueue({
+      capture: reply.capture, path: `/api/sessions/${reply.capture.id}/replies`, label: "reply", contentType: "application/json",
+      body: JSON.stringify({ id: reply.id, text, heard, reply_to: reply.to, vitals }),
+    });
+    for (const { kind, value } of vitals) state.vitals = [...state.vitals.filter(vital => vital.kind !== kind), { kind, value, status: "updated" }];
+    state.message = "Reply sent to the ER.";
+    publish();
+    const photo = await reply.photo;
+    diagnostic("message.replied", { session: reply.capture.id, photo: !!photo, vitals: vitals.length });
+    // Read the vitals back, so the medic catches a mishearing and can answer again.
+    const logged = vitals.map(({ kind, value }) => `${vitalNames[kind]} ${spokenValue(kind, value)}`).join(", ");
+    state.conversation = state.conversation && { ...state.conversation, sent: true };
+    publish();
+    await say(logged ? `${logged[0].toUpperCase()}${logged.slice(1)}, logged.${photo ? " Photo sent." : ""}`
+      : photo ? "Reply sent with the photo." : "Reply sent.");
+    // Answered: the phone lets the message go. The thread stays on the ER's dashboard.
+    if (state.conversation?.current?.id === reply.to && !replying) {
+      state.conversation = { ...state.conversation, current: null, sent: false, draft: "", photo: "none" };
+      publish();
+    }
+  }
+
+  // The glasses' microphone hears them read the question, and the recognizer can join that
+  // to the medic's answer. They always end with "Go ahead", so what comes before it is theirs.
+  // Without it, a start that repeats the question's words is theirs too.
+  function withoutEcho(heard: string, question: string) {
+    const words = heard.split(/\s+/).filter(Boolean);
+    const plain = words.map(word => speechWords(word).join(" "));
+    const ahead = plain.findIndex((word, index) => word === "go" && plain[index + 1] === "ahead");
+    if (ahead >= 0) return words.slice(ahead + 2).join(" ");
+    const asked = new Set(speechWords(`message from the e r er ${question}`));
+    let start = 0;
+    while (start < plain.length && asked.has(plain[start])) start++;
+    return start >= 2 ? words.slice(start).join(" ") : heard;
+  }
+
+  // A question about one vital makes a bare number its answer: "one ten" to "What is the heart rate now?"
+  const asksAbout: [VitalKind, RegExp][] = [
+    ["bp", /blood pressure|\bbp\b/i], ["hr", /heart rate|pulse/i], ["spo2", /oxygen|saturation|\bsats\b|spo2|spo₂/i], ["rr", /resp|breathing/i],
+  ];
+  function expectedVital(question: string): VitalKind | undefined {
+    const kinds = asksAbout.filter(([, pattern]) => pattern.test(question));
+    return kinds.length === 1 ? kinds[0][0] : undefined;
+  }
+
+  // The ER's message on screen, to read again or answer from the phone.
+  const latestQuestion = () => state.conversation?.current ?? undefined;
+
   async function checkDelivered() {
     const delivered = state.delivered;
     if (!delivered || delivered.status === "uploading") return;
@@ -839,14 +1047,19 @@ registerMiniapp<Channels>(async (session) => {
       publish();
     };
     if (!hydrated) return feedback(`Heard “${command}”. Inbound is still loading.`);
+    // While the medic answers the ER, "snap" adds a photo to the reply and "stop" sends it.
+    const answering = !state.capture ? replying : null;
     if (command === "start") {
       if (state.capture) return feedback("Heard “start”. Already recording.");
       if (checking) return feedback("Heard “start”. Wait for the video upload test to finish.");
+      if (answering) void sendReply();
       start();
     } else if (command === "snap") {
-      if (!state.capture) return feedback("Heard “snap”. Say “start” first.");
-      snap();
-    } else {
+      if (answering) replyPhoto(answering);
+      else if (!state.capture) return feedback("Heard “snap”. Say “start” first.");
+      else snap();
+    } else if (answering) void sendReply();
+    else {
       if (!state.capture) return feedback("Heard “stop”. Nothing is recording.");
       stop();
     }
@@ -900,7 +1113,12 @@ registerMiniapp<Channels>(async (session) => {
     const hits = findCommands(words).map(hit => hit.command).join(",");
     if (data.isFinal || hits) diagnostic("speech.transcript", { final: data.isFinal, words: words.length, commands: hits || "none", source: data.source });
     const capture = state.capture;
+    // Between captures, what the medic says after an ER message is the reply. Its words go in
+    // before commands run, so a "stop" at the end sends them too.
+    const reply = !capture && replying && Date.now() >= speakingUntil ? replying : null;
+    if (reply && data.isFinal) hearReply(reply, text, true);
     scan(data.isFinal);
+    if (reply && !data.isFinal && replying === reply) hearReply(reply, text, false);
     if (data.isFinal) {
       // The sentence that said "start" or "stop" belongs to that capture too.
       const target = capture ?? state.capture;
@@ -962,6 +1180,17 @@ registerMiniapp<Channels>(async (session) => {
     publish();
   });
   session.ui.on("checkUpload", () => { void run(checkVideoUpload); });
+  session.ui.on("readAgain", () => {
+    const capture = talk;
+    const message = latestQuestion();
+    if (capture && message && !state.capture && !replying) void announce(capture, message);
+  });
+  session.ui.on("reply", () => {
+    const capture = talk;
+    const message = latestQuestion();
+    if (!capture || !message || state.capture || replying) return;
+    void say("Go ahead.").then(() => { if (talk === capture && !state.capture) listen(capture, message); });
+  });
   session.ui.on("checkSpeaker", () => { void run(async () => {
     state.message = "Speaking through the glasses…";
     publish();
@@ -1027,12 +1256,15 @@ registerMiniapp<Channels>(async (session) => {
     const savedBuild = await session.storage.get("serverBuild");
     state.server = savedServer && !isPhoneRelay(savedServer) && savedBuild === INBOUND_SERVER ? savedServer : INBOUND_SERVER;
     state.videoEnabled = (await session.storage.get("video")) !== "off";
+    // A conversation with the ER never outlives the MiniApp. An earlier build kept its capture.
+    void session.storage.delete("talk").catch(() => {});
     const journal = await session.storage.get("capture");
     if (journal) {
       // The MiniApp closed mid-capture. Queued uploads were lost with it; ask
       // the Mac to build the report from what already arrived.
       const capture = JSON.parse(journal) as Capture;
       state.delivered = { id: capture.id, server: capture.server, status: "uploading", progress: "Finishing the previous capture…" };
+      converse(capture);
       finish(capture, elapsed(capture));
       await session.storage.delete("capture");
       diagnostic("capture.recovered", { session: capture.id });
@@ -1050,6 +1282,16 @@ registerMiniapp<Channels>(async (session) => {
       lastStatusCheck = Date.now();
       void checkDelivered();
     }
+    void checkMessages();
   }, 1000);
-  session.on("disconnect", () => { closed = true; streamAudio(false); resetSpeech(); clearTimeout(warmTimer); clearTimeout(videoLimit); clearInterval(ticker); });
+  session.on("disconnect", () => {
+    closed = true;
+    streamAudio(false);
+    resetSpeech();
+    clearTimeout(warmTimer);
+    clearTimeout(videoLimit);
+    clearTimeout(replying?.wait);
+    clearTimeout(replying?.settle);
+    clearInterval(ticker);
+  });
 });

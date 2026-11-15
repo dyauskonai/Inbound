@@ -54,6 +54,8 @@ async function connect({ journal = null as string | null, video = false, failVid
   const heldVideoStops: (() => void)[] = [];
   const heldSpeech: (() => void)[] = [];
   let serverVideo: object | undefined;
+  // Messages the ER writes about a capture, as the server keeps them.
+  const erMessages: { id: string; from: "er"; text: string; at: string; heard_at: string | null }[] = [];
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = ((callback: () => void, interval: number) => {
     if (interval === 1000) tick = callback;
@@ -153,6 +155,12 @@ async function connect({ journal = null as string | null, video = false, failVid
     if (status) return Response.json({ detail: "Refused" }, { status });
     if (path === "/api/health") return Response.json({ ok: true, ai_configured: true, video_upload_url: tunnelUrl });
     if (path === "/api/sessions") return Response.json({ id: (body as { id: string }).id }, { status: 201 });
+    if (method === "GET" && path.endsWith("/messages")) return Response.json({ messages: erMessages });
+    const heard = /\/messages\/([^/]+)\/heard$/.exec(path);
+    if (heard) {
+      const message = erMessages.find(item => item.id === heard[1]);
+      if (message) message.heard_at = new Date().toISOString();
+    }
     if (method === "GET") return Response.json({ status: macStatus, progress: "Transcribing 0–30 seconds", video: serverVideo });
     return Response.json({ ok: true });
   }) as typeof fetch;
@@ -200,6 +208,13 @@ async function connect({ journal = null as string | null, video = false, failVid
     reject: (endpoint: string, status: number) => rejected.set(endpoint, status),
     photoReply: (value: object | null) => { photoReply = value; },
     macStatus: (value: string) => { macStatus = value; },
+    erSays: (text: string) => {
+      const id = crypto.randomUUID();
+      erMessages.push({ id, from: "er", text, at: new Date().toISOString(), heard_at: null });
+      return id;
+    },
+    replies: () => calls.filter(call => call.path.endsWith("/replies")).map(call => call.body as { id: string; text: string; reply_to: string }),
+    replyPhotos: () => calls.filter(call => /\/replies\/[^/]+\/photo$/.test(call.path)).map(call => call.path),
   };
 }
 
@@ -787,4 +802,118 @@ test("while the last video is still uploading, the next capture starts its video
   await app.settle();
   expect(app.state.capture!.video).toMatchObject({ state: "recording" });
   expect(app.videoStates()).toEqual(["recording", "uploading", "failed", "recording"]);
+});
+
+const ANSWER_SETTLE = 2000;
+
+test("after a capture, the glasses read the ER's message aloud and send back the medic's spoken answer", async () => {
+  const app = await connect();
+  app.button("start");
+  app.button("stop");
+  await app.settle();
+  app.holdSpeech();
+  const question = app.erSays("Any allergies?");
+  app.tick();
+  await app.settle();
+  expect(app.spoken()).toEqual(["Message from the E.R.: Any allergies? … Go ahead."]);
+  // While the glasses read it, the microphone hears them, not the medic.
+  app.voice("message from the e r any allergies go ahead", true);
+  await app.settle();
+  app.finishSpeech();
+  await app.settle(AFTER_SPEECH);
+  expect(app.posts()).toContain(`/messages/${question}/heard`);
+  expect(app.state.conversation).toMatchObject({ listening: true });
+  app.voice("no known", false);
+  app.voice("no known allergies", true);
+  await app.settle(ANSWER_SETTLE);
+  expect(app.replies()).toEqual([{ id: expect.any(String), text: "no known allergies", heard: "no known allergies", reply_to: question, vitals: [] }]);
+  expect(app.state.conversation).toMatchObject({ listening: false, sent: true, draft: "no known allergies", current: { id: question } });
+  expect(app.spoken().at(-1)).toBe("Reply sent.");
+  // Once the glasses confirm, the phone lets the message go. No history stays on it.
+  app.finishSpeech();
+  await app.settle();
+  expect(app.state.conversation?.current).toBeNull();
+  expect(app.storage.has("talk")).toBe(false);
+});
+
+test("saying snap while answering the ER adds a fresh photo to the reply", async () => {
+  const app = await connect();
+  app.button("start");
+  app.button("stop");
+  await app.settle();
+  const question = app.erSays("Can you send a closer photo of the forearm?");
+  app.tick();
+  await app.settle(AFTER_SPEECH);
+  app.voice("here is the forearm snap", true);
+  await app.settle(ANSWER_SETTLE);
+  const [reply] = app.replies();
+  expect(reply).toMatchObject({ text: "here is the forearm", reply_to: question });
+  expect(app.replyPhotos()).toHaveLength(1);
+  expect(app.replyPhotos()[0].endsWith(`/replies/${reply.id}/photo`)).toBe(true);
+  expect(app.spoken().at(-1)).toBe("Reply sent with the photo.");
+});
+
+test("the ER's messages wait while a capture records, and are read once it stops", async () => {
+  const app = await connect();
+  app.button("start");
+  app.button("stop");
+  await app.settle();
+  app.button("start");
+  await app.settle();
+  app.erSays("What was the last blood pressure?");
+  app.tick();
+  await app.settle();
+  expect(app.spoken()).toEqual([]);
+  app.button("stop");
+  await app.settle();
+  app.tick();
+  await app.settle();
+  expect(app.spoken()).toEqual(["Message from the E.R.: What was the last blood pressure? … Go ahead."]);
+});
+
+test("a reply loses the glasses' own voice, and the vitals in it update the patient and are read back", async () => {
+  const app = await connect();
+  app.button("start");
+  app.button("stop");
+  await app.settle();
+  const question = app.erSays("Can you give me an updated set of vitals?");
+  app.tick();
+  await app.settle(AFTER_SPEECH);
+  // The recognizer joined the end of the glasses' question to the medic's answer.
+  app.voice("from the er can you give me an updated set of idols go ahead yeah it's one hundred over eighty now", true);
+  await app.settle(ANSWER_SETTLE);
+  expect(app.replies()).toEqual([{
+    id: expect.any(String), reply_to: question, text: "yeah it's one hundred over eighty now",
+    heard: "from the er can you give me an updated set of idols go ahead yeah it's one hundred over eighty now",
+    vitals: [{ kind: "bp", value: "100/80" }],
+  }]);
+  expect(app.spoken().at(-1)).toBe("Blood pressure 100 over 80, logged.");
+  expect(app.state.vitals).toContainEqual({ kind: "bp", value: "100/80", status: "updated" });
+});
+
+test("a bare number answers a question about one vital", async () => {
+  const app = await connect();
+  app.button("start");
+  app.button("stop");
+  await app.settle();
+  app.erSays("What is the heart rate now?");
+  app.tick();
+  await app.settle(AFTER_SPEECH);
+  app.voice("the heart rate now one ten", true);
+  await app.settle(ANSWER_SETTLE);
+  expect(app.replies()[0]).toMatchObject({ text: "one ten", vitals: [{ kind: "hr", value: "110" }] });
+  expect(app.spoken().at(-1)).toBe("Heart rate 110, logged.");
+});
+
+test("an unlikely vital the medic repeats when asked is what they mean: it is logged and read back", async () => {
+  const app = await connect();
+  app.button("start");
+  app.voice("sats twenty", true);
+  await app.settle();
+  expect(app.spoken()).toEqual(["Can you repeat the oxygen saturation?"]);
+  await app.settle(AFTER_SPEECH);
+  app.voice("twenty percent", true);
+  await app.settle();
+  expect(app.vitalPosts().at(-1)).toMatchObject({ kind: "spo2", value: "20", status: "confirmed" });
+  expect(app.spoken().at(-1)).toBe("Oxygen saturation 20 percent, logged.");
 });

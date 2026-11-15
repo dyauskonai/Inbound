@@ -13,6 +13,8 @@
 node_modules/
 .expo/
 dist/
+# The ER dashboard's build is committed: the server serves it without Bun.
+!dashboard/dist/
 app/dist 2/
 web-build/
 coverage/

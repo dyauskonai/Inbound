@@ -15,7 +15,9 @@ from server.store import Store
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    # The server loads .env; no test reaches OpenAI unless it sets a fake key and stubs the call.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     app = create_app(tmp_path, video_wait=0.3)
     with TestClient(app) as client:
         yield client
@@ -230,6 +232,7 @@ def test_internet_server_requires_the_token_or_dashboard_password(tmp_path, monk
     import uuid
     monkeypatch.setenv("INBOUND_DEVICE_TOKEN", "device-secret")
     monkeypatch.setenv("INBOUND_DASHBOARD_PASSWORD", "er-password")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with TestClient(create_app(tmp_path)) as client:
         device = {"Authorization": "Bearer device-secret"}
         dashboard = {"Authorization": "Basic " + base64.b64encode(b"er:er-password").decode()}
@@ -248,6 +251,12 @@ def test_internet_server_requires_the_token_or_dashboard_password(tmp_path, monk
         assert client.post(f"{path}/process", headers=device).status_code == 401
         assert client.get("/", headers=dashboard).status_code == 200
         assert client.get("/api/sessions", headers=dashboard).json()[0]["id"] == sid
+        # The ER writes to the medic; the phone reads the messages and replies, nothing more.
+        question = client.post(f"{path}/messages", json={"text": "Any allergies?"}, headers=dashboard).json()
+        assert client.post(f"{path}/messages", json={"text": "Any allergies?"}, headers=device).status_code == 401
+        assert client.get(f"{path}/messages", headers=device).json()["messages"][0]["id"] == question["id"]
+        assert client.post(f"{path}/messages/{question['id']}/heard", headers=device).status_code == 200
+        assert client.post(f"{path}/replies", json={"id": str(uuid.uuid4()), "text": "None known"}, headers=device).status_code == 200
 
 
 def test_cloud_transcript_gets_back_the_snap_the_phone_heard():
@@ -391,6 +400,7 @@ def test_confirmed_vitals_decide_the_handoff_card(client, monkeypatch):
             # The model read the first, misheard value.
             handoff={"patient_age": None, "patient_sex": None, "blood_pressure": "190/60", "heart_rate": "110", "spo2": None,
                      "respiratory_rate": None, "injuries": [], "mechanism": None, "allergies": None, "eta_minutes": None,
+               "consciousness": None, "treatment": [], "medications": None, "history": None,
                      "missing_fields": ["blood_pressure", "spo2", "respiratory_rate"], "evidence_ids": ["note_1"]})
         return validate_evidence(result, evidence)
     monkeypatch.setattr(ai, "generate_report", report)
@@ -472,6 +482,7 @@ def test_invented_citations_are_dropped_instead_of_failing_the_report():
                 {"id": "snap_photo-1", "kind": "image", "start": 4, "end": 4, "file": "photo-1.jpg"}]
     handoff = {"patient_age": None, "patient_sex": None, "blood_pressure": None, "heart_rate": None, "spo2": None,
                "respiratory_rate": None, "injuries": [], "mechanism": None, "allergies": None, "eta_minutes": None,
+               "consciousness": None, "treatment": [], "medications": None, "history": None,
                "missing_fields": [], "evidence_ids": ["audio_0", "vital_99"]}
     report = GeneratedReport(
         title="t", summary=[{"text": "Supported.", "evidence_ids": ["audio_0", "photo_1"]}, {"text": "Invented.", "evidence_ids": ["note_9"]}],
@@ -491,6 +502,7 @@ def test_report_generation_retries_once_when_nothing_is_supported(monkeypatch):
     from server.models import GeneratedReport
     handoff = {"patient_age": None, "patient_sex": None, "blood_pressure": None, "heart_rate": None, "spo2": None,
                "respiratory_rate": None, "injuries": [], "mechanism": None, "allergies": None, "eta_minutes": None,
+               "consciousness": None, "treatment": [], "medications": None, "history": None,
                "missing_fields": [], "evidence_ids": []}
     replies = [GeneratedReport(title="t", summary=[{"text": "x", "evidence_ids": ["nope"]}], sections=[], timeline=[], uncertainties=[], snap_captions=[], handoff=handoff),
                GeneratedReport(title="t", summary=[{"text": "y", "evidence_ids": ["audio_0"]}], sections=[], timeline=[], uncertainties=[], snap_captions=[], handoff=handoff)]
@@ -499,3 +511,148 @@ def test_report_generation_retries_once_when_nothing_is_supported(monkeypatch):
     monkeypatch.setattr(ai, "client", lambda: fake)
     report = ai.generate_report(Path("."), [{"id": "audio_0", "kind": "transcript", "start": 0, "end": 30}])
     assert len(calls) == 2 and report["summary"][0]["text"] == "y"
+
+
+def test_sample_patient_fills_the_dashboard_and_stays_current(client):
+    sample = client.post("/api/sample").json()
+    assert sample["source"] == "sample" and sample["status"] == "complete"
+    handoff = sample["report"]["handoff"]
+    assert handoff["confirmed_fields"] == ["blood_pressure"] and handoff["updated_fields"] == ["heart_rate"]
+    assert [vital["status"] for vital in sample["vitals"] if vital["kind"] == "hr"] == ["heard", "updated"]
+    # Every source the report cites exists, so each one on the dashboard opens something.
+    report = sample["report"]
+    cited = {source for item in [*report["summary"], *report["timeline"], handoff, *(s for section in report["sections"] for s in section["statements"])]
+             for source in item["evidence_ids"]}
+    assert cited <= {item["id"] for item in sample["evidence"]}
+    assert {caption["evidence_id"] for caption in report["snap_captions"]} == {item["id"] for item in sample["evidence"] if item["id"].startswith("snap_")}
+    assert client.post("/api/sample").json()["id"] == sample["id"]
+    # An outdated sample makes way for a fresh one and leaves the board.
+    client.app.state.store.update(sample["id"], sample_version=1)
+    fresh = client.post("/api/sample").json()
+    assert fresh["id"] != sample["id"]
+    assert [item["id"] for item in client.get("/api/sessions").json() if item["source"] == "sample"] == [fresh["id"]]
+
+
+def test_upload_meter_counts_video_bytes_as_they_arrive():
+    import asyncio
+    from server.uploads import UploadMeter
+    sid, uploads, seen = "0a1b2c3d-0000-4000-8000-000000000000", {}, []
+
+    async def app(scope, receive, send):
+        while (await receive())["more_body"]:
+            seen.append(dict(uploads[sid]))
+    messages = iter([{"type": "http.request", "body": b"a" * 400, "more_body": True},
+                     {"type": "http.request", "body": b"b" * 600, "more_body": False}])
+
+    async def receive():
+        return next(messages)
+    scope = {"type": "http", "method": "POST", "path": f"/api/sessions/{sid}/video", "headers": [(b"content-length", b"1000")]}
+    asyncio.run(UploadMeter(app, uploads)(scope, receive, None))
+    assert (seen[0]["received"], seen[0]["total"]) == (400, 1000)
+    assert sid not in uploads
+
+
+def test_dashboard_estimates_a_video_upload_the_tunnel_hides(client):
+    import uuid
+    sid = str(uuid.uuid4())
+    assert client.post("/api/sessions", json={"id": sid, "source": "glasses"}).status_code == 201
+    assert client.post(f"/api/sessions/{sid}/video-state", json={"state": "recording", "offset": 1.5}).status_code == 200
+    assert client.get(f"/api/sessions/{sid}").json()["video_upload"] is None
+    assert client.post(f"/api/sessions/{sid}/video-state", json={"state": "uploading"}).status_code == 200
+    upload = client.get(f"/api/sessions/{sid}").json()["video_upload"]
+    assert upload["mode"] == "estimated" and upload["total"] > 0 and upload["rate"] > 0 and upload["since"]
+    assert next(card for card in client.get("/api/sessions").json() if card["id"] == sid)["video_upload"] == upload
+    # A repeated "uploading" keeps the time the upload began.
+    client.post(f"/api/sessions/{sid}/video-state", json={"state": "uploading"})
+    assert client.get(f"/api/sessions/{sid}").json()["video_upload"]["since"] == upload["since"]
+
+
+def test_the_er_and_the_medic_message_about_a_capture(client):
+    import uuid
+    sid = str(uuid.uuid4())
+    assert client.post("/api/sessions", json={"id": sid, "source": "glasses"}).status_code == 201
+    sent = client.post(f"/api/sessions/{sid}/messages", json={"text": " Can you send a closer photo of the left forearm? "})
+    assert sent.status_code == 201
+    question = sent.json()
+    assert (question["from"], question["text"], question["heard_at"]) == ("er", "Can you send a closer photo of the left forearm?", None)
+    # The glasses read it aloud; the medic answers with a photo and words, which can arrive in either order.
+    assert client.post(f"/api/sessions/{sid}/messages/{question['id']}/heard").status_code == 200
+    answer = str(uuid.uuid4())
+    assert client.post(f"/api/sessions/{sid}/replies/{answer}/photo", content=jpeg(), headers={"Content-Type": "image/jpeg"}).status_code == 200
+    for _ in range(2):
+        assert client.post(f"/api/sessions/{sid}/replies", json={"id": answer, "text": "Swelling now reaches the wrist.", "reply_to": question["id"]}).status_code == 200
+    messages = client.get(f"/api/sessions/{sid}/messages").json()["messages"]
+    assert [message["from"] for message in messages] == ["er", "medic"]
+    assert messages[0]["heard_at"]
+    assert (messages[1]["text"], messages[1]["reply_to"], messages[1]["photo"]) == ("Swelling now reaches the wrist.", question["id"], f"reply-{answer}.jpg")
+    assert client.get(f"/media/{sid}/reply-{answer}.jpg").status_code == 200
+    card = next(card for card in client.get("/api/sessions").json() if card["id"] == sid)
+    assert (card["message_count"], card["reply_count"]) == (2, 1)
+    # Only a capture from the glasses has a medic to ask, and message IDs are checked.
+    imported = client.post("/api/sessions", json={"title": "Imported", "source": "upload"}).json()
+    assert client.post(f"/api/sessions/{imported['id']}/messages", json={"text": "Hello"}).status_code == 409
+    assert client.post(f"/api/sessions/{sid}/messages/not-an-id/heard").status_code == 404
+    assert client.post(f"/api/sessions/{sid}/replies/{question['id']}", json={}).status_code in (404, 405)
+    assert client.post(f"/api/sessions/{sid}/replies", json={"id": question["id"], "text": "overwrite"}).status_code == 409
+    assert client.post(f"/api/sessions/{sid}/replies/{answer}/photo", content=b"not an image", headers={"Content-Type": "image/jpeg"}).status_code == 422
+
+
+def test_a_reply_updates_the_vitals_and_fills_in_the_handoff_card(client, monkeypatch):
+    import time
+    import uuid
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setattr(ai, "read_reply", lambda question, heard, card: {"answer": "BP is now 100/80. Resp rate 18.", "handoff": {
+        "patient_age": None, "patient_sex": None, "mechanism": None, "injuries": ["Abrasions to both knees"], "consciousness": None,
+        "treatment": [], "allergies": "Penicillin", "medications": None, "history": None, "eta_minutes": 5}})
+    sid = str(uuid.uuid4())
+    assert client.post("/api/sessions", json={"id": sid, "source": "glasses"}).status_code == 201
+    client.app.state.store.update(
+        sid, capture_seconds=40, vitals=[{"seq": 1, "kind": "bp", "value": "120/80", "status": "confirmed", "seconds": 5, "candidates": ["120/80"]}],
+        report={"title": "Car accident", "summary": [], "sections": [], "timeline": [], "uncertainties": [],
+                "handoff": {"blood_pressure": "120/80", "respiratory_rate": None, "injuries": ["Scalp laceration"], "allergies": None,
+                            "confirmed_fields": ["blood_pressure"], "missing_fields": ["respiratory_rate", "allergies"]}})
+    question = client.post(f"/api/sessions/{sid}/messages", json={"text": "Can you give me an updated set of vitals?"}).json()
+    answer = {"id": str(uuid.uuid4()), "text": "yeah it's one hundred over eighty now, resp rate eighteen", "reply_to": question["id"],
+              "heard": "from the er can you give me an updated set of idols go ahead yeah it's one hundred over eighty now, resp rate eighteen",
+              "vitals": [{"kind": "bp", "value": "100/80"}, {"kind": "rr", "value": "18"}]}
+    for _ in range(2):  # A retried reply logs nothing twice.
+        assert client.post(f"/api/sessions/{sid}/replies", json=answer).status_code == 200
+    session = client.get(f"/api/sessions/{sid}").json()
+    assert [(vital["seq"], vital["kind"], vital["value"], vital["status"], vital["candidates"]) for vital in session["vitals"]] == [
+        (1, "bp", "120/80", "confirmed", ["120/80"]), (2, "bp", "100/80", "updated", ["120/80"]), (3, "rr", "18", "updated", [])]
+    handoff = session["report"]["handoff"]
+    assert (handoff["blood_pressure"], handoff["respiratory_rate"]) == ("100/80", "18")
+    assert (handoff["updated_fields"], handoff["confirmed_fields"], handoff["missing_fields"]) == (["blood_pressure", "respiratory_rate"], [], [])
+    # The AI's tidy version is for reading; the words as heard stay beside it.
+    for _ in range(100):
+        reply = client.get(f"/api/sessions/{sid}/messages").json()["messages"][-1]
+        if reply.get("clean"):
+            break
+        time.sleep(0.02)
+    assert reply["clean"] == "BP is now 100/80. Resp rate 18."
+    assert reply["heard"].startswith("from the er") and reply["text"].startswith("yeah")
+    # What the medic said fills in the handoff card, marked with the reply it came from.
+    handoff = client.get(f"/api/sessions/{sid}").json()["report"]["handoff"]
+    assert handoff["injuries"] == ["Scalp laceration", "Abrasions to both knees"] and handoff["allergies"] == "Penicillin"
+    assert handoff["missing_fields"] == [] and handoff["eta_minutes"] == 5 and handoff["eta_at"]
+    assert set(handoff["reply_sources"]) == {"injuries", "allergies", "eta_minutes"} and handoff["reply_sources"]["allergies"]["id"] == answer["id"]
+    assert reply["added"] == {"injuries": ["Abrasions to both knees"], "allergies": "Penicillin", "eta_minutes": 5}
+    # A rewritten report keeps it: the processor applies the replies again.
+    from server.processing import apply_reply_updates
+    fresh = {"handoff": {"injuries": ["Scalp laceration"], "allergies": None, "missing_fields": ["allergies"]}}
+    apply_reply_updates(fresh, client.get(f"/api/sessions/{sid}").json()["handoff_updates"])
+    assert fresh["handoff"]["injuries"] == ["Scalp laceration", "Abrasions to both knees"] and fresh["handoff"]["missing_fields"] == []
+    # Saying the same value again is not a change.
+    client.post(f"/api/sessions/{sid}/replies", json={**answer, "id": str(uuid.uuid4()), "vitals": [{"kind": "bp", "value": "100/80"}]})
+    assert len(client.get(f"/api/sessions/{sid}").json()["vitals"]) == 3
+
+
+def test_the_doctor_can_dictate_a_message(client, monkeypatch):
+    assert client.post("/api/dictation", files={"audio": ("dictation", b"audio", "audio/mp4")}).status_code == 503
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    heard = []
+    monkeypatch.setattr(ai, "dictate", lambda path: heard.append(path.suffix) or "Does the patient have any allergies?")
+    # Safari records AAC in an MP4 box; the transcription service needs to know that from the name.
+    reply = client.post("/api/dictation", files={"audio": ("dictation", b"audio", "audio/mp4")})
+    assert reply.json() == {"text": "Does the patient have any allergies?"} and heard == [".m4a"]
+    assert client.post("/api/dictation", files={"audio": ("dictation", b"", "audio/webm")}).status_code == 422
