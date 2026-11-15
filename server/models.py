@@ -36,6 +36,27 @@ class NoteInput(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
+class MessageInput(BaseModel):
+    """A question from the ER, read aloud to the medic on the glasses."""
+    text: str = Field(min_length=1, max_length=500)
+
+
+class ReplyVital(BaseModel):
+    kind: Literal["bp", "hr", "spo2", "rr"]
+    value: str = Field(pattern=r"^\d{1,3}(/\d{1,3})?$")
+
+
+class ReplyInput(BaseModel):
+    """The medic's spoken answer. The phone makes the ID, so a retried reply is saved once."""
+    id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    text: str = Field(default="", max_length=2000)
+    # What the recognizer heard, before the phone took out the glasses' own voice.
+    heard: str = Field(default="", max_length=2000)
+    reply_to: str | None = Field(default=None, pattern=r"^[a-f0-9-]{36}$")
+    # Vitals in the answer. The glasses read them back, and they update the patient.
+    vitals: list[ReplyVital] = Field(default_factory=list, max_length=4)
+
+
 class VideoFrame(BaseModel):
     """A snap the camera refused while recording video; its still comes from the video."""
     seq: int = Field(ge=1, le=40)
@@ -110,6 +131,28 @@ class SnapCaption(BaseModel):
     model_config = ConfigDict(extra="forbid")
     evidence_id: str
     caption: str
+
+
+class HandoffUpdate(BaseModel):
+    """What one of the medic's replies adds to the handoff card. Null or empty: the reply didn't say."""
+    model_config = ConfigDict(extra="forbid")
+    patient_age: str | None
+    patient_sex: str | None
+    mechanism: str | None
+    injuries: list[str]
+    consciousness: str | None
+    treatment: list[str]
+    allergies: str | None
+    medications: str | None
+    history: str | None
+    eta_minutes: int | None
+
+
+class ReplyReading(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # The medic's answer, tidied for a doctor to read.
+    answer: str
+    handoff: HandoffUpdate
 
 
 class Handoff(BaseModel):

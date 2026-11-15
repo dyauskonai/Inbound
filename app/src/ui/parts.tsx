@@ -2,9 +2,9 @@ import clsx from "clsx";
 import type { ComponentType, ReactNode } from "react";
 import {
   Camera, Check, CircleAlert, CloudUpload, Droplets, Ear, FileCheck2, Gauge, Glasses, HeartPulse, Hourglass,
-  Laptop, LoaderCircle, Mic, MicOff, Square, TriangleAlert, Video, VideoOff, Wind, X,
+  Laptop, LoaderCircle, MessageSquare, Mic, MicOff, Send, Square, TriangleAlert, Video, VideoOff, Volume2, Wind, X,
 } from "lucide-react";
-import type { Photo, State, Vital } from "../shared/channels";
+import type { Conversation, Photo, State, Vital } from "../shared/channels";
 import type { VitalKind } from "../shared/vitals";
 
 type Icon = ComponentType<{ className?: string; strokeWidth?: number }>;
@@ -225,6 +225,38 @@ export function DeliveredCard({ delivered, onOpen }: { delivered: NonNullable<St
   </Card>;
 }
 
+const timeOf = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const photoNotes: Partial<Record<Conversation["photo"], string>> = {
+  taking: "Taking the photo…", attached: "Photo attached.", failed: "The photo failed. Say “snap” to try again.",
+};
+const roomy = "flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-slate-100 text-base font-semibold ring-1 ring-slate-200 transition active:scale-[0.99] dark:bg-white/5 dark:ring-white/10";
+
+// The ER's message being read on the glasses, and the medic's spoken reply. No history: it
+// clears once the reply is sent, and the conversation stays on the ER's dashboard.
+export function MessageCard({ conversation, onReadAgain, onReply }: { conversation: Conversation; onReadAgain: () => void; onReply: () => void }) {
+  const message = conversation.current;
+  if (!message) return null;
+  const photo = photoNotes[conversation.photo];
+  return <Card className={clsx("space-y-3", conversation.listening && "ring-2 ring-sky-500/60 dark:ring-sky-400/50")}>
+    <Eyebrow icon={MessageSquare}>Message from the ER · {timeOf(message.at)}</Eyebrow>
+    <p className="text-[19px] font-semibold leading-snug">{message.text}</p>
+    {conversation.sent
+      ? <div role="status" className="flex items-center gap-2 rounded-2xl bg-emerald-500/12 p-4 text-base font-semibold text-emerald-800 ring-1 ring-emerald-500/25 dark:bg-emerald-400/10 dark:text-emerald-200">
+        <Check className="size-5" strokeWidth={2.5} />Reply sent to the ER
+      </div>
+      : conversation.listening
+      ? <div role="status" className="rounded-2xl bg-sky-500/12 p-4 ring-1 ring-sky-500/25 dark:bg-sky-400/10">
+        <div className="flex items-center gap-2 text-base font-semibold text-sky-800 dark:text-sky-200"><Mic className="size-5 motion-safe:animate-beat" />Listening for your reply</div>
+        <p className="mt-1 text-[15px] leading-snug">{conversation.draft || "Speak now. Say “snap” to add a photo."}</p>
+        {photo && <p className="mt-1 text-sm font-medium text-slate-600 dark:text-slate-300">{photo}</p>}
+      </div>
+      : <div className="grid grid-cols-2 gap-2">
+        <button onClick={onReadAgain} className={roomy}><Volume2 className="size-5" />Read again</button>
+        <button onClick={onReply} className={roomy}><Mic className="size-5" />Reply</button>
+      </div>}
+  </Card>;
+}
+
 function BigButton({ icon: Icon, label, hint, className, disabled, onClick }: { icon: Icon; label: string; hint: string; className: string; disabled?: boolean; onClick: () => void }) {
   return <button disabled={disabled} onClick={onClick} className={clsx("flex h-[104px] flex-col items-center justify-center gap-1 rounded-[28px] shadow-lg transition active:scale-[0.98] disabled:opacity-40", className)}>
     <span className="flex items-center gap-2.5 text-[26px] font-semibold tracking-tight"><Icon className="size-7" strokeWidth={2.5} />{label}</span>
@@ -234,9 +266,15 @@ function BigButton({ icon: Icon, label, hint, className, disabled, onClick }: { 
 
 export function ActionBar({ state, onCommand }: { state: State | null; onCommand: (command: "start" | "snap" | "stop") => void }) {
   const recording = state?.phase === "recording";
+  const answering = !recording && state?.conversation?.listening;
   return <div className="fixed inset-x-0 bottom-0 z-20 bg-gradient-to-t from-slate-100 from-60% to-transparent px-4 pt-8 pb-[max(1rem,env(safe-area-inset-bottom))] dark:from-[#05080f]">
     <div className="mx-auto max-w-md">
-      {recording
+      {answering
+        ? <div className="grid grid-cols-2 gap-3">
+          <BigButton icon={Camera} label="Photo" hint="or say “snap”" onClick={() => onCommand("snap")} className="bg-sky-400 text-sky-950 shadow-sky-500/20" />
+          <BigButton icon={Send} label="Send" hint="or just pause" onClick={() => onCommand("stop")} className="bg-emerald-500 text-emerald-950 shadow-emerald-500/20" />
+        </div>
+        : recording
         ? <div className="grid grid-cols-2 gap-3">
           <BigButton icon={Camera} label="Snap" hint="or say “snap”" onClick={() => onCommand("snap")} className="bg-sky-400 text-sky-950 shadow-sky-500/20" />
           <BigButton icon={Square} label="Stop" hint="or say “stop”" onClick={() => onCommand("stop")} className="bg-rose-600 text-white shadow-rose-600/25" />

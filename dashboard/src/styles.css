@@ -83,6 +83,16 @@
   }
 }
 
+/* An upload whose progress is not known yet. */
+@keyframes slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
 @utility animate-ring {
   animation: ring 1.8s cubic-bezier(0.2, 0.6, 0.3, 1) infinite;
 }

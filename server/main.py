@@ -8,12 +8,13 @@ import json
 import logging
 import os
 import sqlite3
+import tempfile
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
@@ -23,16 +24,20 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import ValidationError
 
 from .auth import AccessControl, TunnelGuard
-from . import media
-from .models import AudioPart, CaptureInput, FinishInput, NoteInput, PhotoLink, SessionInput, VideoState, VitalInput
-from .processing import Processor
-from .store import Store
+from . import ai, media
+from .models import AudioPart, CaptureInput, FinishInput, MessageInput, NoteInput, PhotoLink, ReplyInput, SessionInput, VideoState, VitalInput
+from .processing import REPLY_FIELDS, VITAL_FIELDS, Processor, apply_reply_updates, shown
+from .store import Store, now
+from .uploads import UploadMeter
 
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 MAX_UPLOAD = 512 * 1024 * 1024
 MAX_PHOTO = 20 * 1024 * 1024
+MAX_DICTATION = 10 * 1024 * 1024
+DICTATION_TYPES = {"audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".m4a", "audio/webm": ".webm", "audio/ogg": ".ogg",
+                   "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/mpeg": ".mp3"}
 log = logging.getLogger("uvicorn.error")
 
 
@@ -89,6 +94,9 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
         processor.pool.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="Inbound", lifespan=lifespan)
+    # Bytes of each video upload in progress, by session. Innermost, so refused requests never count.
+    uploads: dict[str, dict] = {}
+    app.add_middleware(UploadMeter, uploads=uploads)
     app.add_middleware(AccessControl, device_token=os.getenv("INBOUND_DEVICE_TOKEN") or None,
                        dashboard_password=os.getenv("INBOUND_DASHBOARD_PASSWORD") or None)
     public_url = os.getenv("INBOUND_PUBLIC_URL") or None
@@ -105,6 +113,7 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
         app.add_middleware(TunnelGuard, verify=upload_token_ok)
     app.state.store = store
     app.state.processor = processor
+    app.state.uploads = uploads
 
     def get_session(session_id):
         try:
@@ -153,6 +162,41 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
             await socket.send_json({"error": str(error)})
             await socket.close()
 
+    # Measured over a phone hotspot through the tunnel: the glasses' 720p video, and its upload speed.
+    VIDEO_BYTES_PER_SECOND = 640_000
+    UPLOAD_BYTES_PER_SECOND = 140_000
+
+    def upload_rates() -> tuple[float, float]:
+        """The latest internet upload's video bitrate and upload speed."""
+        for item in store.list():
+            video = item.get("video") or {}
+            if video.get("upload_seconds") and video.get("bytes") and video.get("duration"):
+                return video["bytes"] / video["duration"], video["bytes"] / video["upload_seconds"]
+        return VIDEO_BYTES_PER_SECOND, UPLOAD_BYTES_PER_SECOND
+
+    def video_upload(session: dict) -> dict | None:
+        """How far the glasses' video upload has got: counted once its bytes reach this server,
+        estimated while the tunnel holds them, which it does until the upload is complete."""
+        video = session.get("video") or {}
+        if session.get("has_video") or video.get("state") == "ready":
+            return None
+        meter = uploads.get(session["id"])
+        if meter and meter["total"]:
+            return {"mode": "measured", "received": meter["received"], "total": meter["total"],
+                    "since": datetime.fromtimestamp(meter["started"], timezone.utc).isoformat()}
+        if video.get("state") != "uploading":
+            return None
+        if not video.get("uploading_at"):
+            quiet = datetime.now(timezone.utc) - datetime.fromisoformat(session["updated_at"]) > timedelta(minutes=20)
+            return None if quiet else {"mode": "unknown"}
+        # The phone gives up on an upload after 15 minutes. Past that, the glasses are not sending.
+        if datetime.now(timezone.utc) - datetime.fromisoformat(video["uploading_at"]) > timedelta(minutes=20):
+            return None
+        bitrate, rate = upload_rates()
+        started = datetime.fromisoformat(session["created_at"]).timestamp() + (video.get("offset") or 0)
+        recorded = max(1.0, datetime.fromisoformat(video["uploading_at"]).timestamp() - started)
+        return {"mode": "estimated", "since": video["uploading_at"], "total": round(recorded * bitrate), "rate": round(rate)}
+
     @app.get("/api/sessions")
     def sessions():
         # Enough for the ER's incoming board: who, what, ETA, and the latest vitals.
@@ -161,6 +205,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
             return {key: item.get(key) for key in ("id", "title", "source", "created_at", "updated_at", "status", "duration", "progress", "capture_seconds")} | {
                 "headline": report.get("title"), "handoff": report.get("handoff"), "vitals": item.get("vitals", []),
                 "photo_count": len(item.get("photos", [])), "video_state": (item.get("video") or {}).get("state"),
+                "video_upload": video_upload(item), "message_count": len(item.get("messages", [])),
+                "reply_count": sum(message["from"] == "medic" for message in item.get("messages", [])),
             }
         return [card(item) for item in store.list() if not item.get("hidden")]
 
@@ -186,7 +232,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
 
     @app.get("/api/sessions/{session_id}")
     def session(session_id: str):
-        return get_session(session_id)
+        session = get_session(session_id)
+        return {**session, "video_upload": video_upload(session)}
 
     @app.post("/api/sessions/{session_id}/live/start")
     async def live_start(session_id: str):
@@ -327,6 +374,184 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
                 record_upload(session, vitals=sorted([*vitals, body.model_dump()], key=lambda item: item["seq"]))
         return {"ok": True}
 
+    # The ER asks the medic about a capture. The glasses read each message aloud, and the
+    # medic's spoken answer comes back, with a photo if they say "snap" while answering.
+    def conversation(session_id: str) -> dict:
+        session = get_session(session_id)
+        if session["source"] != "glasses":
+            raise HTTPException(409, "Only captures from the glasses can message the medic.")
+        return session
+
+    def message_id(value: str) -> str:
+        try:
+            if str(UUID(value)) == value:
+                return value
+        except ValueError:
+            pass
+        raise HTTPException(404, "Message not found")
+
+    def save_reply(session: dict, reply_id: str, **changes) -> None:
+        messages = session.get("messages", [])
+        existing = next((item for item in messages if item["id"] == reply_id), None)
+        if existing and existing["from"] != "medic":
+            raise HTTPException(409, "That ID belongs to a message from the ER.")
+        # A reply's photo can arrive before its words, and either can be retried.
+        reply = {**(existing or {"id": reply_id, "from": "medic", "text": "", "at": now(), "reply_to": None, "photo": None}), **changes}
+        store.update(session["id"], messages=[reply if item is existing else item for item in messages] if existing else [*messages, reply])
+
+    @app.post("/api/sessions/{session_id}/messages", status_code=201)
+    async def send_message(session_id: str, body: MessageInput):
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = conversation(session_id)
+            message = {"id": str(uuid4()), "from": "er", "text": body.text.strip(), "at": now(), "heard_at": None}
+            store.update(session_id, messages=[*session.get("messages", []), message])
+        log.info("Inbound message to the medic session=%s", session_id)
+        return message
+
+    @app.get("/api/sessions/{session_id}/messages")
+    def messages(session_id: str):
+        return {"messages": conversation(session_id).get("messages", [])}
+
+    @app.post("/api/sessions/{session_id}/messages/{read_id}/heard")
+    async def message_heard(session_id: str, read_id: str):
+        read_id = message_id(read_id)
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = conversation(session_id)
+            messages = session.get("messages", [])
+            if not any(item["id"] == read_id and item["from"] == "er" for item in messages):
+                raise HTTPException(404, "Message not found")
+            store.update(session_id, messages=[{**item, "heard_at": item.get("heard_at") or now()} if item["id"] == read_id else item for item in messages])
+        return {"ok": True}
+
+    def log_reply_vitals(session: dict, vitals: list[dict]) -> dict:
+        """Vitals the medic gives in a reply update the patient, as a change they made on purpose."""
+        logged = session.get("vitals", [])
+        latest = {item["kind"]: item["value"] for item in logged if item["value"] and item["status"] not in {"conflict", "unconfirmed"}}
+        seq = max((item["seq"] for item in logged), default=0)
+        added = []
+        for vital in vitals:
+            if latest.get(vital["kind"]) == vital["value"]:
+                continue
+            seq += 1
+            added.append({"seq": seq, "kind": vital["kind"], "value": vital["value"], "status": "updated", "seconds": session.get("capture_seconds") or 0,
+                          "candidates": [latest[vital["kind"]]] if vital["kind"] in latest else []})
+            latest[vital["kind"]] = vital["value"]
+        if not added:
+            return {}
+        changes = {"vitals": [*logged, *added]}
+        # The handover card follows, so the report, its print, and its export agree with the tiles.
+        report = session.get("report") or {}
+        if report.get("handoff"):
+            handoff = dict(report["handoff"])
+            for vital in added:
+                field = VITAL_FIELDS[vital["kind"]]
+                handoff[field] = shown(vital["kind"], vital["value"])
+                handoff["updated_fields"] = sorted({*handoff.get("updated_fields", []), field})
+                for key in ("missing_fields", "confirmed_fields", "unconfirmed_fields"):
+                    handoff[key] = [item for item in handoff.get(key, []) if item != field]
+            changes["report"] = {**report, "handoff": handoff}
+        return changes
+
+    # The AI reads each reply after it is saved: a tidy version to show, and what it adds to the
+    # handoff card, so the doctor never fills the card in by hand. The raw words show meanwhile.
+    reading: set[asyncio.Task] = set()
+
+    async def read_reply(session_id: str, reply_id: str):
+        session = get_session(session_id)
+        messages = session.get("messages", [])
+        answer = next((item for item in messages if item["id"] == reply_id), None)
+        if not answer or not answer.get("text"):
+            return
+        question = next((item["text"] for item in messages if item["id"] == answer.get("reply_to")), "")
+        handoff = (session.get("report") or {}).get("handoff") or {}
+        card = {field: handoff.get(field) for field in REPLY_FIELDS}
+        try:
+            result = await asyncio.to_thread(ai.read_reply, question, answer.get("heard") or answer["text"], card)
+        except Exception as error:  # The reply and its vitals are saved either way.
+            log.warning("Inbound reply reading failed session=%s error=%s", session_id, error)
+            return
+        fields = {field: value for field, value in result["handoff"].items() if value not in (None, "", [])}
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = conversation(session_id)
+            save_reply(session, reply_id, clean=result["answer"][:2000], added=fields)
+            if fields:
+                update = {"reply_id": reply_id, "at": answer["at"], "fields": fields}
+                changes = {"handoff_updates": [*(item for item in session.get("handoff_updates", []) if item["reply_id"] != reply_id), update]}
+                report = session.get("report") or {}
+                if report.get("handoff"):
+                    report = {**report, "handoff": dict(report["handoff"])}
+                    apply_reply_updates(report, [update])
+                    changes["report"] = report
+                store.update(session_id, **changes)
+                log.info("Inbound reply filled the handoff session=%s fields=%s", session_id, ",".join(fields))
+
+    @app.post("/api/sessions/{session_id}/replies")
+    async def reply(session_id: str, body: ReplyInput):
+        vitals = [vital.model_dump() for vital in body.vitals]
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            session = conversation(session_id)
+            existing = next((item for item in session.get("messages", []) if item["id"] == body.id), None)
+            # A retried reply must not log its vitals twice.
+            logged = bool(existing and existing.get("vitals_logged"))
+            changes = log_reply_vitals(session, vitals) if vitals and not logged else {}
+            if changes:
+                session = store.update(session_id, **changes)
+            save_reply(session, body.id, text=body.text.strip(), heard=body.heard.strip() or body.text.strip(), vitals=vitals,
+                       vitals_logged=logged or bool(vitals), **({"reply_to": body.reply_to} if body.reply_to else {}))
+        if body.text.strip() and os.getenv("OPENAI_API_KEY") and not (existing and existing.get("clean")):
+            task = asyncio.create_task(read_reply(session_id, body.id))
+            reading.add(task)
+            task.add_done_callback(reading.discard)
+        log.info("Inbound reply from the medic session=%s vitals=%d", session_id, len(vitals))
+        return {"ok": True}
+
+    @app.post("/api/sessions/{session_id}/replies/{reply_id}/photo")
+    async def reply_photo(session_id: str, reply_id: str, request: Request):
+        reply_id = message_id(reply_id)
+        conversation(session_id)
+        if int(request.headers.get("content-length") or 0) > MAX_PHOTO:
+            raise HTTPException(413, "Photos must be under 20 MB")
+        body = await request.body()
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                link = PhotoLink.model_validate_json(body)
+            except ValidationError:
+                raise HTTPException(422, "Send the photo or a photo link")
+            body = await asyncio.to_thread(fetch_photo, link.url)
+        try:
+            jpeg = await asyncio.to_thread(normalize_photo, body)
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
+            raise HTTPException(422, "The upload is not a readable image")
+        async with upload_locks.setdefault(session_id, asyncio.Lock()):
+            name = f"reply-{reply_id}.jpg"
+            (store.media_dir(session_id) / name).write_bytes(jpeg)
+            save_reply(conversation(session_id), reply_id, photo=name)
+        log.info("Inbound reply photo saved session=%s bytes=%d", session_id, len(jpeg))
+        return {"ok": True}
+
+    # The doctor speaks a message instead of typing it, in browsers whose own speech recognition is
+    # missing or switched off: Safari without macOS Dictation, or Firefox.
+    @app.post("/api/dictation")
+    async def dictation(audio: UploadFile = File()):
+        if not os.getenv("OPENAI_API_KEY"):
+            raise HTTPException(503, "Dictation needs the OpenAI key on the server. Type the message instead.")
+        data = await audio.read(MAX_DICTATION + 1)
+        await audio.close()
+        if len(data) > MAX_DICTATION:
+            raise HTTPException(413, "Keep a spoken message under a minute.")
+        if not data:
+            raise HTTPException(422, "No audio arrived. Tap the mic and try again.")
+        suffix = DICTATION_TYPES.get((audio.content_type or "").split(";")[0].strip(), ".webm")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / f"dictation{suffix}"
+            path.write_bytes(data)
+            try:
+                text = await asyncio.to_thread(ai.dictate, path)
+            except Exception as error:
+                log.warning("Inbound dictation failed error=%s", error)
+                raise HTTPException(502, "The message couldn't be transcribed. Try again, or type it.")
+        return {"text": text}
+
     @app.post("/api/sessions/{session_id}/finish")
     async def finish(session_id: str, body: FinishInput):
         async with upload_locks.setdefault(session_id, asyncio.Lock()):
@@ -369,12 +594,15 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
             video = session.get("video") or {}
             if video.get("state") != "ready":
                 offset = {"offset": body.offset} if body.offset is not None else {}
-                session = store.update(session_id, video={**video, "state": body.state, **offset, "detail": body.detail})
+                # When the glasses began uploading, to estimate an upload the tunnel hides until it ends.
+                since = {"uploading_at": now()} if body.state == "uploading" and video.get("state") != "uploading" else {}
+                session = store.update(session_id, video={**video, "state": body.state, **offset, **since, "detail": body.detail})
         if body.state == "failed" and session["status"] == "waiting_video":
             processor.submit(session_id)
         return {"ok": True}
 
-    async def receive_video(session_id: str, video: UploadFile):
+    async def receive_video(session_id: str, video: UploadFile, tunnel: bool = False):
+        arrived = datetime.now(timezone.utc)
         session = get_session(session_id)
         log.info("Inbound upload received session=%s source=%s", session_id, session["source"])
         lock = upload_locks.setdefault(session_id, asyncio.Lock())
@@ -415,6 +643,9 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
                         raise HTTPException(422, str(error))
                     details = {**(session.get("video") or {}), "state": "ready", "file": "video.mp4",
                                "duration": info["duration"], "has_audio": info["has_audio"], "bytes": size, "detail": None}
+                    # How long the internet upload took, which estimates the next one.
+                    if tunnel and details.get("uploading_at"):
+                        details["upload_seconds"] = round((arrived - datetime.fromisoformat(details["uploading_at"])).total_seconds(), 1)
                     store.update(session_id, video=details, video_hash=checksum)
                     log.info("Inbound glasses video saved session=%s bytes=%d duration=%.2f", session_id, size, info["duration"])
                     added = await asyncio.to_thread(attach_frames, session_id)
@@ -444,8 +675,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
         return await receive_video(requestId, video)
 
     @app.post("/api/sessions/{session_id}/video")
-    async def upload(session_id: str, video: UploadFile = File()):
-        return await receive_video(session_id, video)
+    async def upload(session_id: str, request: Request, video: UploadFile = File()):
+        return await receive_video(session_id, video, tunnel="cf-ray" in request.headers)
 
     @app.post("/api/sessions/{session_id}/process", status_code=202)
     def process(session_id: str):
@@ -469,7 +700,8 @@ def create_app(data_dir: Path | None = None, live_port: int | None = None, video
     @app.get("/media/{session_id}/{filename}")
     def media_file(session_id: str, filename: str):
         session = get_session(session_id)
-        allowed = {"recording.mp4", "recording.wav", "video.mp4", *(item["file"] for item in session.get("photos", []))}
+        allowed = {"recording.mp4", "recording.wav", "video.mp4", *(item["file"] for item in session.get("photos", [])),
+                   *(item["photo"] for item in session.get("messages", []) if item.get("photo"))}
         for item in session["evidence"]:
             allowed.update(item[key] for key in ("file", "clip") if key in item)
         if filename not in allowed:

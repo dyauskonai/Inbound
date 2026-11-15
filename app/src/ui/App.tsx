@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { ChevronDown, ClipboardCopy, Laptop, Settings2, Video, Volume2, Wifi } from "lucide-react";
 import type { Command, State } from "../shared/channels";
-import { ActionBar, Banner, Card, DeliveredCard, Eyebrow, HeardPanel, Header, PhotoStrip, StatusHero, VitalsGrid } from "./parts";
+import { ActionBar, Banner, Card, DeliveredCard, Eyebrow, HeardPanel, Header, MessageCard, PhotoStrip, StatusHero, VitalsGrid } from "./parts";
 
 // Voice first: the phone is a glanceable status screen with big, glove-friendly backups.
 export function App() {
@@ -22,6 +22,7 @@ export function App() {
     <Header state={state} />
     {problem && <Banner>{problem}</Banner>}
     <StatusHero state={state} now={now} />
+    {state && !recording && state.conversation && <MessageCard conversation={state.conversation} onReadAgain={() => mentra.send("readAgain", {})} onReply={() => mentra.send("reply", {})} />}
     {state && recording && <VitalsGrid vitals={state.vitals} live />}
     {state && !recording && state.delivered && <DeliveredCard delivered={state.delivered} onOpen={() => mentra.send("report", {})} />}
     {state && <HeardPanel state={state} />}

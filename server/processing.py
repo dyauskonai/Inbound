@@ -2,6 +2,7 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from threading import Lock
 
 from openai import APIConnectionError, AuthenticationError, RateLimitError
@@ -33,6 +34,36 @@ def vital_evidence(vital: dict) -> dict:
     }[vital["status"]]
     return {"id": f"vital_{vital['seq']}", "kind": "vital", "start": vital["seconds"], "end": vital["seconds"],
             "vital": vital["kind"], "status": vital["status"], "text": text}
+
+
+REPLY_LISTS = {"injuries", "treatment"}
+# What a medic's reply can fill in on the handoff card. Vitals come through their own read-back instead.
+REPLY_FIELDS = ("patient_age", "patient_sex", "mechanism", "injuries", "consciousness", "treatment", "allergies", "medications", "history", "eta_minutes")
+
+
+def apply_reply_updates(report: dict, updates: list[dict]) -> None:
+    """What the medic told the ER in replies after the capture fills in the handoff card, newest last."""
+    handoff = report.get("handoff")
+    if not handoff or not updates:
+        return
+    sources = dict(handoff.get("reply_sources") or {})
+    for update in updates:
+        for field, value in update["fields"].items():
+            if field in REPLY_LISTS:
+                listed = handoff.get(field) or []
+                known = {item.lower() for item in listed}
+                new = [item for item in value if item.lower() not in known]
+                if not new:
+                    continue
+                handoff[field] = [*listed, *new]
+            else:
+                handoff[field] = value
+            if field == "eta_minutes":
+                # An ETA counts from when the medic gave it.
+                handoff["eta_at"] = (datetime.fromisoformat(update["at"]) + timedelta(minutes=value)).isoformat()
+            sources[field] = {"id": update["reply_id"], "at": update["at"]}
+            handoff["missing_fields"] = [item for item in handoff.get("missing_fields", []) if item != field]
+    handoff["reply_sources"] = sources
 
 
 def apply_vitals(report: dict, vitals: list[dict]) -> None:
@@ -150,6 +181,7 @@ class Processor:
                                                if transcript else "This recording has no audio track. The report covers images only.")
             report["uncertainties"][:0] = corrections
             apply_vitals(report, vitals)
+            apply_reply_updates(report, session.get("handoff_updates", []))
             missing = [kind for kind, expected, received in [
                 ("audio parts", session.get("expected_audio_parts", 0), len(session.get("audio_parts", {}))),
                 ("photos", session.get("expected_photos", 0), len(session.get("photos", []))),

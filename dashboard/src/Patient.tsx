@@ -2,14 +2,17 @@ import clsx from "clsx";
 import { useRef, useState, type ReactNode, type RefObject } from "react";
 import {
   Activity, AudioLines, Camera, Check, CircleQuestionMark, ClipboardList, FileText, Hourglass, ListChecks, MessageSquareText,
-  Paperclip, RotateCw, ShieldAlert, Sparkles, TriangleAlert, Video,
+  MessagesSquare, Paperclip, RotateCw, ShieldAlert, Sparkles, TriangleAlert, Video,
 } from "lucide-react";
 import { Eta, minutesAgo, statusLook } from "./Board";
-import { arrival, clock, identity, live, mediaUrl, type Evidence, type Session } from "./data";
+import { arrival, clock, identity, live, mediaUrl, snapsInVideo, type Evidence, type Session } from "./data";
+import { CrewMessages } from "./Messages";
+import { UploadBar } from "./Upload";
 import { Button, Heading, Panel, Pill, toneSoft, toneText, useNow, type Tone } from "./ui";
 import { severity, vitalKinds, vitalViews, type VitalView } from "./vitals";
 
-export interface PhotoView { id: string; file: string; seconds: number; label: string; caption?: string; clip?: string }
+/** `when`: shown instead of the time since "start", for a photo the medic sent later. */
+export interface PhotoView { id: string; file: string; seconds: number; label: string; caption?: string; clip?: string; when?: string }
 
 // Captured photos: from the processed evidence once the report exists, live from the upload before that.
 export function photosOf(session: Session): PhotoView[] {
@@ -19,22 +22,25 @@ export function photosOf(session: Session): PhotoView[] {
   return (session.photos ?? []).map(photo => ({ id: photo.id, file: photo.file, seconds: photo.seconds, label: `Photo ${photo.seq}` }));
 }
 
-const fieldLabels: Record<string, string> = {
+const timeOf = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+export const fieldLabels: Record<string, string> = {
   patient_age: "Age", patient_sex: "Sex", mechanism: "Mechanism of injury", injuries: "Injuries", blood_pressure: "Blood pressure",
   heart_rate: "Heart rate", spo2: "SpO₂", respiratory_rate: "Respiratory rate", consciousness: "Level of consciousness",
-  allergies: "Allergies", medications: "Medications", eta_minutes: "ETA",
+  allergies: "Allergies", medications: "Medications", eta_minutes: "ETA", treatment: "Treatment", history: "Background",
 };
 
 type Seek = (seconds: number, prefer?: "audio" | "video") => void;
 type Chips = (ids: string[]) => ReactNode;
 
-export function PatientView({ session, now, onPhoto, onRetry, onAttach, onUploadVideo }: {
+export function PatientView({ session, now, onPhoto, onRetry, onAttach, onUploadVideo, onMessage }: {
   session: Session;
   now: number;
   onPhoto: (photo: PhotoView, photos: PhotoView[]) => void;
   onRetry: () => Promise<void>;
   onAttach: () => void;
   onUploadVideo: (file: File) => Promise<void>;
+  onMessage: (text: string) => Promise<void>;
 }) {
   const video = useRef<HTMLVideoElement>(null);
   const audio = useRef<HTMLAudioElement>(null);
@@ -58,9 +64,11 @@ export function PatientView({ session, now, onPhoto, onRetry, onAttach, onUpload
     if (photo) onPhoto(photo, photos);
   };
   const chips: Chips = ids => <EvidenceChips ids={ids} evidence={evidence} onSeek={seek} onPhoto={showPhoto} />;
+  const upload = videoUpload(session);
   return <div className="space-y-4">
     <Header session={session} now={now} />
     {!isLive && session.status !== "complete" && <ProcessingBar session={session} now={now} onRetry={onRetry} onAttach={onAttach} />}
+    {upload && <UploadBar upload={upload} snaps={snapsInVideo(session).length} />}
     <Alerts vitals={vitals} />
     <VitalsRow vitals={vitals} isLive={isLive} />
     {/* Printed, the columns run one after the other so pages break cleanly. */}
@@ -72,6 +80,7 @@ export function PatientView({ session, now, onPhoto, onRetry, onAttach, onUpload
         {report && report.timeline.length > 0 && <Timeline session={session} chips={chips} />}
       </div>
       <div className="space-y-4 print:mt-4">
+        {session.source === "glasses" && <CrewMessages session={session} isLive={isLive} onPhoto={photo => onPhoto(photo, [photo])} onSend={onMessage} />}
         <Photos session={session} photos={photos} onPhoto={photo => onPhoto(photo, photos)} />
         <Media session={session} isLive={isLive} video={video} audio={audio} onUploadVideo={onUploadVideo} />
         {handoff && <AskCrew session={session} vitals={vitals} />}
@@ -200,21 +209,11 @@ function VitalsRow({ vitals, isLive }: { vitals: VitalView[]; isLive: boolean })
           <span className={clsx("text-xs font-medium", vital.value ? toneText[level.tone] : "text-slate-500 dark:text-slate-400")}>
             {vital.value ? level.label : unsettled ? "Waiting for the medic" : isLive ? "Not reported yet" : "Not reported"}
           </span>
-          <Sparkline values={vital.history.map(reading => Number.parseInt(reading.value, 10))} className={toneText[level.tone]} />
         </div>
         {vital.history.length > 1 && <div className="mt-1 truncate text-xs tabular-nums text-slate-500 dark:text-slate-400">{vital.history.map(reading => reading.value).join(" → ")}</div>}
       </div>;
     })}
   </div>;
-}
-
-function Sparkline({ values, className }: { values: number[]; className?: string }) {
-  if (values.length < 2) return null;
-  const min = Math.min(...values), max = Math.max(...values), range = max - min || 1;
-  const points = values.map((value, index) => `${(index / (values.length - 1)) * 64},${19 - ((value - min) / range) * 17}`).join(" ");
-  return <svg viewBox="0 0 64 20" className={clsx("h-5 w-16 opacity-80", className)} aria-hidden>
-    <polyline points={points} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>;
 }
 
 // IMIST-AMBO, the order ED staff helped design, so the handover reads the way they expect it.
@@ -228,25 +227,31 @@ function Imist({ session, vitals, chips }: { session: Session; vitals: VitalView
     const { short } = vitalKinds.find(item => item.kind === vital.kind)!;
     return `${short} ${vital.value ?? vital.candidates.join(" or ")}`;
   });
-  const rows: { letter: string; label: string; content: ReactNode }[] = [
-    { letter: "I", label: "Identification", content: [handoff.patient_age && `${handoff.patient_age} years`, handoff.patient_sex].filter(Boolean).join(" · ") || empty("patient_age") },
-    { letter: "M", label: "Mechanism", content: handoff.mechanism || empty("mechanism") },
+  // Fields the medic filled in by answering the ER, marked with when.
+  const sources = handoff.reply_sources ?? {};
+  const fromCrew = (...fields: string[]) => fields.map(field => sources[field]?.at).filter(Boolean).sort().at(-1);
+  const rows: { letter: string; label: string; content: ReactNode; from?: string }[] = [
+    { letter: "I", label: "Identification", from: fromCrew("patient_age", "patient_sex"), content: [handoff.patient_age && `${handoff.patient_age} years`, handoff.patient_sex].filter(Boolean).join(" · ") || empty("patient_age") },
+    { letter: "M", label: "Mechanism", from: fromCrew("mechanism"), content: handoff.mechanism || empty("mechanism") },
     {
-      letter: "I", label: "Injuries", content: handoff.injuries.length
+      letter: "I", label: "Injuries", from: fromCrew("injuries"), content: handoff.injuries.length
         ? <div className="flex flex-wrap gap-1.5">{handoff.injuries.map(injury => <span key={injury} className="rounded-lg bg-rose-500/10 px-2 py-0.5 text-sm font-medium text-rose-800 ring-1 ring-rose-500/20 dark:text-rose-100">{injury}</span>)}</div>
         : empty("injuries"),
     },
     {
-      letter: "S", label: "Signs", content: <div className="space-y-0.5">
+      letter: "S", label: "Signs", from: fromCrew("consciousness"), content: <div className="space-y-0.5">
         <div>{handoff.consciousness || empty("consciousness", "Consciousness not reported")}</div>
         {signs.length > 0 && <div className="text-sm font-normal tabular-nums text-slate-500 dark:text-slate-400">{signs.join(" · ")}</div>}
       </div>,
     },
-    { letter: "T", label: "Treatment", content: handoff.treatment?.length ? <ul className="space-y-0.5">{handoff.treatment.map(item => <li key={item}>{item}</li>)}</ul> : <span className="text-sm font-normal text-slate-400">None reported</span> },
-    { letter: "A", label: "Allergies", content: handoff.allergies || empty("allergies") },
-    { letter: "M", label: "Medications", content: handoff.medications || empty("medications") },
-    { letter: "B", label: "Background", content: handoff.history || <span className="text-sm font-normal text-slate-400">Not reported</span> },
-    { letter: "O", label: "Other", content: handoff.eta_minutes != null ? `ETA ${handoff.eta_minutes} min when reported` : empty("eta_minutes") },
+    { letter: "T", label: "Treatment", from: fromCrew("treatment"), content: handoff.treatment?.length ? <ul className="space-y-0.5">{handoff.treatment.map(item => <li key={item}>{item}</li>)}</ul> : <span className="text-sm font-normal text-slate-400">None reported</span> },
+    { letter: "A", label: "Allergies", from: fromCrew("allergies"), content: handoff.allergies || empty("allergies") },
+    { letter: "M", label: "Medications", from: fromCrew("medications"), content: handoff.medications || empty("medications") },
+    { letter: "B", label: "Background", from: fromCrew("history"), content: handoff.history || <span className="text-sm font-normal text-slate-400">Not reported</span> },
+    {
+      letter: "O", label: "Other", from: fromCrew("eta_minutes"), content: handoff.eta_minutes == null ? empty("eta_minutes")
+        : sources.eta_minutes ? `ETA ${handoff.eta_minutes} min, given at ${timeOf(sources.eta_minutes.at)}` : `ETA ${handoff.eta_minutes} min when reported`,
+    },
   ];
   return <Panel>
     <Heading icon={ClipboardList} aside={<span className="text-xs font-medium text-slate-500 dark:text-slate-400">IMIST-AMBO</span>}>Handover</Heading>
@@ -255,7 +260,12 @@ function Imist({ session, vitals, chips }: { session: Session; vitals: VitalView
         <dt className="flex items-center gap-2.5 text-sm font-medium text-slate-500 dark:text-slate-400">
           <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-emerald-500/12 text-sm font-bold text-emerald-700 dark:text-emerald-300">{row.letter}</span>{row.label}
         </dt>
-        <dd className="text-[15px] font-medium leading-snug sm:pt-1">{row.content}</dd>
+        <dd className="text-[15px] font-medium leading-snug sm:pt-1">
+          {row.content}
+          {row.from && <span className="mt-1 inline-flex items-center gap-1 rounded-md bg-sky-500/10 px-1.5 py-0.5 text-[11px] font-semibold text-sky-700 ring-1 ring-sky-500/20 dark:text-sky-300">
+            <MessagesSquare className="size-3" />From the crew · {timeOf(row.from)}
+          </span>}
+        </dd>
       </div>)}
     </dl>
     {handoff.evidence_ids.length > 0 && <div className="no-print mt-3 flex flex-wrap items-center gap-1 text-xs text-slate-500">Sources {chips(handoff.evidence_ids)}</div>}
@@ -320,26 +330,41 @@ function Timeline({ session, chips }: { session: Session; chips: Chips }) {
 }
 
 function Photos({ session, photos, onPhoto }: { session: Session; photos: PhotoView[]; onPhoto: (photo: PhotoView) => void }) {
+  // Snaps taken while the glasses recorded video wait for it: their stills come out of the video.
+  const inVideo = snapsInVideo(session);
+  const coming = !session.has_video && ["recording", "stopping", "uploading"].includes(session.video?.state ?? "");
+  const count = photos.length + inVideo.length;
   return <Panel>
     <Heading icon={Camera} aside={photos.length > 0 && <span className="text-xs font-semibold tabular-nums text-slate-500">{photos.length}</span>}>Injury photos</Heading>
-    {photos.length ? <div className="grid grid-cols-2 gap-2.5 print:grid-cols-3">
+    {count ? <div className="grid grid-cols-2 gap-2.5 print:grid-cols-3">
       {photos.map((photo, index) => <button key={photo.id} onClick={() => onPhoto(photo)}
-        className={clsx("group relative overflow-hidden rounded-xl bg-slate-900 text-left ring-1 ring-slate-200 print:col-span-1 print:break-inside-avoid dark:ring-white/10", index === 0 && photos.length % 2 === 1 && "col-span-2")}>
+        className={clsx("group relative overflow-hidden rounded-xl bg-slate-900 text-left ring-1 ring-slate-200 print:col-span-1 print:break-inside-avoid dark:ring-white/10", index === 0 && count % 2 === 1 && "col-span-2")}>
         <img src={mediaUrl(session, photo.file)} alt={photo.caption ?? photo.label} className="aspect-[4/3] w-full object-cover transition duration-300 group-hover:scale-[1.03]" />
         <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent p-2.5 pt-10 text-white print:static print:bg-none print:p-2 print:text-slate-800">
           <div className="flex items-center justify-between text-xs font-semibold"><span>{photo.label}</span><span className="tabular-nums opacity-80">{clock(photo.seconds)}</span></div>
           {photo.caption && <p className="mt-0.5 line-clamp-2 text-xs leading-snug opacity-90">{photo.caption}</p>}
         </div>
       </button>)}
+      {inVideo.map(frame => <div key={`frame-${frame.seq}`} className="no-print grid aspect-[4/3] place-items-center rounded-xl border border-dashed border-slate-300 p-3 text-center text-xs text-slate-500 dark:border-white/15 dark:text-slate-400">
+        <div>
+          <Camera className="mx-auto mb-1.5 size-5 opacity-60" />
+          <div className="font-semibold text-slate-600 dark:text-slate-300">Snap {frame.seq} · {clock(frame.seconds)}</div>
+          <div className="mt-0.5">{coming ? "Arrives with the video" : "Inside the video on the glasses"}</div>
+        </div>
+      </div>)}
     </div> : <p className="text-sm text-slate-500 dark:text-slate-400">Photos appear here when the medic says “snap”.</p>}
   </Panel>;
 }
+
+// The glasses' video on its way, unless it has arrived.
+const videoUpload = (session: Session) => session.has_video || session.video?.state === "ready" ? null
+  : session.video_upload ?? (session.video?.state === "uploading" ? { mode: "unknown" as const } : null);
 
 const videoNotes: Record<string, string> = {
   starting: "The glasses are starting the video.",
   recording: "The glasses are recording video. It uploads after the medic says “stop”.",
   stopping: "The glasses are stopping the video.",
-  uploading: "The glasses are uploading the video.",
+  uploading: "The glasses are uploading the video. Its progress is at the top of the page.",
   failed: "The glasses could not record or upload video. The handover uses the phone’s audio and photos.",
 };
 

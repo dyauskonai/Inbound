@@ -1,7 +1,7 @@
 import clsx from "clsx";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
-  Ambulance, ArrowRight, ChevronLeft, ClipboardList, Download, Glasses, HeartPulse, Mic, Moon, Play, Printer, Sparkles, Sun, TriangleAlert, Upload, Wifi, WifiOff, X,
+  Ambulance, ArrowRight, ChevronLeft, ClipboardList, MessagesSquare, Download, Glasses, HeartPulse, Mic, Moon, Play, Printer, Sparkles, Sun, TriangleAlert, Upload, Wifi, WifiOff, X,
 } from "lucide-react";
 import { setupRecorder } from "../recorder.js";
 import { Board } from "./Board";
@@ -23,6 +23,7 @@ export function App() {
   const [connected, setConnected] = useState<boolean | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [arrived, setArrived] = useState<SessionCard | null>(null);
+  const [replied, setReplied] = useState<SessionCard | null>(null);
   const [importing, setImporting] = useState<{ attach: Session | null } | null>(null);
   const [viewing, setViewing] = useState<{ photo: PhotoView; photos: PhotoView[] } | null>(null);
   const [sampling, setSampling] = useState(false);
@@ -36,6 +37,7 @@ export function App() {
     let selected = idFromHash();
     let current: Session | null = null;
     let seen: Set<string> | null = null;
+    let replies: Map<string, number> | null = null;
     let sequence = 0;
 
     async function refresh() {
@@ -54,6 +56,10 @@ export function App() {
       const glasses = list.filter(card => card.source === "glasses");
       const fresh = seen ? glasses.find(card => !seen!.has(card.id)) : !selected && glasses.find(card => live(card));
       seen = new Set(glasses.map(card => card.id));
+      // A medic's answer about a patient nobody has open gets a banner; the open one shows it in place.
+      const answered = replies && list.find(card => card.id !== selected && (card.reply_count ?? 0) > (replies!.get(card.id) ?? 0));
+      replies = new Map(list.map(card => [card.id, card.reply_count ?? 0]));
+      if (answered) setReplied(answered);
       if (fresh && fresh.id !== selected) {
         if ((!selected || current?.status === "created") && !document.querySelector("dialog[open]")) return select(fresh.id);
         setArrived(fresh);
@@ -62,7 +68,8 @@ export function App() {
       try {
         const detail = await api<Session>(`/api/sessions/${selected}`);
         if (request !== sequence || detail.id !== selected) return;
-        if (detail.id !== current?.id || detail.updated_at !== current.updated_at) {
+        // An upload's byte count changes without touching the capture itself.
+        if (detail.id !== current?.id || detail.updated_at !== current.updated_at || JSON.stringify(detail.video_upload) !== JSON.stringify(current.video_upload)) {
           current = detail;
           setSession(detail);
         }
@@ -79,6 +86,7 @@ export function App() {
       setSession(null);
       setViewing(null);
       setArrived(card => (card?.id === id ? null : card));
+      setReplied(card => (card?.id === id ? null : card));
       setNotice(null);
       history.replaceState(null, "", id ? `/#${id}` : "/");
       void refresh();
@@ -90,7 +98,20 @@ export function App() {
     // Some HTTPS proxies, like Cloudflare quick tunnels, hold back event streams. Poll as well.
     const poll = setInterval(() => void refresh(), 3000);
     const checkHealth = () => api<Health>("/api/health").then(setHealth, () => {});
-    const healthPoll = setInterval(checkHealth, 30_000);
+    // A newer dashboard build loads by itself, so nobody reads a stale screen. Not mid-sentence,
+    // though: an open dialog or a half-typed message waits for the next check.
+    const build = document.querySelector<HTMLScriptElement>('script[src*="/static/dist/"]')?.getAttribute("src");
+    const checkBuild = async () => {
+      try {
+        const latest = /\/static\/dist\/[\w-]+\.js/.exec(await (await fetch("/", { cache: "no-store" })).text())?.[0];
+        const typing = document.activeElement instanceof HTMLInputElement && document.activeElement.value;
+        if (build && latest && latest !== build && !typing && !document.querySelector("dialog[open]")) location.reload();
+      } catch { /* Offline: checked again next time. */ }
+    };
+    const healthPoll = setInterval(() => {
+      void checkHealth();
+      void checkBuild();
+    }, 30_000);
     const hash = () => select(idFromHash());
     window.addEventListener("hashchange", hash);
     void checkHealth();
@@ -153,9 +174,9 @@ export function App() {
 
   return <div className="min-h-screen">
     <header className="no-print sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-slate-200/80 bg-white/80 px-4 backdrop-blur-xl dark:border-white/[0.06] dark:bg-[#060911]/75 sm:px-6">
-      <button onClick={() => select(null)} className="flex items-center gap-2.5" aria-label="Inbound home">
-        <Logo />
-        <span className="text-[17px] font-semibold tracking-tight">Inbound</span>
+      {/* The same wordmark as the paramedic's MiniApp. */}
+      <button onClick={() => select(null)} className="text-[27px] font-bold leading-none tracking-[-0.04em]" aria-label="Inbound home">
+        inbound<span className="text-emerald-500">↘</span>
       </button>
       <span className="hidden h-5 w-px bg-slate-200 dark:bg-white/10 md:block" />
       <span className="hidden text-sm font-medium text-slate-500 dark:text-slate-400 md:block">Emergency department · Arrivals</span>
@@ -209,6 +230,7 @@ export function App() {
             <button onClick={() => setNotice(null)} aria-label="Dismiss" className="ml-auto grid size-7 place-items-center rounded-md hover:bg-rose-500/15"><X className="size-4" /></button>
           </div>}
           {arrived && <Arrived card={arrived} onView={() => select(arrived.id)} onDismiss={() => setArrived(null)} />}
+          {replied && <Arrived card={replied} title="The medic replied" onView={() => select(replied.id)} onDismiss={() => setReplied(null)} />}
           {selectedId && <button onClick={() => select(null)} className="no-print -ml-2 flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm font-semibold text-slate-500 hover:bg-slate-200/60 dark:text-slate-400 dark:hover:bg-white/5 lg:hidden">
             <ChevronLeft className="size-4" />All patients
           </button>}
@@ -218,7 +240,11 @@ export function App() {
                 onPhoto={(photo, photos) => setViewing({ photo, photos })}
                 onRetry={() => act(() => api(`/api/sessions/${session.id}/process`, { method: "POST" }))}
                 onAttach={() => setImporting({ attach: session })}
-                onUploadVideo={uploadVideo} />
+                onUploadVideo={uploadVideo}
+                onMessage={async text => {
+                  await api(`/api/sessions/${session.id}/messages`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+                  await control.current?.refresh();
+                }} />
               : <Loading />
             : <Welcome {...actions} waiting={connected !== false} />}
         </div>
@@ -229,14 +255,6 @@ export function App() {
     {viewing && session && <PhotoDialog session={session} photos={viewing.photos} start={viewing.photo.id} onClose={() => setViewing(null)} />}
     <RecordDialog />
   </div>;
-}
-
-function Logo() {
-  return <span className="grid size-8 place-items-center rounded-[10px] bg-gradient-to-br from-emerald-300 to-teal-600 text-emerald-950 shadow-lg shadow-emerald-500/25">
-    <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M2.5 12.5h4l2.2-5.5 4.3 10.5 2.3-5h6.2" />
-    </svg>
-  </span>;
 }
 
 function Clock() {
@@ -270,12 +288,17 @@ function Loading() {
   </div>;
 }
 
-function Arrived({ card, onView, onDismiss }: { card: SessionCard; onView: () => void; onDismiss: () => void }) {
+function Arrived({ card, title, onView, onDismiss }: { card: SessionCard; title?: string; onView: () => void; onDismiss: () => void }) {
   const { who, what } = identity(card, live(card));
-  return <div className="no-print flex flex-wrap items-center gap-3 rounded-2xl bg-rose-500/10 px-4 py-3 ring-1 ring-rose-500/30 dark:bg-rose-500/12 dark:ring-rose-400/35">
-    <span className="grid size-9 place-items-center rounded-xl bg-rose-500 text-white shadow-lg shadow-rose-500/30"><Ambulance className="size-5" /></span>
+  const reply = Boolean(title);
+  return <div className={clsx("no-print flex flex-wrap items-center gap-3 rounded-2xl px-4 py-3 ring-1", reply
+    ? "bg-emerald-500/10 ring-emerald-500/30 dark:bg-emerald-400/10 dark:ring-emerald-400/30"
+    : "bg-rose-500/10 ring-rose-500/30 dark:bg-rose-500/12 dark:ring-rose-400/35")}>
+    <span className={clsx("grid size-9 place-items-center rounded-xl text-white shadow-lg", reply ? "bg-emerald-500 shadow-emerald-500/30" : "bg-rose-500 shadow-rose-500/30")}>
+      {reply ? <MessagesSquare className="size-5" /> : <Ambulance className="size-5" />}
+    </span>
     <div className="min-w-0 flex-1">
-      <div className="text-sm font-semibold text-rose-700 dark:text-rose-200">New patient from the glasses</div>
+      <div className={clsx("text-sm font-semibold", reply ? "text-emerald-700 dark:text-emerald-200" : "text-rose-700 dark:text-rose-200")}>{title ?? "New patient from the glasses"}</div>
       <div className="truncate text-sm text-slate-600 dark:text-slate-300">{who} · {what}</div>
     </div>
     <Button variant="primary" icon={ArrowRight} onClick={onView}>Open</Button>

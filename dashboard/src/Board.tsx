@@ -1,7 +1,8 @@
 import clsx from "clsx";
-import { Ambulance, Camera, CircleAlert, FileCheck2, FileClock, Hourglass, LoaderCircle, TriangleAlert, Video, WifiOff } from "lucide-react";
+import { Ambulance, Camera, CircleAlert, FileCheck2, FileClock, Hourglass, LoaderCircle, MessagesSquare, TriangleAlert, Video, WifiOff } from "lucide-react";
 import { ARRIVING_MS, arrival, identity, live, type SessionCard } from "./data";
 import { Pill, type Icon, type Tone } from "./ui";
+import { UploadMini } from "./Upload";
 import { severity, vitalViews } from "./vitals";
 
 export function statusLook(card: Pick<SessionCard, "status" | "updated_at">, now: number): { tone: Tone; label: string; icon?: Icon } {
@@ -83,7 +84,12 @@ export function Board({ cards, selectedId, onSelect, now }: { cards: SessionCard
             {eta && <Eta at={eta} now={now} />}
             {card.photo_count > 0 && <span className="inline-flex items-center gap-1"><Camera className="size-3.5" />{card.photo_count}</span>}
             {card.video_state === "ready" && <span className="inline-flex items-center gap-1"><Video className="size-3.5" />Video</span>}
-            {card.video_state === "uploading" && <span className="inline-flex items-center gap-1"><Hourglass className="size-3.5" />Video uploading</span>}
+            {(card.message_count ?? 0) > 0 && <span className={clsx("inline-flex items-center gap-1", card.reply_count && "font-semibold text-emerald-700 dark:text-emerald-300")}>
+              <MessagesSquare className="size-3.5" />{card.reply_count ? `${card.reply_count} ${card.reply_count === 1 ? "reply" : "replies"}` : "Asked"}
+            </span>}
+            {card.video_upload
+              ? <UploadMini upload={card.video_upload} />
+              : card.video_state === "uploading" && <span className="inline-flex items-center gap-1"><Hourglass className="size-3.5" />Video uploading</span>}
           </div>
         </button>
       </li>;
