@@ -12,9 +12,7 @@
 
 <p align="center">
   <img alt="Built for Mentra Live" src="https://img.shields.io/badge/built%20for-Mentra%20Live-10b981">
-  <img alt="Immerse the Bay 2026" src="https://img.shields.io/badge/Immerse%20the%20Bay-2026-0f172a">
-  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-64748b">
-  <img alt="Status: prototype, not a medical device" src="https://img.shields.io/badge/status-prototype%20%C2%B7%20not%20a%20medical%20device-b45309">
+  <img alt="Status: prototype" src="https://img.shields.io/badge/status-prototype%20%C2%B7%20not%20a%20medical%20device-b45309">
 </p>
 
 <p align="center">
@@ -34,11 +32,11 @@ Inbound lets the paramedic hand over without using their hands, and gives the ER
 
 ## What it does
 
-- **Talk, don't type.** The medic says "inbound start", describes the patient, says "snap" to photograph an injury from their own point of view, and says "inbound stop". Commands work in the middle of a sentence: "BP 190 over 90, snap the left forearm". "Start" and "stop" count only after "inbound", so ordinary conversation never starts or ends a recording.
-- **Numbers are double-checked by ear.** Inbound hears blood pressure, heart rate, SpO₂ and respiratory rate as the medic talks. When two values conflict or a number makes no sense, the glasses ask the medic to repeat it and read back the value they log.
+- The medic says "inbound start", describes the patient, says "snap" to photograph an injury from their own point of view, and says "inbound stop". Commands work in the middle of a sentence: "BP 190 over 90, snap the left forearm". "Start" and "stop" count only after "inbound", so ordinary conversation never starts or ends a recording.
+- Inbound hears blood pressure, heart rate, SpO₂ and respiratory rate as the medic talks. When two values conflict or a number makes no sense, the glasses ask the medic to repeat it and read back the value they log.
 - **The ER sees it live.** The dashboard opens the patient as soon as the medic says "inbound start", with the transcript, vitals and photos as they arrive. After "inbound stop", AI writes an IMIST-AMBO handover with NEWS2 colour cues and a source for every statement.
 - **The ER can ask, hands-free.** A doctor types or speaks a question. The glasses read it aloud, the medic answers by voice ("snap" adds a photo), and the answer fills in the handover.
-- **Paper when it's needed.** One click turns the handover into a PDF to print or attach to the chart.
+- One click turns the handover into a PDF to print or attach to the chart.
 
 <p align="center">
   <img src="docs/images/miniapp.png" alt="The Inbound MiniApp on the medic's phone: recording a handover while the glasses ask to repeat a blood pressure, and answering a question from the ER" width="560">
@@ -141,9 +139,9 @@ bun install
 bun run dev                          # prints a QR code for the Mentra app
 ```
 
-1. Open the ER dashboard at <http://127.0.0.1:8000/>. No glasses yet? Click **Open a sample patient**.
+1. Open the ER dashboard locally at <http://127.0.0.1:8000/>. Planning on future server expansion for hosting.
 2. In the Mentra app, connect Mentra Live, then scan the QR code under **Settings → Miniapp Developer Settings**.
-3. Say "inbound start", describe the patient, say "snap" for a photo, and say "inbound stop" to send the handover.
+3. Say "Inbound start", describe the patient, say "snap" for a photo, and say "Inbound stop" to send the handover.
 
 The phone must reach the computer on port 8000. Venue Wi-Fi often isolates devices, so a phone hotspot is the reliable choice. To host Inbound online, for ambulances on cellular and an ER in any browser, see [Host it online](DEVELOPMENT.md#host-it-online).
 
@@ -186,11 +184,6 @@ cd dashboard && bun run typecheck    # dashboard types
 - **Fleet readiness.** Battery, connectivity and app version for every pair of glasses in a service, built to plug into device management platforms such as ManageXR.
 - **Production readiness.** Per-user accounts, audit logs, encryption at rest, and data-processing agreements before any real patient data.
 
-## Acknowledgements
-
-- Built at **Immerse the Bay 2026** at Stanford.
-- [Mentra](https://mentraglass.com) for Mentra Live and the MiniApp SDK. The MiniApp began from Mentra's starter kit, used under the Apache 2.0 license (see [`licenses/`](licenses/)).
-- The handover follows **IMIST-AMBO** (Iedema et al., *BMJ Quality & Safety*, 2012). Vital-sign colours follow **NEWS2** (Royal College of Physicians, 2017).
 
 ## License
 
