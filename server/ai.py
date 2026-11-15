@@ -34,6 +34,7 @@ Do not infer vital signs, diagnoses, identity, medical history, causality, or tr
 from appearance. Record explicitly reported symptoms, history, mechanism, assessments, actions,
 responses, and handoff details where present. Include detailed chronological observations.
 Describe images conservatively as sampled visible observations, distinct from reported statements.
+In every image, attend to the patient and their injuries, not the surroundings.
 Only a subset of video frames is supplied; do not claim continuous visual review.
 The medic controls capture by saying "inbound start", "inbound stop", "snap", "snapshot", or "screenshot", often
 mid-sentence. Leave those control words out of the report, but keep the rest of each sentence.
@@ -52,10 +53,17 @@ Where the audio transcript has a similar word instead (for example "splint" or "
 phone's line says "snap", it was the command: never report it as a treatment or action. When the two
 transcripts disagree on a clinical value, use the audio transcript's value and record the
 disagreement in uncertainties.
-Images whose evidence ID starts with snap_ are photos the medic deliberately took. For every one,
-provide exactly one snap_captions entry with that evidence_id and a short caption describing only
-what is visibly present in that one image.
-If a snap is unclear, say what obscures the view. Return an empty list if there are no snaps.
+Images whose evidence ID starts with snap_ are photos the medic deliberately took of the patient's injury.
+For every one, provide exactly one snap_captions entry with that evidence_id: one or two short sentences, as
+a paramedic would describe the photo. Lead with the injured body part and side: the part that is exposed,
+bandaged, splinted, iced, or that the patient is holding or guarding. Then say what is visible on it (such
+as swelling, deformity, bleeding, an abrasion or a wound, a dressing or a cold pack) and how the patient is
+positioned. For example: "Left forearm with an obvious mid-shaft deformity and a small laceration; no active
+bleeding. Patient seated, supporting the arm." Leave out the surroundings: the room, furniture, bystanders,
+phones, and the medic's hands. In training, the patient may be shown on a screen or a printout: describe
+the patient shown as you would a real one, and never mention a screen, a display, a printout, a photo, or
+that the patient is simulated. Describe only what is visible, never a diagnosis. Only if no patient can be
+made out, say briefly what is visible instead. Return an empty list if there are no snaps.
 The transcript is grouped into bounded time intervals; do not invent word-level timestamps.
 If sources conflict, record both with their evidence, and explain the uncertainty.
 Use the uncertainties list for missing information, unclear audio, visibility limitations, and
