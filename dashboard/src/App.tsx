@@ -338,7 +338,7 @@ function Arrived({ card, title, onView, onDismiss }: { card: SessionCard; title?
 
 const steps = [
   { icon: Glasses, title: "The medic says “start”", text: "Voice, vitals and injury photos stream here from the glasses while hands stay on the patient." },
-  { icon: HeartPulse, title: "Every vital is read back", text: "The glasses repeat each value out loud and ask again when two numbers conflict, so what you see is confirmed." },
+  { icon: HeartPulse, title: "Numbers are double-checked", text: "When two values conflict or a number makes no sense, the glasses ask the medic to repeat it, then read back the value they log." },
   { icon: ClipboardList, title: "Handover before arrival", text: "An IMIST-AMBO handover with NEWS2 colour cues, a source for every statement, and what to ask the crew." },
 ];
 
