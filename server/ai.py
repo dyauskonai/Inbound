@@ -14,7 +14,7 @@ def client() -> OpenAI:
 
 # Without this, "snap the left forearm" was transcribed as "splint the left forearm".
 TRANSCRIBE_PROMPT = ("A paramedic's ambulance-to-ER handoff. The paramedic controls the recording by saying "
-                     "the words start, snap, and stop, often mid-sentence: \"snap the left forearm\".")
+                     "\"inbound start\", \"snap\", and \"inbound stop\", often mid-sentence: \"snap the left forearm\".")
 
 
 def transcribe(path: Path) -> str:
@@ -35,7 +35,7 @@ from appearance. Record explicitly reported symptoms, history, mechanism, assess
 responses, and handoff details where present. Include detailed chronological observations.
 Describe images conservatively as sampled visible observations, distinct from reported statements.
 Only a subset of video frames is supplied; do not claim continuous visual review.
-The medic controls capture by saying "start", "stop", "snap", "snapshot", or "screenshot", often
+The medic controls capture by saying "inbound start", "inbound stop", "snap", "snapshot", or "screenshot", often
 mid-sentence. Leave those control words out of the report, but keep the rest of each sentence.
 Evidence with kind "vital" records critical vitals Inbound heard. When the medic gave two different
 values close together, Inbound's glasses asked aloud to repeat it ("Can you repeat the blood pressure?")

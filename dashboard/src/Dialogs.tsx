@@ -127,7 +127,7 @@ export function PhotoDialog({ session, photos, start, onClose }: { session: Sess
   });
   if (!photo) return null;
   return <Modal className="w-[min(1040px,calc(100vw-2rem))]" onClose={onClose}>{close => <>
-    <Title onClose={close}>{photo.label} <span className="ml-1 font-normal tabular-nums text-slate-500">· {photo.when ?? `${clock(photo.seconds)} after “start”`}</span></Title>
+    <Title onClose={close}>{photo.label} <span className="ml-1 font-normal tabular-nums text-slate-500">· {photo.when ?? `${clock(photo.seconds)} after “inbound start”`}</span></Title>
     <div className="space-y-4 p-5">
       <div className="relative overflow-hidden rounded-xl bg-black">
         <img src={mediaUrl(session, photo.file)} alt={photo.caption ?? photo.label} className="max-h-[68vh] w-full object-contain" />

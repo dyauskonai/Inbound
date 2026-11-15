@@ -85,7 +85,7 @@ This is still a prototype. Before real patient data, it needs per-user accounts,
 
 ## Voice commands
 
-Say **start**, **snap** (also "snapshot" or "screenshot"), or **stop** anywhere in a sentence. For example, "BP 190 over 90, snap the left forearm" takes a photo, and "okay that's everything, stop" ends the capture. Inbound acts on partial transcripts, so it doesn't wait for a pause. A command word that ends a partial transcript waits 350 ms in case it becomes "started" or "stopped". A negated command such as "don't stop" is ignored. Each occurrence fires once, so two snaps in one sentence take two photos. The words stay in the transcript, and the report leaves them out.
+Say **inbound start** to begin, **snap** (also "snapshot" or "screenshot") for a photo, and **inbound stop** to finish, anywhere in a sentence. "Start" and "stop" are everyday words ("we had to stop the bleeding"), so they count only right after "inbound"; "in bound", as the recognizer sometimes splits it, works too. "Snap" works on its own. For example, "BP 190 over 90, snap the left forearm" takes a photo, and "okay that's everything, inbound stop" ends the capture. Inbound acts on partial transcripts, so it doesn't wait for a pause. A command word that ends a partial transcript waits 350 ms in case it becomes "started" or "stopped". A negated command such as "don't snap" is ignored. Each occurrence fires once, so two snaps in one sentence take two photos. The words stay in the transcript, and the report leaves them out.
 
 ## Vitals read-back
 
@@ -103,7 +103,7 @@ An unlikely value, like a saturation of 20%, is almost always a misheard word, s
 
 After a capture, the ER can ask the medic for what the handover left out. On a glasses patient, **Message the crew** sends a question. Quick asks come from the report's missing fields, plus a closer photo and updated vitals. The doctor can also tap the microphone and speak. Ending with "send" (or "send it", "send that") sends the message; "…and send it" stays in the box, because it asks the medic for something. A pause leaves the words in the box to read over first. Where the browser's speech recognition works (Chrome, Edge, or Safari with macOS Dictation on), the words fill the box as they're heard. Otherwise the dashboard records the doctor until they pause and the server transcribes it with the OpenAI key. Either way the microphone needs a secure address, so open the dashboard at `http://localhost:8001` on the Mac.
 
-Between captures the phone checks for messages every 3 seconds. The glasses read each one aloud ("Message from the E.R.: … Go ahead."), and the medic answers by voice. A short pause ends the answer, or "stop" sends it at once. Saying "snap" while answering adds a fresh photo. The glasses confirm with "Reply sent." The phone shows only the message being read or answered, with **Read again** and **Reply** for touch, and **Photo** and **Send** replace the big buttons while the medic answers.
+Between captures the phone checks for messages every 3 seconds. The glasses read each one aloud ("Message from the E.R.: … Go ahead."), and the medic answers by voice. A short pause ends the answer, or "inbound stop" sends it at once; a plain "stop" is just part of the answer. Saying "snap" while answering adds a fresh photo. The glasses confirm with "Reply sent." The phone shows only the message being read or answered, with **Read again** and **Reply** for touch, and **Photo** and **Send** replace the big buttons while the medic answers.
 
 Replies keep the report current, so the doctor never fills in the handover by hand:
 
@@ -117,9 +117,9 @@ The dashboard shows when each message was read aloud, the replies with their pho
 
 1. Start the Mac server and the MiniApp development server as shown above. Scan the QR from the current terminal and open Inbound inside Mentra. Allow microphone and local-network access. In Mentra's **Speech** settings, select **English**.
 2. Wait for **Voice commands ready**. Under **Connection settings**, check the Mac address and tap **Connect to Mac**. Open `http://127.0.0.1:8000/` on the Mac.
-3. Say "okay **start** the handoff". The MiniApp should switch to **Recording** before you finish the sentence, and the dashboard should open the new capture within a few seconds.
-4. Say "BP 190 over 90, **snap** the left forearm". A photo appears under **Injury photos** on the dashboard. Say a sentence with two snaps and confirm that two photos arrive. Say "don't stop" and confirm that recording continues.
-5. Say "that's everything, **stop**". The phone shows the report status. With an OpenAI key in `.env`, the dashboard shows the IMIST-AMBO handover and summary. Without one, it shows **API key needed**, with the audio, photos, and phone transcript already saved.
+3. Say "okay **inbound start** the handoff". The MiniApp should switch to **Recording** before you finish the sentence, and the dashboard should open the new capture within a few seconds.
+4. Say "BP 190 over 90, **snap** the left forearm". A photo appears under **Injury photos** on the dashboard. Say a sentence with two snaps and confirm that two photos arrive. Say "we had to stop the bleeding" and confirm that recording continues.
+5. Say "that's everything, **inbound stop**". The phone shows the report status. With an OpenAI key in `.env`, the dashboard shows the IMIST-AMBO handover and summary. Without one, it shows **API key needed**, with the audio, photos, and phone transcript already saved.
 6. To test recovery, turn off the Mac's Wi-Fi mid-capture. The MiniApp keeps recording and shows queued uploads. When Wi-Fi returns, everything arrives in order.
 7. If something fails, open **Capture diagnostics → Copy logs** in Inbound. The log records each command, photo, upload retry, and rejection. It omits transcript text and server addresses.
 

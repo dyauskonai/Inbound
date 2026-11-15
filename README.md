@@ -34,9 +34,9 @@ Inbound lets the paramedic hand over without using their hands, and gives the ER
 
 ## What it does
 
-- **Talk, don't type.** The medic says "start", describes the patient, says "snap" to photograph an injury from their own point of view, and says "stop". Commands work in the middle of a sentence: "BP 190 over 90, snap the left forearm".
+- **Talk, don't type.** The medic says "inbound start", describes the patient, says "snap" to photograph an injury from their own point of view, and says "inbound stop". Commands work in the middle of a sentence: "BP 190 over 90, snap the left forearm". "Start" and "stop" count only after "inbound", so ordinary conversation never starts or ends a recording.
 - **Numbers are double-checked by ear.** Inbound hears blood pressure, heart rate, SpO₂ and respiratory rate as the medic talks. When two values conflict or a number makes no sense, the glasses ask the medic to repeat it and read back the value they log.
-- **The ER sees it live.** The dashboard opens the patient as soon as the medic says "start", with the transcript, vitals and photos as they arrive. After "stop", AI writes an IMIST-AMBO handover with NEWS2 colour cues and a source for every statement.
+- **The ER sees it live.** The dashboard opens the patient as soon as the medic says "inbound start", with the transcript, vitals and photos as they arrive. After "inbound stop", AI writes an IMIST-AMBO handover with NEWS2 colour cues and a source for every statement.
 - **The ER can ask, hands-free.** A doctor types or speaks a question. The glasses read it aloud, the medic answers by voice ("snap" adds a photo), and the answer fills in the handover.
 - **Paper when it's needed.** One click turns the handover into a PDF to print or attach to the chart.
 
@@ -92,14 +92,14 @@ sequenceDiagram
     participant Server as Inbound server
     participant ER as ER dashboard
 
-    Medic->>Glasses: "Start. Fifty-four-year-old, fell from a ladder."
+    Medic->>Glasses: "Inbound start. Fifty-four-year-old, fell from a ladder."
     Phone->>Server: capture opens, audio and transcript stream in
     Server-->>ER: new patient, live
     Medic->>Glasses: "BP 190 over 90, no, 90 over 60"
     Phone-->>Glasses: "Can you repeat the blood pressure?"
     Medic->>Glasses: "90 over 60"
     Phone-->>Glasses: "Blood pressure 90 over 60, logged."
-    Medic->>Glasses: "Snap the left forearm. Stop."
+    Medic->>Glasses: "Snap the left forearm. Inbound stop."
     Phone->>Server: photo, confirmed vitals, end of capture
     Server->>Server: transcribe and write the IMIST-AMBO handover
     Server-->>ER: handover ready
@@ -143,7 +143,7 @@ bun run dev                          # prints a QR code for the Mentra app
 
 1. Open the ER dashboard at <http://127.0.0.1:8000/>. No glasses yet? Click **Open a sample patient**.
 2. In the Mentra app, connect Mentra Live, then scan the QR code under **Settings → Miniapp Developer Settings**.
-3. Say "start", describe the patient, say "snap" for a photo, and say "stop" to send the handover.
+3. Say "inbound start", describe the patient, say "snap" for a photo, and say "inbound stop" to send the handover.
 
 The phone must reach the computer on port 8000. Venue Wi-Fi often isolates devices, so a phone hotspot is the reliable choice. To host Inbound online, for ambulances on cellular and an ER in any browser, see [Host it online](DEVELOPMENT.md#host-it-online).
 

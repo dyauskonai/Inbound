@@ -282,7 +282,7 @@ function Pending({ isLive }: { isLive: boolean }) {
     <div className="grid size-12 shrink-0 place-items-center rounded-2xl bg-emerald-500/10 text-emerald-600 ring-1 ring-emerald-500/20 dark:text-emerald-300"><ClipboardList className="size-6" /></div>
     <div>
       <div className="text-lg font-semibold">{isLive ? "The structured handover follows" : "Handover not written yet"}</div>
-      <div className="text-sm text-slate-500 dark:text-slate-400">{isLive ? "When the medic says “stop”, Inbound writes the IMIST-AMBO handover from what they said and photographed." : "It appears here once the report is ready."}</div>
+      <div className="text-sm text-slate-500 dark:text-slate-400">{isLive ? "When the medic says “inbound stop”, Inbound writes the IMIST-AMBO handover from what they said and photographed." : "It appears here once the report is ready."}</div>
     </div>
   </Panel>;
 }
@@ -367,7 +367,7 @@ const videoUpload = (session: Session) => session.has_video || session.video?.st
 
 const videoNotes: Record<string, string> = {
   starting: "The glasses are starting the video.",
-  recording: "The glasses are recording video. It uploads after the medic says “stop”.",
+  recording: "The glasses are recording video. It uploads after the medic says “inbound stop”.",
   stopping: "The glasses are stopping the video.",
   uploading: "The glasses are uploading the video. Its progress is at the top of the page.",
   failed: "The glasses could not record or upload video. The handover uses the phone’s audio and photos.",
@@ -397,7 +397,7 @@ function Media({ session, isLive, video, audio, onUploadVideo }: {
     </Heading>
     <div className="space-y-3">
       {videoFile && <video ref={video} src={mediaUrl(session, videoFile)} controls playsInline preload="metadata" className="aspect-video w-full rounded-xl bg-black" />}
-      {videoFile && glasses?.offset ? <p className="text-xs text-slate-500 dark:text-slate-400">The video starts {clock(glasses.offset)} after “start”. Source times are matched to it.</p> : null}
+      {videoFile && glasses?.offset ? <p className="text-xs text-slate-500 dark:text-slate-400">The video starts {clock(glasses.offset)} after “inbound start”. Source times are matched to it.</p> : null}
       {audioFile && <div>
         <div className="mb-1.5 text-xs font-semibold text-slate-500 dark:text-slate-400">Medic’s voice · phone microphone</div>
         <audio ref={audio} src={mediaUrl(session, audioFile)} controls preload="metadata" className="w-full" />
@@ -410,7 +410,7 @@ function Media({ session, isLive, video, audio, onUploadVideo }: {
         </div>
       </div>}
       {!videoFile && !audioFile && !glasses && <p className="text-sm text-slate-500 dark:text-slate-400">
-        {isLive ? "The medic’s audio streams in now. The recording is ready after “stop”." : "The recording appears here once it arrives."}
+        {isLive ? "The medic’s audio streams in now. The recording is ready after “inbound stop”." : "The recording appears here once it arrives."}
       </p>}
       {canAttach && <label className="no-print block cursor-pointer rounded-xl border border-dashed border-slate-300 p-3 text-sm leading-snug text-slate-600 transition hover:bg-slate-50 dark:border-white/15 dark:text-slate-300 dark:hover:bg-white/[0.03]">
         <span className="font-semibold">Attach the video from the Mentra gallery.</span> If the glasses couldn’t upload it, AirDrop it to this Mac and choose it here.

@@ -60,7 +60,7 @@ async function jpeg(url: string) {
 /** The handover PDF for a patient, with its photos and the photos the medic sent in replies. */
 export async function handoverPdf(session: Session) {
   const shots = [
-    ...photosOf(session).map(photo => ({ label: photo.label, when: photo.when ?? `${clock(photo.seconds)} after start`, caption: photo.caption, file: photo.file })),
+    ...photosOf(session).map(photo => ({ label: photo.label, when: photo.when ?? `${clock(photo.seconds)} after “inbound start”`, caption: photo.caption, file: photo.file })),
     ...(session.messages ?? []).filter(message => message.photo).map(message => ({
       label: "Photo from the medic", when: `sent ${time(message.at)}`, caption: message.clean || message.text || undefined, file: message.photo!,
     })),
@@ -434,7 +434,7 @@ function writeHandover(session: Session, shots: Shot[], made: Date) {
     };
   }));
 
-  blocks("Timeline", "Minutes and seconds after “start”", report.timeline.map(entry => {
+  blocks("Timeline", "Minutes and seconds after “inbound start”", report.timeline.map(entry => {
     font(10, "bold");
     const title = wrap(entry.title, WIDTH - 46);
     font(9.5);
